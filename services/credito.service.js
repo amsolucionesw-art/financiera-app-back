@@ -1,4 +1,3 @@
-// backend/src/services/credito.service.js
 import Cuota from '../models/Cuota.js';
 import Usuario from '../models/Usuario.js';
 import Zona from '../models/Zona.js';
@@ -7,7 +6,8 @@ import {
   addDays,
   format,
   differenceInCalendarDays,
-  differenceInCalendarMonths
+  differenceInCalendarMonths,
+  addMonths
 } from 'date-fns';
 import { buildFilters } from '../utils/buildFilters.js';
 import { Credito, Cliente } from '../models/associations.js';
@@ -21,9 +21,22 @@ import FormaPago from '../models/FormaPago.js';
 import CajaMovimiento from '../models/CajaMovimiento.js';
 
 /* ===================== Constantes ===================== */
-const MORA_DIARIA = 0.025;        // 2.5% por día en NO-libre
+const MORA_DIARIA = 0.025;        // 2.5% por día
 const LIBRE_MAX_CICLOS = 3;       // tope 3 meses para crédito libre
 const LIBRE_VTO_FICTICIO = '2099-12-31';
+
+/* ===================== Zona horaria negocio ===================== */
+const APP_TZ = process.env.APP_TZ || 'America/Argentina/Tucuman';
+
+// YYYY-MM-DD en TZ negocio
+const todayYMD = () => new Intl.DateTimeFormat('en-CA', {
+  timeZone: APP_TZ, year: 'numeric', month: '2-digit', day: '2-digit'
+}).format(new Date());
+
+// HH:mm:ss en TZ negocio
+const nowTime = () => new Intl.DateTimeFormat('en-GB', {
+  timeZone: APP_TZ, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+}).format(new Date());
 
 /* ===================== Helpers numéricos ===================== */
 const toNumber = (v) => {
@@ -31,6 +44,25 @@ const toNumber = (v) => {
   return Number.isFinite(n) ? n : 0;
 };
 const fix2 = (n) => Math.round(toNumber(n) * 100) / 100;
+
+/* ===================== Helpers de fecha (YMD estricto) ===================== */
+const asYMD = (d) => {
+  const dt = new Date(d);
+  return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+};
+const ymd = (dateOrStr) => asYMD(dateOrStr);
+const ymdDate = (dateOrStr) => new Date(asYMD(dateOrStr));
+
+/* ===================== Helpers formato ===================== */
+const fmtARS = (n) =>
+  Number(n || 0).toLocaleString('es-AR', { style: 'currency', currency: 'ARS' });
+
+/* Mapea modalidad para mostrar en interfaz/PDF */
+const labelModalidad = (modalidad) => {
+  const m = String(modalidad || '').toLowerCase();
+  if (m === 'comun') return 'PLAN DE CUOTAS FIJAS';
+  return m.toUpperCase();
+};
 
 /* ===================== Helpers de tasas ===================== */
 /** Normaliza un valor de tasa que puede venir como "60" o "0.60" a porcentaje 60 */
@@ -47,14 +79,13 @@ const percentToDecimal = (pct) => toNumber(pct) / 100.0;
 /* ===================== Helpers de interés / períodos ===================== */
 const periodLengthFromTipo = (tipo_credito) =>
   tipo_credito === 'semanal' ? 4 :
-  tipo_credito === 'quincenal' ? 2 : 1;
+    tipo_credito === 'quincenal' ? 2 : 1;
 
 /**
  * Interés proporcional mínimo 60% (común / progresivo):
  *   - semanal   → 60% * (semanas / 4)
  *   - quincenal → 60% * (quincenas / 2)
  *   - mensual   → 60% * (meses)
- * Ej.: 5 semanas ⇒ 75%; 3 quincenas ⇒ 90%
  */
 const calcularInteresProporcionalMin60 = (tipo_credito, cantidad_cuotas) => {
   const n = Math.max(toNumber(cantidad_cuotas), 1);
@@ -74,51 +105,57 @@ const esLibre = (credito) => {
 /**
  * Registra un EGRESO en caja por desembolso del crédito.
  * Se invoca al CREAR el crédito (no en refinanciación).
- * Acepta transacción opcional { t } para atomicidad.
+ * Ahora con usuario_id (operador que hizo el movimiento).
  */
 const registrarEgresoDesembolsoCredito = async ({
   creditoId,
   clienteNombre,
   fecha_acreditacion,
-  monto
+  monto,
+  usuario_id = null
 }, { t = null } = {}) => {
   if (!monto || toNumber(monto) <= 0) return;
 
-  const now = new Date();
+  const fecha = fecha_acreditacion || todayYMD();
+  const hora = nowTime();
+
   await CajaMovimiento.create({
-    fecha: fecha_acreditacion || format(now, 'yyyy-MM-dd'),
-    hora: format(now, 'HH:mm:ss'),
+    fecha,
+    hora,
     tipo: 'egreso',
     monto: fix2(monto),
-    forma_pago_id: null, // si luego definís el medio de desembolso, lo pasamos aquí
+    forma_pago_id: null,
     concepto: `Desembolso crédito #${creditoId} - ${clienteNombre || 'Cliente'}`.slice(0, 255),
     referencia_tipo: 'credito',
     referencia_id: creditoId,
-    usuario_id: null
+    usuario_id: usuario_id ?? null
   }, t ? { transaction: t } : undefined);
 };
 
 /**
  * Registra un INGRESO en caja por un recibo generado dentro de una TX.
  * Debe llamarse DESPUÉS de crear el Recibo.
+ * Ahora con usuario_id (operador que cobró).
  */
 const registrarIngresoDesdeReciboEnTx = async ({
   t,
   recibo,
-  forma_pago_id
+  forma_pago_id,
+  usuario_id = null
 }) => {
   if (!recibo) return;
-  const now = new Date();
+  const fecha = recibo.fecha || todayYMD();
+  const hora = recibo.hora || nowTime();
   await CajaMovimiento.create({
-    fecha: recibo.fecha || format(now, 'yyyy-MM-dd'),
-    hora: recibo.hora || format(now, 'HH:mm:ss'),
+    fecha,
+    hora,
     tipo: 'ingreso',
     monto: fix2(recibo.monto_pagado || 0),
     forma_pago_id: forma_pago_id ?? null,
     concepto: `Cobro recibo #${recibo.numero_recibo ?? ''} - ${recibo.cliente_nombre || 'Cliente'}`.slice(0, 255),
     referencia_tipo: 'recibo',
     referencia_id: recibo.numero_recibo ?? null,
-    usuario_id: null
+    usuario_id: usuario_id ?? null
   }, { transaction: t });
 };
 
@@ -126,10 +163,10 @@ const registrarIngresoDesdeReciboEnTx = async ({
 const fechaBaseLibre = (credito) => {
   // Usamos fecha_acreditacion como inicio de ciclo; si no existe, caemos a fecha_compromiso_pago
   const f = credito?.fecha_acreditacion || credito?.fecha_compromiso_pago;
-  return f || format(new Date(), 'yyyy-MM-dd');
+  return f || todayYMD();
 };
 
-const cicloLibreActual = (credito, hoy = new Date()) => {
+const cicloLibreActual = (credito, hoy = ymdDate(todayYMD())) => {
   const [Y, M, D] = fechaBaseLibre(credito).split('-').map((x) => parseInt(x, 10));
   const inicio = new Date(Y, M - 1, D);
   const diffMeses = Math.max(differenceInCalendarMonths(hoy, inicio), 0);
@@ -137,7 +174,31 @@ const cicloLibreActual = (credito, hoy = new Date()) => {
   return Math.min(LIBRE_MAX_CICLOS, diffMeses + 1);
 };
 
-const verificarTopeCiclosLibre = (credito, hoy = new Date()) => {
+/**
+ * Calcula las fechas de vencimiento de cada ciclo del crédito LIBRE
+ * Tomando como base la "Fecha de compromiso de pago" elegida en el formulario.
+ * Ciclo 1: fecha_compromiso_pago
+ * Ciclo 2: fecha_compromiso_pago + 1 mes
+ * Ciclo 3: fecha_compromiso_pago + 2 meses
+ */
+const obtenerFechasCiclosLibre = (credito) => {
+  if (!credito) return null;
+  const baseStr = credito.fecha_compromiso_pago || credito.fecha_acreditacion;
+  if (!baseStr) return null;
+
+  const base = ymdDate(baseStr);
+  const ciclo1 = ymd(base);
+  const ciclo2 = ymd(addMonths(base, 1));
+  const ciclo3 = ymd(addMonths(base, 2));
+
+  return {
+    vencimiento_ciclo_1: ciclo1,
+    vencimiento_ciclo_2: ciclo2,
+    vencimiento_ciclo_3: ciclo3
+  };
+};
+
+const verificarTopeCiclosLibre = (credito, hoy = ymdDate(todayYMD())) => {
   const ciclo = cicloLibreActual(credito, hoy);
   const saldo = toNumber(credito?.saldo_actual);
   if (ciclo > LIBRE_MAX_CICLOS && saldo > 0) {
@@ -149,18 +210,48 @@ const verificarTopeCiclosLibre = (credito, hoy = new Date()) => {
   }
 };
 
-const interesCicloLibreHoy = (credito) => {
-  const tasaPct = normalizePercent(credito?.interes, 60);
-  const tasaDec = percentToDecimal(tasaPct);
-  const capital = toNumber(credito?.saldo_actual);
-  return fix2(capital * tasaDec);
+/**
+ * ✅ Cálculo de mora para LIBRE (sin contar el mismo día del compromiso)
+ * Regla: mora_diaria = 2.5% del INTERÉS DEL MES (sobre capital pendiente), por día de atraso.
+ * Días en mora = días completos transcurridos desde el día SIGUIENTE a fecha_compromiso_pago.
+ */
+const calcularMoraLibre = (credito, hoy = ymdDate(todayYMD())) => {
+  if (!credito) return 0;
+
+  const fcp = credito.fecha_compromiso_pago;
+  if (!fcp) return 0;
+
+  // No hay mora si hoy es el mismo día o antes del compromiso (comparación YMD)
+  const hoyY = ymd(hoy);
+  const fcpY = ymd(fcp);
+  if (hoyY <= fcpY) return 0;
+
+  // Días completos: desde el día siguiente al compromiso
+  const dias = differenceInCalendarDays(ymdDate(hoy), ymdDate(fcp));
+  if (dias <= 0) return 0;
+
+  const tasaMensualPct = normalizePercent(credito.interes, 0); // % mensual guardado
+  if (tasaMensualPct <= 0) return 0;
+
+  const capital = toNumber(credito.saldo_actual);
+  if (capital <= 0) return 0;
+
+  const interesMes = fix2(capital * (tasaMensualPct / 100.0));
+  const mora = fix2(interesMes * MORA_DIARIA * dias);
+  return mora;
 };
 
+// En LIBRE, el importe visible de la cuota es SOLO capital pendiente
 const calcularImporteCuotaLibre = (credito) => {
-  // Mostrar SIEMPRE "capital pendiente + interés del ciclo vigente" (sin mora)
-  return fix2(toNumber(credito?.saldo_actual) + interesCicloLibreHoy(credito));
+  return fix2(toNumber(credito?.saldo_actual || 0));
 };
 
+/**
+ * ✅ Refrescar cuota LIBRE
+ * - Importe = capital
+ * - Mora = según regla
+ * - Estado 'vencida' SOLO si ya pasó el día del compromiso (no el mismo día)
+ */
 const refrescarCuotaLibre = async (creditoId, t = null) => {
   const credito = await Credito.findByPk(creditoId, t ? { transaction: t } : undefined);
   if (!credito) return;
@@ -169,40 +260,78 @@ const refrescarCuotaLibre = async (creditoId, t = null) => {
   // Enforzamos tope de 3 meses
   verificarTopeCiclosLibre(credito);
 
-  const cuotaLibre = await Cuota.findOne({
+  // Buscar/crear cuota 1
+  let cuotaLibre = await Cuota.findOne({
     where: { credito_id: credito.id },
     order: [['numero_cuota', 'ASC']],
     ...(t && { transaction: t })
   });
 
+  const hoy = ymdDate(todayYMD());
   const nuevoImporte = fix2(calcularImporteCuotaLibre(credito));
+  const moraLibre = fix2(calcularMoraLibre(credito, hoy));
+
+  let diasAtraso = 0;
+  if (credito.fecha_compromiso_pago) {
+    const h = ymd(hoy);
+    const fv = ymd(credito.fecha_compromiso_pago);
+    diasAtraso = h > fv ? differenceInCalendarDays(ymdDate(h), ymdDate(fv)) : 0;
+  }
+  const nuevoEstado = diasAtraso > 0 ? 'vencida' : 'pendiente';
 
   if (cuotaLibre) {
-    await cuotaLibre.update({ importe_cuota: nuevoImporte }, { transaction: t || undefined });
+    await cuotaLibre.update({
+      importe_cuota: nuevoImporte,
+      intereses_vencidos_acumulados: moraLibre,
+      estado: nuevoEstado
+    }, { transaction: t || undefined });
   } else {
     // defensivo: creamos la cuota única libre si faltara
-    await Cuota.create({
+    cuotaLibre = await Cuota.create({
       credito_id: credito.id,
       numero_cuota: 1,
-      importe_cuota: nuevoImporte,
+      importe_cuota: fix2(nuevoImporte),
       fecha_vencimiento: LIBRE_VTO_FICTICIO,
-      estado: 'pendiente',
+      estado: nuevoEstado,
       forma_pago_id: null,
       descuento_cuota: 0.0,
-      intereses_vencidos_acumulados: 0.0,
+      intereses_vencidos_acumulados: fix2(moraLibre),
       monto_pagado_acumulado: 0.0
     }, t ? { transaction: t } : undefined);
   }
 };
 
-/* ===================== Generación de cuotas ===================== */
+/* ===================== TOTAL ACTUAL (campo calculado) ===================== */
 /**
- * Genera las cuotas de un crédito según su modalidad:
- *  - comun / progresivo: con vencimientos por período (semanal/quincenal/mensual)
- *  - libre: CREA UNA SOLA CUOTA “ABIERTA”, sin mora y con vencimiento ficticio (2099-12-31)
- *           MOSTRANDO como importe el TOTAL DEL CICLO (capital pendiente + interés del ciclo)
- * Acepta transacción opcional `t` para asegurar consistencia en refi/creación.
+ * Calcula el total actual del crédito (sin tocar DB):
+ * - LIBRE: capital pendiente + mora (si hubiera) de su cuota abierta.
+ * - COMÚN/PROGRESIVO: suma por cuotas pendientes/parcial/vencidas:
+ *    (importe - descuento - pagado) + intereses_vencidos_acumulados (mora).
  */
+const calcularTotalActualCreditoPlain = (creditoPlain) => {
+  if (!creditoPlain) return 0;
+  if (String(creditoPlain.modalidad_credito) === 'libre') {
+    const capital = toNumber(creditoPlain.saldo_actual);
+    const cuota = Array.isArray(creditoPlain.cuotas) ? creditoPlain.cuotas[0] : null;
+    const mora = fix2(toNumber(cuota?.intereses_vencidos_acumulados));
+    return fix2(capital + mora);
+  }
+  // común/progresivo
+  let total = 0;
+  const cuotas = Array.isArray(creditoPlain.cuotas) ? creditoPlain.cuotas : [];
+  for (const c of cuotas) {
+    const estado = String(c.estado || '').toLowerCase();
+    if (!['pendiente', 'parcial', 'vencida'].includes(estado)) continue;
+    const principalPend = Math.max(
+      fix2(toNumber(c.importe_cuota) - toNumber(c.descuento_cuota) - toNumber(c.monto_pagado_acumulado)), 0
+    );
+    const mora = fix2(toNumber(c.intereses_vencidos_acumulados));
+    total = fix2(total + principalPend + mora);
+  }
+  return total;
+};
+
+/* ===================== Generación de cuotas ===================== */
 const generarCuotasServicio = async (credito, t = null) => {
   const {
     id: credito_id,
@@ -213,22 +342,31 @@ const generarCuotasServicio = async (credito, t = null) => {
     fecha_compromiso_pago
   } = credito.get ? credito.get({ plain: true }) : credito;
 
-  // Caso LIBRE → 1 cuota abierta (importe = capital pendiente + interés del ciclo)
+  // Caso LIBRE → 1 cuota abierta
   if (modalidad_credito === 'libre') {
     await Cuota.destroy({ where: { credito_id }, ...(t && { transaction: t }) }); // limpieza defensiva
-    // Enforzar tope 3 meses
     verificarTopeCiclosLibre(credito);
     const importe = calcularImporteCuotaLibre(credito);
+    const moraLibre = calcularMoraLibre(credito, ymdDate(todayYMD()));
+
+    let diasAtraso = 0;
+    if (fecha_compromiso_pago) {
+      const h = todayYMD();
+      if (h > fecha_compromiso_pago) {
+        diasAtraso = differenceInCalendarDays(ymdDate(h), ymdDate(fecha_compromiso_pago));
+      }
+    }
+    const estado = diasAtraso > 0 ? 'vencida' : 'pendiente';
 
     await Cuota.create({
       credito_id,
       numero_cuota: 1,
       importe_cuota: fix2(importe),
       fecha_vencimiento: LIBRE_VTO_FICTICIO,
-      estado: 'pendiente',
+      estado,
       forma_pago_id: null,
       descuento_cuota: 0.00,
-      intereses_vencidos_acumulados: 0.00,
+      intereses_vencidos_acumulados: fix2(moraLibre),
       monto_pagado_acumulado: 0.00
     }, t ? { transaction: t } : undefined);
     return;
@@ -260,7 +398,7 @@ const generarCuotasServicio = async (credito, t = null) => {
     );
   }
 
-  // Fecha base
+  // Fecha base = fecha_compromiso_pago
   const [year, month, day] = fecha_compromiso_pago
     .split('-')
     .map((x) => parseInt(x, 10));
@@ -270,7 +408,7 @@ const generarCuotasServicio = async (credito, t = null) => {
   const bulk = cuotasArr.map(({ numero_cuota, importe_cuota }) => {
     const dias =
       tipo_credito === 'semanal' ? 7 :
-      tipo_credito === 'quincenal' ? 15 : 30;
+        tipo_credito === 'quincenal' ? 15 : 30;
     const venc = addDays(fechaBase, dias * numero_cuota);
     return {
       credito_id,
@@ -288,8 +426,199 @@ const generarCuotasServicio = async (credito, t = null) => {
   await Cuota.bulkCreate(bulk, t ? { transaction: t } : undefined);
 };
 
+/* ===================== Simulación de plan (Cotizador) ===================== */
+/**
+ * Simula un crédito COMÚN o PROGRESIVO usando la misma lógica
+ * que crearCredito/generarCuotasServicio, pero sin tocar la base.
+ *
+ * data:
+ *  - monto_acreditar
+ *  - tipo_credito: 'mensual' | 'semanal' | 'quincenal'
+ *  - cantidad_cuotas
+ *  - modalidad_credito: 'comun' | 'progresivo'
+ *  - descuento (opcional, solo aplica si rol_id === 0)
+ *  - interes (opcional, solo se usa directo si origen_venta_manual_financiada = true)
+ *  - fecha_compromiso_pago (base para vencimientos; default: hoy)
+ */
+export const simularPlanCredito = (data = {}) => {
+  const {
+    monto_acreditar,
+    tipo_credito,
+    cantidad_cuotas,
+    modalidad_credito = 'comun',
+    descuento = 0,
+    rol_id = null,
+    interes: interesInput,
+    fecha_compromiso_pago,
+    origen_venta_manual_financiada = false
+  } = data;
+
+  const capital = toNumber(monto_acreditar);
+  const n = Math.max(toNumber(cantidad_cuotas), 1);
+
+  if (!capital || capital <= 0) {
+    throw new Error('Monto a acreditar inválido para simulación.');
+  }
+  if (!tipo_credito) {
+    throw new Error('Tipo de crédito requerido para simulación.');
+  }
+
+  const modalidadStr = String(modalidad_credito || 'comun').toLowerCase();
+  if (modalidadStr === 'libre') {
+    throw new Error('La simulación de modalidad LIBRE no está soportada desde este servicio.');
+  }
+
+  // === Interés ===
+  let interestPct;
+  if (origen_venta_manual_financiada && typeof interesInput !== 'undefined') {
+    interestPct = normalizePercent(interesInput);
+  } else {
+    interestPct = calcularInteresProporcionalMin60(tipo_credito, n);
+  }
+
+  let totalBase = Number((capital * (1 + interestPct / 100)).toFixed(2));
+
+  // Descuento opcional (solo para superadmin)
+  let descuentoPct = 0;
+  if (rol_id === 0 && Number(descuento) > 0) {
+    descuentoPct = Number(descuento);
+    const discMonto = Number((totalBase * descuentoPct) / 100).toFixed(2);
+    totalBase = Number((totalBase - discMonto).toFixed(2));
+  }
+
+  const M = totalBase;
+
+  // === Cuotas ===
+  let cuotasArr = [];
+  if (modalidadStr === 'progresivo') {
+    const sum = (n * (n + 1)) / 2;
+    let acumulado = 0;
+    for (let i = 1; i <= n; i++) {
+      const importe = parseFloat((M * (i / sum)).toFixed(2));
+      cuotasArr.push({ numero_cuota: i, importe_cuota: importe });
+      acumulado += importe;
+    }
+    const diff = parseFloat((M - acumulado).toFixed(2));
+    cuotasArr[n - 1].importe_cuota = parseFloat(
+      (cuotasArr[n - 1].importe_cuota + diff).toFixed(2)
+    );
+  } else {
+    const fija = parseFloat((M / n).toFixed(2));
+    for (let i = 1; i <= n; i++) {
+      cuotasArr.push({ numero_cuota: i, importe_cuota: fija });
+    }
+    const totalCalc = fija * n;
+    const diff = parseFloat((M - totalCalc).toFixed(2));
+    cuotasArr[n - 1].importe_cuota = parseFloat(
+      (cuotasArr[n - 1].importe_cuota + diff).toFixed(2)
+    );
+  }
+
+  // === Fechas de vencimiento ===
+  const baseStr = fecha_compromiso_pago || todayYMD();
+  let fechaBase;
+  try {
+    const [year, month, day] = String(baseStr).split('-').map((x) => parseInt(x, 10));
+    fechaBase = new Date(year, month - 1, day);
+  } catch {
+    fechaBase = new Date();
+  }
+
+  const dias =
+    tipo_credito === 'semanal' ? 7 :
+      tipo_credito === 'quincenal' ? 15 : 30;
+
+  const cuotasSimuladas = cuotasArr.map(({ numero_cuota, importe_cuota }) => {
+    const venc = addDays(fechaBase, dias * numero_cuota);
+    return {
+      numero_cuota,
+      importe_cuota: fix2(importe_cuota),
+      fecha_vencimiento: format(venc, 'yyyy-MM-dd')
+    };
+  });
+
+  return {
+    modalidad_credito: modalidadStr,
+    tipo_credito,
+    cantidad_cuotas: n,
+    monto_acreditar: fix2(capital),
+    interes_pct: interestPct,
+    descuento_pct: descuentoPct,
+    monto_total_devolver: fix2(M),
+    cuotas: cuotasSimuladas
+  };
+};
+
+/* ===================== Precálculo para CRÉDITOS ANTIGUOS ===================== */
+/**
+ * Regla corregida (TZ y YMD):
+ * - Si fv < hoyYMD(TZ) → marcar 'vencida' y calcular mora por días completos.
+ * - Si fv === hoyYMD(TZ) → NO marcar 'vencida' y mora = 0 (no corre el mismo día).
+ * - Si fv > hoyYMD(TZ) → mora = 0.
+ *
+ * IMPORTANTE:
+ * - Nunca tocar cuotas 'pagada', 'refinanciada' o 'anulada'.
+ */
+const marcarVencidasYCalcularMora = async (
+  creditoId,
+  {
+    sumarSoloVencidas = true,
+    fechaCorte // opcional YYYY-MM-DD
+  } = {}
+) => {
+  const credito = await Credito.findByPk(creditoId);
+  if (!credito || esLibre(credito)) return;
+
+  const hoy = fechaCorte ? ymdDate(fechaCorte) : ymdDate(todayYMD());
+  const hoyY = ymd(hoy);
+
+  const cuotas = await Cuota.findAll({ where: { credito_id: creditoId } });
+  for (const c of cuotas) {
+    const fv = c.fecha_vencimiento;
+    if (!fv) continue;
+
+    const estado = String(c.estado || '').toLowerCase();
+    const fvY = ymd(fv);
+
+    // 🛡️ No tocamos cuotas cerradas / derivadas
+    if (['pagada', 'refinanciada', 'anulada'].includes(estado)) {
+      continue;
+    }
+
+    if (fvY < hoyY) {
+      // Día posterior al vencimiento → calcular mora por días completos (versión simple, se pisará luego)
+      const dias = Math.max(differenceInCalendarDays(ymdDate(hoy), ymdDate(fv)), 0);
+      const mora = fix2(toNumber(c.importe_cuota) * MORA_DIARIA * dias);
+      await c.update({
+        estado: 'vencida',
+        intereses_vencidos_acumulados: mora
+      });
+    } else if (fvY === hoyY) {
+      // Mismo día → NO se marca vencida, mora 0
+      if (!sumarSoloVencidas && toNumber(c.intereses_vencidos_acumulados) !== 0) {
+        await c.update({ intereses_vencidos_acumulados: 0 });
+      }
+      if (estado === 'vencida') {
+        await c.update({ estado: 'pendiente' });
+      }
+    } else if (!sumarSoloVencidas) {
+      // Futuras → sin mora
+      if (toNumber(c.intereses_vencidos_acumulados) !== 0) {
+        await c.update({ intereses_vencidos_acumulados: 0 });
+      }
+    }
+  }
+};
+
 /* ===================== Listado / detalle ===================== */
-export const obtenerCreditos = async (query) => {
+export const obtenerCreditos = async (query, { rol_id = null } = {}) => {
+  // Visualización de créditos solo para admin/superadmin cuando se pasa rol_id
+  if (rol_id !== null && rol_id !== 0 && rol_id !== 1) {
+    const err = new Error('No tenés permisos para ver créditos.');
+    err.status = 403;
+    throw err;
+  }
+
   const where = buildFilters(query, ['cliente_id', 'estado', 'interes', 'monto']);
   return Credito.findAll({
     where,
@@ -301,62 +630,86 @@ export const obtenerCreditos = async (query) => {
   });
 };
 
-export const obtenerCreditoPorId = async (id) => {
-  const cred = await Credito.findByPk(id, {
-    include: [
-      { model: Cliente, as: 'cliente', attributes: ['id', 'nombre', 'apellido'] },
-      { model: Cuota, as: 'cuotas', separate: true, order: [['numero_cuota', 'ASC']] }
-    ]
-  });
-  // Si es LIBRE, refresco el importe de la cuota para que muestre el ciclo vigente
-  if (cred && esLibre(cred)) {
-    await refrescarCuotaLibre(cred.id);
-    return Credito.findByPk(id, {
-      include: [
-        { model: Cliente, as: 'cliente', attributes: ['id', 'nombre', 'apellido'] },
-        { model: Cuota, as: 'cuotas', separate: true, order: [['numero_cuota', 'ASC']] }
-      ]
-    });
+/**
+ * ✅ Versión robusta:
+ * - Lee el crédito con todas sus relaciones.
+ * - Si existe, recalcula LIBRE o común/progresivo (mora/estado) dentro de un try/catch.
+ * - Relee el crédito actualizado.
+ * - Siempre que la fila exista, devuelve algo (evitamos 404 fantasma).
+ */
+export const obtenerCreditoPorId = async (id, { rol_id = null } = {}) => {
+  const pk = Number(id);
+  if (!Number.isFinite(pk)) return null;
+
+  // Visualización de un crédito solo para admin/superadmin cuando se pasa rol_id
+  if (rol_id !== null && rol_id !== 0 && rol_id !== 1) {
+    const err = new Error('No tenés permisos para ver créditos.');
+    err.status = 403;
+    throw err;
   }
+
+  const includeOpts = [
+    { model: Cliente, as: 'cliente' },
+    { model: Cuota, as: 'cuotas', separate: true, order: [['numero_cuota', 'ASC']] },
+    { model: Usuario, as: 'cobradorCredito', attributes: ['id', 'nombre_completo'] }
+  ];
+
+  // 1) Leemos el crédito con todas las relaciones
+  let cred = await Credito.findByPk(pk, { include: includeOpts });
+  if (!cred) return null;
+
+  // 2) Recalcular en función de modalidad (protegido con try/catch)
+  try {
+    if (esLibre(cred)) {
+      // LIBRE → refresca cuota abierta y mora
+      await refrescarCuotaLibre(pk);
+    } else {
+      // COMÚN / PROGRESIVO:
+      // 1) Normalizamos estados 'vencida' según fecha (versión simple).
+      await marcarVencidasYCalcularMora(pk, {
+        sumarSoloVencidas: true,
+        fechaCorte: todayYMD()
+      });
+
+      // 2) Recalculamos la MORA usando la misma lógica que usa el modal de pago
+      //    (cuota.service → simularMoraCuotaHasta), para que ficha y modal coincidan.
+      try {
+        const { recalcularMoraPorCredito } = await import('./cuota.service.js');
+        await recalcularMoraPorCredito(pk);
+      } catch (e2) {
+        console.error('[obtenerCreditoPorId] Error al recalcular mora por crédito:', e2?.message || e2);
+      }
+
+      // 3) Ajustamos estado global del crédito (pendiente / vencido / pagado)
+      await actualizarEstadoCredito(pk);
+    }
+
+    // Releer actualizado (si por alguna razón no vuelve nada, nos quedamos con el original)
+    const refetched = await Credito.findByPk(pk, { include: includeOpts });
+    if (refetched) {
+      cred = refetched;
+    }
+  } catch (e) {
+    console.error('[obtenerCreditoPorId] Error al recalcular crédito:', e?.message || e);
+    // No tiramos error para no romper la ficha ni la ficha PDF
+  }
+
+  // 3) total_actual calculado + fechas de ciclos para LIBRE
+  const plain = cred.get({ plain: true });
+  const totalActual = calcularTotalActualCreditoPlain(plain);
+  cred.setDataValue('total_actual', totalActual);
+
+  if (esLibre(plain)) {
+    const ciclos = obtenerFechasCiclosLibre(plain);
+    if (ciclos) {
+      cred.setDataValue('fechas_ciclos_libre', ciclos);
+    }
+  }
+
   return cred;
 };
 
-/* ===================== Precálculo para CRÉDITOS ANTIGUOS ===================== */
-const marcarVencidasYCalcularMora = async (
-  creditoId,
-  {
-    sumarSoloVencidas = true,
-    fechaCorte = format(new Date(), 'yyyy-MM-dd')
-  } = {}
-) => {
-  const credito = await Credito.findByPk(creditoId);
-  if (!credito || esLibre(credito)) return;
-
-  const cuotas = await Cuota.findAll({ where: { credito_id: creditoId } });
-  for (const c of cuotas) {
-    const fv = c.fecha_vencimiento;
-    if (fv && fv < fechaCorte) {
-      const dias = Math.max(differenceInCalendarDays(new Date(fechaCorte), new Date(fv)), 0);
-      const mora = fix2(toNumber(c.importe_cuota) * MORA_DIARIA * dias);
-      await c.update({
-        estado: 'vencida',
-        intereses_vencidos_acumulados: mora
-      });
-    } else if (!sumarSoloVencidas) {
-      if (toNumber(c.intereses_vencidos_acumulados) !== 0) {
-        await c.update({ intereses_vencidos_acumulados: 0 });
-      }
-    }
-  }
-};
-
 /* ===================== Crear / Actualizar ===================== */
-/**
- * Ahora soporta options.transaction (t) para ejecutar TODO dentro de la misma TX:
- * - Crear crédito
- * - Generar cuotas
- * - Registrar egreso de desembolso en caja
- */
 export const crearCredito = async (data, options = {}) => {
   const t = options?.transaction || null;
 
@@ -373,66 +726,67 @@ export const crearCredito = async (data, options = {}) => {
     descuento = 0,
     rol_id = null,
     interes: interesInput,
-    origen_venta_manual_financiada = false, // ⬅️ NUEVO: prioridad a interés manual
-    // banderas de precálculo histórico (NO aplican a libre)
+    origen_venta_manual_financiada = false,
+    detalle_producto = null,
     recalcular_hasta_hoy = true,
     sumar_interes_solo_vencidas = true,
-    fecha_corte = null
+    fecha_corte = null,
+    // 👇 nuevo: usuario que origina el movimiento de caja
+    usuario_id = null
   } = data;
 
-  // —— Modalidad LIBRE — solo hasta 3 meses —— 
+  // —— Modalidad LIBRE —— 
   if (modalidad_credito === 'libre') {
-    const tasaPorCicloPct = normalizePercent(interesInput, 60);
-    const tasaDec = percentToDecimal(tasaPorCicloPct);
+    const tasaPorCicloPct = normalizePercent(interesInput, 0);
 
     const nuevo = await Credito.create({
       cliente_id,
       cobrador_id,
       monto_acreditar,
-      fecha_solicitud: fecha_solicitud || format(new Date(), 'yyyy-MM-dd'),
+      fecha_solicitud: fecha_solicitud || todayYMD(),
       fecha_acreditacion,
       fecha_compromiso_pago,
-      interes: tasaPorCicloPct,    // 60 = 60%
-      tipo_credito: 'mensual',     // para libre consideramos ciclos mensuales
-      cantidad_cuotas: 1,          // 1 cuota abierta
+      interes: tasaPorCicloPct,    // base para mora (interés del mes)
+      tipo_credito: 'mensual',
+      cantidad_cuotas: 1,
       modalidad_credito,
       descuento: 0,
-      // total de referencia del PRIMER ciclo (no se usa para saldo)
-      monto_total_devolver: fix2(monto_acreditar * (1 + tasaDec)),
-      // el saldo representa SIEMPRE el capital pendiente
+      monto_total_devolver: fix2(monto_acreditar),
       saldo_actual: fix2(monto_acreditar),
-      interes_acumulado: 0.00
+      interes_acumulado: 0.00,
+      origen_venta_manual_financiada,
+      detalle_producto
     }, t ? { transaction: t } : undefined);
 
-    // Enforzamos ciclos y generamos cuota 1
     verificarTopeCiclosLibre(nuevo);
     await generarCuotasServicio(nuevo, t || null);
 
     // EGRESO en Caja por desembolso (LIBRE)
-    try {
-      const cli = await Cliente.findByPk(cliente_id, t ? { transaction: t } : undefined);
-      const clienteNombre = cli ? `${cli.nombre} ${cli.apellido}` : null;
-      await registrarEgresoDesembolsoCredito({
-        creditoId: nuevo.id,
-        clienteNombre,
-        fecha_acreditacion,
-        monto: monto_acreditar
-      }, { t });
-    } catch (e) {
-      // Log defensivo; no interrumpe la creación del crédito
-      console.error('[Caja][Desembolso libre] No se pudo registrar movimiento:', e?.message || e);
+    // Si el crédito proviene de una venta manual financiada, NO impactamos Caja aquí
+    if (!origen_venta_manual_financiada) {
+      try {
+        const cli = await Cliente.findByPk(cliente_id, t ? { transaction: t } : undefined);
+        const clienteNombre = cli ? `${cli.nombre} ${cli.apellido}` : null;
+        await registrarEgresoDesembolsoCredito({
+          creditoId: nuevo.id,
+          clienteNombre,
+          fecha_acreditacion,
+          monto: monto_acreditar,
+          usuario_id
+        }, { t });
+      } catch (e) {
+        console.error('[Caja][Desembolso libre] No se pudo registrar movimiento:', e?.message || e);
+      }
     }
 
     return nuevo.id;
   }
 
-  // —— común / progresivo — interés MANUAL si proviene de venta financiada —— 
+  // —— común / progresivo —— 
   let interestPct;
   if (origen_venta_manual_financiada && typeof interesInput !== 'undefined') {
-    // Prioridad al interés manual provisto por la venta (ej. 60 ó 0.60)
     interestPct = normalizePercent(interesInput);
   } else {
-    // Regla estándar (mínimo 60 proporcional por períodos)
     interestPct = calcularInteresProporcionalMin60(tipo_credito, cantidad_cuotas);
   }
 
@@ -450,7 +804,7 @@ export const crearCredito = async (data, options = {}) => {
     cliente_id,
     cobrador_id,
     monto_acreditar,
-    fecha_solicitud: fecha_solicitud || format(new Date(), 'yyyy-MM-dd'),
+    fecha_solicitud: fecha_solicitud || todayYMD(),
     fecha_acreditacion,
     fecha_compromiso_pago,
     interes: interestPct,
@@ -460,43 +814,53 @@ export const crearCredito = async (data, options = {}) => {
     descuento: descuentoPct,
     monto_total_devolver: totalBase,
     saldo_actual: totalBase,
-    interes_acumulado: 0.00
+    interes_acumulado: 0.00,
+    origen_venta_manual_financiada,
+    detalle_producto
   }, t ? { transaction: t } : undefined);
 
   await generarCuotasServicio(nuevo, t || null);
 
-  // Créditos antiguos → precálculo de mora/interés por atraso (opcional)
   if (recalcular_hasta_hoy !== false) {
     await marcarVencidasYCalcularMora(nuevo.id, {
       sumarSoloVencidas: sumar_interes_solo_vencidas !== false,
-      fechaCorte: fecha_corte || format(new Date(), 'yyyy-MM-dd')
+      fechaCorte: fecha_corte || todayYMD()
     });
   }
 
-  // EGRESO en Caja por desembolso (común/progresivo)
+  // 🔁 Ajustamos el estado global del crédito según la situación de sus cuotas (todas vencidas → 'vencido')
   try {
-    const cli = await Cliente.findByPk(cliente_id, t ? { transaction: t } : undefined);
-    const clienteNombre = cli ? `${cli.nombre} ${cli.apellido}` : null;
-    await registrarEgresoDesembolsoCredito({
-      creditoId: nuevo.id,
-      clienteNombre,
-      fecha_acreditacion,
-      monto: monto_acreditar
-    }, { t });
+    await actualizarEstadoCredito(nuevo.id);
   } catch (e) {
-    console.error('[Caja][Desembolso común/progresivo] No se pudo registrar movimiento:', e?.message || e);
+    console.error('[crearCredito] No se pudo actualizar estado del crédito:', e?.message || e);
+  }
+
+  // EGRESO en Caja por desembolso (común/progresivo)
+  // Si el crédito proviene de una venta manual financiada, NO generamos egreso en Caja aquí
+  if (!origen_venta_manual_financiada) {
+    try {
+      const cli = await Cliente.findByPk(cliente_id, t ? { transaction: t } : undefined);
+      const clienteNombre = cli ? `${cli.nombre} ${cli.apellido}` : null;
+      await registrarEgresoDesembolsoCredito({
+        creditoId: nuevo.id,
+        clienteNombre,
+        fecha_acreditacion,
+        monto: monto_acreditar,
+        usuario_id
+      }, { t });
+    } catch (e) {
+      console.error('[Caja][Desembolso común/progresivo] No se pudo registrar movimiento:', e?.message || e);
+    }
   }
 
   return nuevo.id;
+
 };
 
 /**
  * Actualizar un crédito:
  *  - común/progresivo → recalcula interés (proporcional, mínimo 60) y REGENERA cuotas
- *  - libre            → recalcula total de ciclo = capital*(1+tasa) **(solo referencia)** y
- *                       ACTUALIZA la cuota abierta para que muestre capital+interés del ciclo.
- *                       **No tocamos saldo_actual** (sigue siendo capital).
- *  - Para créditos antiguos: mismas banderas de precálculo histórico
+ *  - libre            → refresca cuota abierta (capital) y recalcula MORA según regla
  */
 export const actualizarCredito = async (id, data) => {
   const existente = await Credito.findByPk(id);
@@ -513,39 +877,39 @@ export const actualizarCredito = async (id, data) => {
     descuento = existente.descuento,
     rol_id = null,
     interes: interesInput,
-    origen_venta_manual_financiada = false,
+    origen_venta_manual_financiada = existente.origen_venta_manual_financiada,
+    detalle_producto = existente.detalle_producto,
     recalcular_hasta_hoy = true,
     sumar_interes_solo_vencidas = true,
     fecha_corte = null
   } = data;
 
-  // —— LIBRE → recalcular referencia de ciclo y refrescar cuota —— 
+  // —— LIBRE —— 
   if (modalidad_credito === 'libre') {
     const tasaPorCicloPct = normalizePercent(
       typeof interesInput !== 'undefined' ? interesInput : existente.interes,
-      60
+      0
     );
-    const tasaDec = percentToDecimal(tasaPorCicloPct);
     const capital = toNumber(typeof monto_acreditar !== 'undefined' ? monto_acreditar : existente.monto_acreditar);
 
     await Credito.update(
       {
         monto_acreditar: capital,
-        fecha_solicitud: fecha_solicitud || existente.fecha_solicitud || format(new Date(), 'yyyy-MM-dd'),
+        fecha_solicitud: fecha_solicitud || existente.fecha_solicitud || todayYMD(),
         fecha_acreditacion: fecha_acreditacion || existente.fecha_acreditacion,
         fecha_compromiso_pago: fecha_compromiso_pago || existente.fecha_compromiso_pago,
-        interes: tasaPorCicloPct,
+        interes: tasaPorCicloPct,  // base para mora mensual
         tipo_credito: 'mensual',
         cantidad_cuotas: 1,
         modalidad_credito,
         descuento: 0,
-        // solo referencia del ciclo, el saldo_actual sigue siendo capital pendiente
-        monto_total_devolver: fix2(capital * (1 + tasaDec))
+        monto_total_devolver: fix2(capital),
+        origen_venta_manual_financiada,
+        detalle_producto
       },
       { where: { id } }
     );
 
-    // Refrescar cuota para mostrar capital+interés del ciclo vigente
     await refrescarCuotaLibre(id);
     return;
   }
@@ -573,7 +937,7 @@ export const actualizarCredito = async (id, data) => {
   await Credito.update(
     {
       monto_acreditar: capitalBase,
-      fecha_solicitud: fecha_solicitud || existente.fecha_solicitud || format(new Date(), 'yyyy-MM-dd'),
+      fecha_solicitud: fecha_solicitud || existente.fecha_solicitud || todayYMD(),
       fecha_acreditacion: fecha_acreditacion || existente.fecha_acreditacion,
       fecha_compromiso_pago: fecha_compromiso_pago || existente.fecha_compromiso_pago,
       interes: interestPct,
@@ -583,7 +947,9 @@ export const actualizarCredito = async (id, data) => {
       descuento: descuentoPct,
       monto_total_devolver: totalBase,
       saldo_actual: totalBase,
-      interes_acumulado: 0.00
+      interes_acumulado: 0.00,
+      origen_venta_manual_financiada,
+      detalle_producto
     },
     { where: { id } }
   );
@@ -595,35 +961,83 @@ export const actualizarCredito = async (id, data) => {
   if (recalcular_hasta_hoy !== false) {
     await marcarVencidasYCalcularMora(actualizado.id, {
       sumarSoloVencidas: sumar_interes_solo_vencidas !== false,
-      fechaCorte: fecha_corte || format(new Date(), 'yyyy-MM-dd')
+      fechaCorte: fecha_corte || todayYMD()
     });
+  }
+
+  // 🔁 Después de regenerar cuotas y recalcular mora, actualizamos el estado global
+  try {
+    await actualizarEstadoCredito(actualizado.id);
+  } catch (e) {
+    console.error('[actualizarCredito] No se pudo actualizar estado del crédito:', e?.message || e);
   }
 };
 
-/* ===================== Estado del crédito (no cambia para libre) ===================== */
-export const actualizarEstadoCredito = async (credito_id, transaction = null) => {
+/* ===================== Estado del crédito (no cambia para libre/refinanciado) ===================== */
+export async function actualizarEstadoCredito(credito_id, transaction = null) {
+  const credito = await Credito.findByPk(
+    credito_id,
+    transaction ? { transaction } : undefined
+  );
+  if (!credito) return;
+
+  const estadoActual = String(credito.estado || '').toLowerCase();
+
+  // 🛡️ Si el crédito ya está marcado como "refinanciado",
+  // no pisamos ese estado automáticamente.
+  if (estadoActual === 'refinanciado') {
+    return;
+  }
+
+  // Respetamos la regla: no cambiar estado automáticamente para LIBRE
+  if (esLibre(credito)) return;
+
   const cuotas = await Cuota.findAll({
     where: { credito_id },
     ...(transaction && { transaction })
   });
-  const todas = cuotas.every(c => c.estado === 'pagada');
-  const algunaV = cuotas.some(c => c.estado === 'vencida');
-  const estado = todas ? 'pagado' : algunaV ? 'vencido' : 'pendiente';
+
+  if (!cuotas || cuotas.length === 0) {
+    // Sin cuotas: mantenemos pendiente
+    await Credito.update(
+      { estado: 'pendiente' },
+      { where: { id: credito_id }, ...(transaction && { transaction }) }
+    );
+    return;
+  }
+
+  const todasPagadas = cuotas.every(c => String(c.estado).toLowerCase() === 'pagada');
+
+  // Solo consideramos "activas" las que no están pagadas
+  const activas = cuotas.filter(c => String(c.estado).toLowerCase() !== 'pagada');
+  const todasActivasVencidas = activas.length > 0 && activas.every(c => String(c.estado).toLowerCase() === 'vencida');
+
+  const nuevoEstado = todasPagadas
+    ? 'pagado'
+    : (todasActivasVencidas ? 'vencido' : 'pendiente');
+
   await Credito.update(
-    { estado },
+    { estado: nuevoEstado },
     { where: { id: credito_id }, ...(transaction && { transaction }) }
   );
-};
+}
 
 /* ============================================================
  *  CANCELACIÓN / PAGO ANTICIPADO
+ *  Ahora con modo de descuento configurable en LIQUIDACIÓN:
+ *  - descuento_sobre: 'mora' (default, comportamiento previo) | 'total'
+ *    En 'total': el descuento impacta primero en MORA y luego en PRINCIPAL.
  * ============================================================ */
 
 const cancelarCreditoLibre = async ({
   credito,
   forma_pago_id,
   descuento_porcentaje = 0,
-  observacion = null
+  descuento_sobre = 'mora',
+  observacion = null,
+  rol_id = null,
+  // 👇 nuevo: usuario que realiza la cancelación
+  usuario_id = null
 }) => {
   if (!forma_pago_id) {
     const err = new Error('Debe indicar forma_pago_id');
@@ -647,14 +1061,38 @@ const cancelarCreditoLibre = async ({
     };
   }
 
-  // Interés del ciclo vigente
-  const interesCiclo = interesCicloLibreHoy(credito);
-  const totalBase = fix2(saldoPendiente + interesCiclo);
+  // Mora vigente (sin contar día del compromiso)
+  const moraLibre = fix2(calcularMoraLibre(credito, ymdDate(todayYMD())));
 
-  // Descuento opcional sobre el total (interés + capital)
   const pct = Math.min(Math.max(toNumber(descuento_porcentaje), 0), 100);
-  const totalDescuento = fix2(totalBase * (pct / 100));
-  const totalAPagar = fix2(totalBase - totalDescuento);
+
+  // 🚫 Descuento solo permitido para superadmin cuando se pasa rol_id
+  if (pct > 0 && rol_id !== null && rol_id !== 0) {
+    const err = new Error('Solo un superadmin puede aplicar descuentos en la cancelación del crédito.');
+    err.status = 403;
+    throw err;
+  }
+
+  // Distribución del descuento
+  let descSobreMora = 0;
+  let descSobrePrincipal = 0;
+
+  if (String(descuento_sobre) === 'total') {
+    const base = fix2(saldoPendiente + moraLibre);
+    let totalDescuento = fix2(base * (pct / 100));
+    descSobreMora = Math.min(totalDescuento, moraLibre);
+    totalDescuento = fix2(totalDescuento - descSobreMora);
+    descSobrePrincipal = Math.min(totalDescuento, saldoPendiente);
+  } else {
+    // Comportamiento anterior: solo sobre mora
+    descSobreMora = fix2(moraLibre * (pct / 100));
+    descSobrePrincipal = 0;
+  }
+
+  const moraNeta = fix2(Math.max(moraLibre - descSobreMora, 0));
+  const principalNeto = fix2(Math.max(saldoPendiente - descSobrePrincipal, 0));
+  const totalAPagar = fix2(principalNeto + moraNeta);
+  const totalDescuento = fix2(descSobreMora + descSobrePrincipal);
 
   // Cuota única libre
   const cuotaLibre = await Cuota.findOne({
@@ -669,46 +1107,46 @@ const cancelarCreditoLibre = async ({
   try {
     const saldoAntes = fix2(credito.saldo_actual);
 
-    // Actualizar crédito: liquidado
     await Credito.update(
       {
         saldo_actual: 0,
         estado: 'pagado',
-        interes_acumulado: fix2(toNumber(credito.interes_acumulado) + interesCiclo)
+        interes_acumulado: fix2(toNumber(credito.interes_acumulado) + moraNeta)
       },
       { where: { id: credito.id }, transaction: t }
     );
 
-    // Cerrar la cuota abierta
+    // Actualizo la cuota: si hubo descuento sobre principal, lo reflejo en descuento_cuota
+    const nuevoDescCuota = fix2(toNumber(cuotaLibre.descuento_cuota) + descSobrePrincipal);
+
     await Cuota.update(
       {
         estado: 'pagada',
         forma_pago_id,
-        monto_pagado_acumulado: fix2(cuotaLibre.importe_cuota),
+        descuento_cuota: nuevoDescCuota,
+        // monto pagado sobre principal = importe - descuento aplicado al principal
+        monto_pagado_acumulado: fix2(toNumber(cuotaLibre.importe_cuota) - nuevoDescCuota),
         intereses_vencidos_acumulados: 0
       },
       { where: { id: cuotaLibre.id }, transaction: t }
     );
 
-    // Crear pago “resumen”
     const pagoResumen = await Pago.create(
       {
         cuota_id: cuotaLibre.id,
         monto_pagado: totalAPagar,
-        fecha_pago: format(new Date(), 'yyyy-MM-dd'),
+        fecha_pago: todayYMD(),
         forma_pago_id,
         observacion: `Cancelación crédito libre #${credito.id}` + (observacion ? ` - ${observacion}` : '')
       },
       { transaction: t }
     );
 
-    // Datos para el recibo
     const [cliente, cobrador, medio] = await Promise.all([
       Cliente.findByPk(credito.cliente_id, { transaction: t }),
       Usuario.findByPk(credito.cobrador_id, { transaction: t }),
       FormaPago.findByPk(forma_pago_id, { transaction: t })
     ]);
-    const now = new Date();
 
     const recibo = await Recibo.create(
       {
@@ -716,8 +1154,8 @@ const cancelarCreditoLibre = async ({
         cuota_id: cuotaLibre.id,
         cliente_id: credito.cliente_id,
 
-        fecha: format(now, 'yyyy-MM-dd'),
-        hora: format(now, 'HH:mm:ss'),
+        fecha: todayYMD(),
+        hora: nowTime(),
 
         cliente_nombre: cliente ? `${cliente.nombre} ${cliente.apellido}` : null,
         nombre_cobrador: cobrador?.nombre_completo || 'Sin cobrador asignado',
@@ -731,22 +1169,26 @@ const cancelarCreditoLibre = async ({
         saldo_anterior: saldoAntes,
         saldo_actual: 0,
 
-        // desgloses extra
-        mora_cobrada: 0,
-        principal_pagado: saldoPendiente,
-        interes_ciclo_cobrado: interesCiclo,
-        descuento_aplicado: totalDescuento,
+        // desgloses
+        mora_cobrada: moraNeta,
+        principal_pagado: principalNeto,
+        interes_ciclo_cobrado: 0,
+
+        descuento_aplicado: totalDescuento, // incluye mora + principal si 'total'
         saldo_credito_anterior: saldoAntes,
-        saldo_credito_actual: 0
+        saldo_credito_actual: 0,
+
+        // Mora restante (en cancelación total = 0)
+        saldo_mora: 0.00
       },
       { transaction: t }
     );
 
-    // INGRESO en Caja por el recibo (LIBRE)
     await registrarIngresoDesdeReciboEnTx({
       t,
       recibo,
-      forma_pago_id
+      forma_pago_id,
+      usuario_id
     });
 
     await t.commit();
@@ -754,11 +1196,13 @@ const cancelarCreditoLibre = async ({
     return {
       credito_id: credito.id,
       cuotas_pagadas: 1,
-      total_interes_ciclo: interesCiclo,
+      total_interes_ciclo: 0,
       total_descuento_aplicado: totalDescuento,
       total_pagado: totalAPagar,
+      total_mora_cobrada: moraNeta,
       saldo_credito_antes: saldoAntes,
-      saldo_credito_despues: 0
+      saldo_credito_despues: 0,
+      numero_recibo: recibo.numero_recibo
     };
   } catch (e) {
     await t.rollback();
@@ -770,11 +1214,22 @@ export const cancelarCredito = async ({
   credito_id,
   forma_pago_id,
   descuento_porcentaje = 0,
-  observacion = null
+  descuento_sobre = 'mora', // 'mora' (default) | 'total'
+  observacion = null,
+  rol_id = null,
+  // 👇 nuevo: usuario que realiza la cancelación
+  usuario_id = null
 }) => {
   if (!forma_pago_id) {
     const err = new Error('Debe indicar forma_pago_id');
     err.status = 400;
+    throw err;
+  }
+
+  // 🚫 Impacto de cancelación: si se pasa rol_id, solo admin/superadmin
+  if (rol_id !== null && rol_id !== 0 && rol_id !== 1) {
+    const err = new Error('No tenés permisos para cancelar créditos.');
+    err.status = 403;
     throw err;
   }
 
@@ -798,7 +1253,10 @@ export const cancelarCredito = async ({
       credito,
       forma_pago_id,
       descuento_porcentaje,
-      observacion
+      descuento_sobre,
+      observacion,
+      rol_id,
+      usuario_id
     });
   }
 
@@ -823,7 +1281,7 @@ export const cancelarCredito = async ({
     };
   }
 
-  // 1) Calcular principal pendiente por cuota y total
+  // 1) Principal pendiente por cuota y total
   const info = [];
   let totalPrincipalPendiente = 0;
   for (const c of cuotasPend) {
@@ -835,7 +1293,7 @@ export const cancelarCredito = async ({
     totalPrincipalPendiente = fix2(totalPrincipalPendiente + principalPend);
   }
 
-  // 2) Mora del día D por cuota (idempotente con pagos)
+  // 2) Mora del día (idempotente y en TZ)
   let totalMoraDia = 0;
   const moraHoyPorCuota = {};
   for (const { c } of info) {
@@ -844,44 +1302,102 @@ export const cancelarCredito = async ({
     totalMoraDia = fix2(totalMoraDia + mora);
   }
 
-  // 3) Descuento global (%) sobre principal total
   const pct = Math.min(Math.max(toNumber(descuento_porcentaje), 0), 100);
-  const totalDescuento = fix2(totalPrincipalPendiente * (pct / 100));
 
-  // 4) Reparto proporcional del descuento por cuota
-  const descuentos = new Map();
-  if (totalPrincipalPendiente > 0 && totalDescuento > 0) {
-    let asignado = 0;
-    for (let i = 0; i < info.length; i++) {
-      const { c, principalPend } = info[i];
-      if (principalPend <= 0) { descuentos.set(c.id, 0); continue; }
-      let d = fix2((principalPend / totalPrincipalPendiente) * totalDescuento);
-      descuentos.set(c.id, d);
-      asignado = fix2(asignado + d);
-    }
-    const delta = fix2(totalDescuento - asignado);
-    if (Math.abs(delta) >= 0.01) {
-      const last = [...info].reverse().find(x => x.principalPend > 0);
-      if (last) descuentos.set(last.c.id, fix2((descuentos.get(last.c.id) || 0) + delta));
-    }
-  } else {
-    for (const { c } of info) descuentos.set(c.id, 0);
+  // 🚫 Descuento en cancelación solo para superadmin cuando se pasa rol_id
+  if (pct > 0 && rol_id !== null && rol_id !== 0) {
+    const err = new Error('Solo un superadmin puede aplicar descuentos en la cancelación del crédito.');
+    err.status = 403;
+    throw err;
   }
 
-  // 5) Transacción: cerrar cuotas + actualizar crédito + crear Pago y Recibo únicos
+  // 3) Estrategia de descuento
+  let descSobreMoraTotal = 0;
+  let descSobrePrincipalTotal = 0;
+
+  const descuentosMora = new Map();      // cuota_id -> descuento aplicado a mora (para referencia, no se guarda en cuota)
+  const descuentosPrincipal = new Map(); // cuota_id -> descuento aplicado al principal (se refleja en descuento_cuota)
+
+  if (String(descuento_sobre) === 'total') {
+    // Descuento sobre (principal + mora): primero a mora, luego al principal
+    const baseTotal = fix2(totalPrincipalPendiente + totalMoraDia);
+    let totalDescuento = fix2(baseTotal * (pct / 100));
+
+    // a) Aplicar a mora por proporción de mora de cada cuota
+    if (totalMoraDia > 0) {
+      let asignadoMora = 0;
+      for (let i = 0; i < info.length; i++) {
+        const { c } = info[i];
+        const m = toNumber(moraHoyPorCuota[c.id]);
+        const d = fix2(Math.min((m / totalMoraDia) * totalDescuento, m));
+        descuentosMora.set(c.id, d);
+        asignadoMora = fix2(asignadoMora + d);
+      }
+      descSobreMoraTotal = asignadoMora;
+      totalDescuento = fix2(Math.max(totalDescuento - asignadoMora, 0));
+    }
+
+    // b) El remanente va al principal por proporción del principal pendiente
+    if (totalDescuento > 0 && totalPrincipalPendiente > 0) {
+      let asignadoPrincipal = 0;
+      for (let i = 0; i < info.length; i++) {
+        const { c, principalPend } = info[i];
+        const d = fix2(Math.min((principalPend / totalPrincipalPendiente) * totalDescuento, principalPend));
+        descuentosPrincipal.set(c.id, d);
+        asignadoPrincipal = fix2(asignadoPrincipal + d);
+      }
+      descSobrePrincipalTotal = asignadoPrincipal;
+      // ✅ Fix bug: variable correcta en el ajuste fino
+      const delta = fix2(totalDescuento - asignadoPrincipal);
+      if (Math.abs(delta) >= 0.01) {
+        const last = info[info.length - 1].c;
+        descuentosPrincipal.set(last.id, fix2((descuentosPrincipal.get(last.id) || 0) + delta));
+        descSobrePrincipalTotal = fix2(descSobrePrincipalTotal + delta);
+      }
+    }
+
+  } else {
+    // Comportamiento anterior: descuento solo sobre mora, proporcional a la mora del día
+    const totalDescuento = fix2(totalMoraDia * (pct / 100));
+    if (totalMoraDia > 0 && totalDescuento > 0) {
+      let asignado = 0;
+      const itemsConMora = info.filter(({ c }) => toNumber(moraHoyPorCuota[c.id]) > 0);
+      for (let i = 0; i < itemsConMora.length; i++) {
+        const { c } = itemsConMora[i];
+        const moraC = toNumber(moraHoyPorCuota[c.id]);
+        let d = fix2((moraC / totalMoraDia) * totalDescuento);
+        d = Math.min(d, moraC);
+        descuentosMora.set(c.id, d);
+        asignado = fix2(asignado + d);
+      }
+      const delta = fix2(totalDescuento - asignado);
+      if (Math.abs(delta) >= 0.01 && info.length > 0) {
+        const last = info[info.length - 1].c;
+        descuentosMora.set(last.id, fix2((descuentosMora.get(last.id) || 0) + delta));
+      }
+      descSobreMoraTotal = fix2(totalDescuento);
+    }
+    // Principal no se descuenta en este modo
+  }
+
+  // 4) TX de cierre
   const t = await Credito.sequelize.transaction();
   try {
-    for (const { c, principalPend } of info) {
-      const descAsignado = principalPend > 0 ? Math.min(descuentos.get(c.id) || 0, principalPend) : 0;
-      const nuevoDescAcum = fix2(c.descuento_cuota + descAsignado);
-      const nuevoPagadoAcum = fix2(c.importe_cuota - nuevoDescAcum);
+    // Actualización de cuotas: se cancela cada una.
+    for (const { c } of info) {
+      const descPrincipalC = fix2(descuentosPrincipal.get(c.id) || 0);
+      const nuevoDescCuota = fix2(toNumber(c.descuento_cuota) + descPrincipalC);
+
+      // Al liquidar: pagado acumulado = importe - descuento_cuota
+      const nuevoPagadoAcum = fix2(toNumber(c.importe_cuota) - nuevoDescCuota);
 
       await Cuota.update(
         {
           estado: 'pagada',
           forma_pago_id,
-          descuento_cuota: nuevoDescAcum,
+          descuento_cuota: nuevoDescCuota,
           monto_pagado_acumulado: nuevoPagadoAcum,
+          // cortamos mora
           intereses_vencidos_acumulados: 0
         },
         { where: { id: c.id }, transaction: t }
@@ -889,13 +1405,17 @@ export const cancelarCredito = async ({
     }
 
     const saldoAntes = fix2(credito.saldo_actual);
-    const totalPagado = fix2((totalPrincipalPendiente - totalDescuento) + totalMoraDia);
+
+    const principalNeto = fix2(Math.max(totalPrincipalPendiente - descSobrePrincipalTotal, 0));
+    const moraNeta = fix2(Math.max(totalMoraDia - descSobreMoraTotal, 0));
+    const totalDescuento = fix2(descSobreMoraTotal + descSobrePrincipalTotal);
+    const totalPagado = fix2(principalNeto + moraNeta);
 
     await Credito.update(
       {
         saldo_actual: 0,
         estado: 'pagado',
-        interes_acumulado: fix2(toNumber(credito.interes_acumulado) + totalMoraDia)
+        interes_acumulado: fix2(toNumber(credito.interes_acumulado) + moraNeta)
       },
       { where: { id: credito_id }, transaction: t }
     );
@@ -905,7 +1425,7 @@ export const cancelarCredito = async ({
       {
         cuota_id: cuotaAsociada.id,
         monto_pagado: totalPagado,
-        fecha_pago: format(new Date(), 'yyyy-MM-dd'),
+        fecha_pago: todayYMD(),
         forma_pago_id,
         observacion: `Cancelación crédito #${credito_id}` + (observacion ? ` - ${observacion}` : '')
       },
@@ -918,16 +1438,14 @@ export const cancelarCredito = async ({
       FormaPago.findByPk(forma_pago_id, { transaction: t })
     ]);
 
-    const now = new Date();
-
     const recibo = await Recibo.create(
       {
         pago_id: pagoResumen.id,
         cuota_id: cuotaAsociada.id,
         cliente_id: credito.cliente_id,
 
-        fecha: format(now, 'yyyy-MM-dd'),
-        hora: format(now, 'HH:mm:ss'),
+        fecha: todayYMD(),
+        hora: nowTime(),
 
         cliente_nombre: cliente ? `${cliente.nombre} ${cliente.apellido}` : null,
         nombre_cobrador: cobrador?.nombre_completo || 'Sin cobrador asignado',
@@ -941,20 +1459,24 @@ export const cancelarCredito = async ({
         saldo_anterior: saldoAntes,
         saldo_actual: 0,
 
-        mora_cobrada: totalMoraDia,
-        principal_pagado: fix2(totalPrincipalPendiente - totalDescuento),
-        descuento_aplicado: totalDescuento,
+        // Desgloses coherentes con el modo de descuento
+        mora_cobrada: moraNeta,
+        principal_pagado: principalNeto,
+        descuento_aplicado: totalDescuento, // incluye descuento a mora y, si corresponde, a principal
         saldo_credito_anterior: saldoAntes,
-        saldo_credito_actual: 0
+        saldo_credito_actual: 0,
+
+        // Mora restante luego de la operación (en cancelación total = 0)
+        saldo_mora: 0.00
       },
       { transaction: t }
     );
 
-    // INGRESO en Caja por el recibo (común/progresivo)
     await registrarIngresoDesdeReciboEnTx({
       t,
       recibo,
-      forma_pago_id
+      forma_pago_id,
+      usuario_id
     });
 
     await t.commit();
@@ -964,40 +1486,78 @@ export const cancelarCredito = async ({
       cuotas_pagadas: info.length,
       total_principal_pendiente: totalPrincipalPendiente,
       total_descuento_aplicado: totalDescuento,
-      total_mora_cobrada: totalMoraDia,
+      total_mora_cobrada: moraNeta,
       total_pagado: totalPagado,
       saldo_credito_antes: saldoAntes,
-      saldo_credito_despues: 0
+      saldo_credito_despues: 0,
+      numero_recibo: recibo.numero_recibo
     };
   } catch (e) {
     if (t.finished !== 'commit') {
-      try { await t.rollback(); } catch (_) {}
+      try { await t.rollback(); } catch (_) { }
     }
     throw e;
   }
 };
 
-/* ===================== Refinanciación (transaccional y con generación de cuotas dentro de la misma TX) ===================== */
+/* ===================== Refinanciación ===================== */
 export const refinanciarCredito = async ({
   creditoId,
   opcion,           // 'P1' | 'P2' | 'manual'
   tasaManual = 0,   // tasa mensual en %
   cantidad_cuotas,
-  tipo_credito      // 'mensual' | 'semanal' | 'quincenal' (opcional, si no se envía, hereda del original)
+  tipo_credito,     // 'mensual' | 'semanal' | 'quincenal'
+  rol_id = null
 }) => {
-  const original = await Credito.findByPk(creditoId);
+  let original = await Credito.findByPk(creditoId, {
+    include: [{ model: Cuota, as: 'cuotas' }]
+  });
   if (!original) throw new Error('Crédito no encontrado');
 
-  // ✅ Solo se puede refinanciar créditos de modalidad COMÚN
-  if (String(original.modalidad_credito) !== 'comun') {
-    const err = new Error('Solo se permite refinanciar créditos de modalidad "comun".');
+  // 🛡️ Bloqueo: un crédito ya refinanciado no se puede volver a refinanciar.
+  const estadoOriginal = String(original.estado || '').toLowerCase();
+  if (estadoOriginal === 'refinanciado') {
+    const err = new Error('Este crédito ya fue refinanciado y no puede volver a refinanciarse.');
     err.status = 400;
     throw err;
   }
 
-  const saldo = toNumber(original.saldo_actual);
+  const modalidad = String(original.modalidad_credito || '').toLowerCase();
 
-  // 1) Determinar tasa mensual por opción
+  // ✅ Permitimos refinanciar: común, progresivo y libre
+  if (!['comun', 'progresivo', 'libre'].includes(modalidad)) {
+    const err = new Error('Solo se permite refinanciar créditos de modalidad "comun", "progresivo" o "libre".');
+    err.status = 400;
+    throw err;
+  }
+
+  // 🔁 Si es LIBRE, refrescamos primero la cuota para tener la MORA actualizada
+  if (modalidad === 'libre') {
+    try {
+      await refrescarCuotaLibre(creditoId);
+      original = await Credito.findByPk(creditoId, {
+        include: [{ model: Cuota, as: 'cuotas' }]
+      });
+    } catch (e) {
+      console.error('[refinanciarCredito] Error al refrescar crédito LIBRE antes de refinanciar:', e?.message || e);
+    }
+  }
+
+  // 🚫 P3 (manual) solo superadmin cuando se pasa rol_id
+  if (opcion === 'manual' && rol_id !== null && rol_id !== 0) {
+    const err = new Error('Solo un superadmin puede usar la tasa manual (P3) en la refinanciación.');
+    err.status = 403;
+    throw err;
+  }
+
+  // Base: saldo_actual + mora pendiente
+  // En LIBRE esto implementa exactamente la regla:
+  //   saldoBase = saldo_actual (capital) + mora (cuota abierta)
+  const cuotasNP = (original.cuotas || []).filter(q => q.estado !== 'pagada');
+  const moraPendiente = cuotasNP.reduce((acc, q) => acc + toNumber(q.intereses_vencidos_acumulados), 0);
+  const saldoBase = fix2(toNumber(original.saldo_actual) + moraPendiente);
+
+  // Tasa mensual
   let tasaMensual;
   if (opcion === 'P1') tasaMensual = 25;
   else if (opcion === 'P2') tasaMensual = 15;
@@ -1010,74 +1570,100 @@ export const refinanciarCredito = async ({
     throw err;
   }
 
-  // 2) Periodicidad y cantidad de cuotas
+  // Periodicidad y cuotas
   const nuevoTipo = tipo_credito || original.tipo_credito; // semanal | quincenal | mensual
   const nuevasCuotas = Number.isFinite(Number(cantidad_cuotas)) && Number(cantidad_cuotas) > 0
     ? Number(cantidad_cuotas)
     : original.cantidad_cuotas;
 
-  const pl = periodLengthFromTipo(nuevoTipo); // 4|2|1
-  const tasaPorPeriodo = tasaMensual / pl;    // ej: semanal P2 -> 15/4 = 3.75% por semana
+  const pl = periodLengthFromTipo(nuevoTipo);
+  const tasaPorPeriodo = tasaMensual / pl;
 
-  // 3) Interés total por período * cantidad de cuotas (lineal, no compuesto)
-  const interesTotalPct = tasaPorPeriodo * nuevasCuotas;              // en %
-  const interesTotalMonto = fix2(saldo * (interesTotalPct / 100.0));  // en dinero
-  const nuevoMonto = fix2(saldo + interesTotalMonto);                 // total a devolver
+  // Interés lineal
+  const interesTotalPct = tasaPorPeriodo * nuevasCuotas;
+  const interesTotalMonto = fix2(saldoBase * (interesTotalPct / 100.0));
+  const nuevoMonto = fix2(saldoBase + interesTotalMonto);
 
-  // 4) Crear nuevo crédito COMÚN dentro de TX (y marcar original como refinanciado)
+  // TX refi
   const t = await Credito.sequelize.transaction();
   try {
+    // 1) Marcar crédito original como refinanciado
     await original.update({
       estado: 'refinanciado',
       opcion_refinanciamiento: opcion,
       tasa_refinanciacion: tasaMensual
     }, { transaction: t });
 
-    // Eliminamos cuotas pendientes del original
-    await Cuota.destroy({
+    // 2) Preparar cuotas a afectar (pendiente/parcial/vencida)
+    const cuotasAfectadas = await Cuota.findAll({
       where: {
         credito_id: creditoId,
         estado: { [Op.in]: ['pendiente', 'parcial', 'vencida'] }
       },
       transaction: t
     });
+    const idsAfectadas = cuotasAfectadas.map(c => c.id);
 
-    const hoy = format(new Date(), 'yyyy-MM-dd');
+    // Contar pagos por cuota
+    const pagosPorCuota = await Pago.findAll({
+      attributes: ['cuota_id'],
+      where: { cuota_id: { [Op.in]: idsAfectadas } },
+      transaction: t
+    });
+    const setConPagos = new Set(pagosPorCuota.map(p => p.cuota_id));
+
+    const idsConPagos = idsAfectadas.filter(id => setConPagos.has(id));
+    const idsSinPagos = idsAfectadas.filter(id => !setConPagos.has(id));
+
+    // a) Cuotas SIN pagos → borrar (primero recibos, por seguridad)
+    if (idsSinPagos.length > 0) {
+      await Recibo.destroy({ where: { cuota_id: { [Op.in]: idsSinPagos } }, transaction: t });
+      await Cuota.destroy({ where: { id: { [Op.in]: idsSinPagos } }, transaction: t });
+    }
+
+    // b) Cuotas CON pagos → NO borrar, se marcan 'refinanciada' y se corta la mora
+    if (idsConPagos.length > 0) {
+      await Cuota.update(
+        { estado: 'refinanciada', intereses_vencidos_acumulados: 0 },
+        { where: { id: { [Op.in]: idsConPagos } }, transaction: t }
+      );
+    }
+
+    // 3) Crear nuevo crédito refinanciado
+    const hoy = todayYMD();
 
     const nuevo = await Credito.create({
       cliente_id: original.cliente_id,
       cobrador_id: original.cobrador_id,
 
-      // Para refi: usamos saldo + interés lineal por período
       monto_acreditar: nuevoMonto,
 
       fecha_solicitud: hoy,
       fecha_acreditacion: hoy,
       fecha_compromiso_pago: hoy,
 
-      // Guardamos la tasa mensual usada para refi (25, 15 o manual)
       interes: tasaMensual,
       tipo_credito: nuevoTipo,
       cantidad_cuotas: nuevasCuotas,
-      modalidad_credito: 'comun',                   // 🔒 siempre comun en refi
+      modalidad_credito: 'comun', // 🟢 Siempre pasa a PLAN DE CUOTAS FIJAS
       descuento: 0,
 
       monto_total_devolver: nuevoMonto,
       saldo_actual: nuevoMonto,
 
-      // No sumamos nada al acumulado del original; iniciamos en 0 para el nuevo crédito
       interes_acumulado: fix2(toNumber(original.interes_acumulado) + 0),
-      id_credito_origen: original.id
+      id_credito_origen: original.id,
+      origen_venta_manual_financiada: original.origen_venta_manual_financiada ?? false,
+      detalle_producto: original.detalle_producto
     }, { transaction: t });
 
-    // Generar las cuotas (partes iguales) con el monto_total_devolver calculado
     await generarCuotasServicio(nuevo, t);
 
     await t.commit();
     return nuevo.id;
   } catch (e) {
     if (t.finished !== 'commit') {
-      try { await t.rollback(); } catch (_) {}
+      try { await t.rollback(); } catch (_) { }
     }
     throw e;
   }
@@ -1085,12 +1671,10 @@ export const refinanciarCredito = async ({
 
 /* ===================== Eliminación / utilidades ===================== */
 export const esCreditoEliminable = async (id) => {
-  // Traigo IDs de cuotas del crédito
   const cuotas = await Cuota.findAll({ attributes: ['id'], where: { credito_id: id } });
   const cuotaIds = cuotas.map(c => c.id);
   if (cuotaIds.length === 0) return { eliminable: true, cantidadPagos: 0 };
 
-  // ¿Existen pagos para alguna de esas cuotas?
   const cantidadPagos = await Pago.count({ where: { cuota_id: cuotaIds } });
   return { eliminable: cantidadPagos === 0, cantidadPagos };
 };
@@ -1098,7 +1682,6 @@ export const esCreditoEliminable = async (id) => {
 export const eliminarCredito = async (id) => {
   const t = await Credito.sequelize.transaction();
   try {
-    // 1) Traer cuotas del crédito
     const cuotas = await Cuota.findAll({
       attributes: ['id'],
       where: { credito_id: id },
@@ -1106,10 +1689,8 @@ export const eliminarCredito = async (id) => {
     });
     const cuotaIds = cuotas.map(c => c.id);
 
-    // 2) Si no hay cuotas, borrar crédito directo (y sus movs de caja de desembolso)
     if (cuotaIds.length === 0) {
       await Credito.destroy({ where: { id }, transaction: t });
-      // Limpieza de movimientos de caja referidos al crédito (desembolso)
       await CajaMovimiento.destroy({
         where: { referencia_tipo: 'credito', referencia_id: id },
         transaction: t
@@ -1118,7 +1699,6 @@ export const eliminarCredito = async (id) => {
       return { ok: true, mensaje: 'Crédito eliminado (no tenía cuotas).' };
     }
 
-    // 3) Verificar si existen pagos asociados a esas cuotas
     const cantidadPagos = await Pago.count({ where: { cuota_id: cuotaIds }, transaction: t });
     if (cantidadPagos > 0) {
       const err = new Error('No se puede eliminar el crédito porque tiene pagos registrados.');
@@ -1127,14 +1707,10 @@ export const eliminarCredito = async (id) => {
       throw err;
     }
 
-    // 4) Limpieza de recibos por si existiera alguno suelto
     await Recibo.destroy({ where: { cuota_id: cuotaIds }, transaction: t });
-
-    // 5) Borrar cuotas y luego el crédito
     await Cuota.destroy({ where: { credito_id: id }, transaction: t });
     await Credito.destroy({ where: { id }, transaction: t });
 
-    // 6) Borrar movimientos de caja de desembolso del crédito
     await CajaMovimiento.destroy({
       where: { referencia_tipo: 'credito', referencia_id: id },
       transaction: t
@@ -1144,26 +1720,30 @@ export const eliminarCredito = async (id) => {
     return { ok: true, mensaje: 'Crédito eliminado correctamente.' };
   } catch (e) {
     if (t.finished !== 'commit') {
-      try { await t.rollback(); } catch (_) {}
+      try { await t.rollback(); } catch (_) { }
     }
     throw e;
   }
 };
 
 /* ===================== Cliente con créditos (con filtros) ===================== */
-export const obtenerCreditosPorCliente = async (clienteId, query = {}) => {
+export const obtenerCreditosPorCliente = async (clienteId, query = {}, { rol_id = null } = {}) => {
   try {
-    // Sanitizar filtros
+    // Visualización de créditos por cliente solo para admin/superadmin cuando se pasa rol_id
+    if (rol_id !== null && rol_id !== 0 && rol_id !== 1) {
+      const err = new Error('No tenés permisos para ver créditos de clientes.');
+      err.status = 403;
+      throw err;
+    }
+
     const estado = query.estado ? String(query.estado).toLowerCase() : null;
     const modalidad = query.modalidad ? String(query.modalidad).toLowerCase() : null;
     const tipo = query.tipo ? String(query.tipo).toLowerCase() : null;
-    const desde = query.desde || null; // YYYY-MM-DD (validado en la ruta)
-    const hasta = query.hasta || null; // YYYY-MM-DD (validado en la ruta)
+    const desde = query.desde || null; // YYYY-MM-DD
+    const hasta = query.hasta || null; // YYYY-MM-DD
     const conCuotasVencidas = query.conCuotasVencidas === true || query.conCuotasVencidas === 'true' || query.conCuotasVencidas === '1';
 
-    // Armamos where para la include de créditos
     const whereCredito = {};
-
     if (estado) whereCredito.estado = estado;
     if (modalidad) whereCredito.modalidad_credito = modalidad;
     if (tipo) whereCredito.tipo_credito = tipo;
@@ -1172,20 +1752,19 @@ export const obtenerCreditosPorCliente = async (clienteId, query = {}) => {
       const rango = {};
       if (desde) rango[Op.gte] = desde;
       if (hasta) rango[Op.lte] = hasta;
-      // Filtramos por cualquiera de las dos fechas relevantes
       whereCredito[Op.or] = [
         { fecha_acreditacion: rango },
         { fecha_compromiso_pago: rango }
       ];
     }
 
-    const cliente = await Cliente.findByPk(clienteId, {
+    let cliente = await Cliente.findByPk(clienteId, {
       include: [
         {
           model: Credito,
           as: 'creditos',
           where: Object.keys(whereCredito).length ? whereCredito : undefined,
-          required: false, // si no matchea nada, igual devolvemos el cliente con creditos: []
+          required: false,
           include: [
             {
               model: Cuota,
@@ -1208,19 +1787,67 @@ export const obtenerCreditosPorCliente = async (clienteId, query = {}) => {
     });
     if (!cliente) return null;
 
+    // Refresco TODOS los créditos del cliente (LIBRE y no LIBRE) al día actual
+    const creditosCliente = cliente.creditos || [];
+    for (const cr of creditosCliente) {
+      if (esLibre(cr)) {
+        await refrescarCuotaLibre(cr.id);
+      } else {
+        await marcarVencidasYCalcularMora(cr.id, {
+          sumarSoloVencidas: true,
+          fechaCorte: todayYMD()
+        });
+        await actualizarEstadoCredito(cr.id);
+      }
+    }
+
+    // Re-traigo actualizado
+    cliente = await Cliente.findByPk(clienteId, {
+      include: [
+        {
+          model: Credito,
+          as: 'creditos',
+          where: Object.keys(whereCredito).length ? whereCredito : undefined,
+          required: false,
+          include: [
+            {
+              model: Cuota,
+              as: 'cuotas',
+              include: [
+                {
+                  model: Pago,
+                  as: 'pagos',
+                  attributes: ['id', 'monto_pagado', 'fecha_pago'],
+                  include: [{ model: FormaPago, as: 'formaPago', attributes: ['nombre'] }]
+                }
+              ]
+            },
+            { model: Usuario, as: 'cobradorCredito', attributes: ['id', 'nombre_completo'] }
+          ]
+        },
+        { model: Usuario, as: 'cobradorUsuario', attributes: ['id', 'nombre_completo'] },
+        { model: Zona, as: 'clienteZona', attributes: ['id', 'nombre'] }
+      ]
+    });
+
     const plain = cliente.get({ plain: true });
 
-    // Filtro adicional: solo créditos con al menos una cuota vencida
     if (conCuotasVencidas && Array.isArray(plain.creditos)) {
       plain.creditos = plain.creditos.filter(cr =>
         Array.isArray(cr.cuotas) && cr.cuotas.some(ct => String(ct.estado) === 'vencida')
       );
     }
 
-    // Ordenamos créditos y cuotas como venías haciendo
     plain.creditos.sort((a, b) => b.id - a.id);
     plain.creditos.forEach(cr => {
       if (Array.isArray(cr.cuotas)) cr.cuotas.sort((x, y) => x.numero_cuota - y.numero_cuota);
+      cr.total_actual = calcularTotalActualCreditoPlain(cr);
+      if (esLibre(cr)) {
+        const ciclos = obtenerFechasCiclosLibre(cr);
+        if (ciclos) {
+          cr.fechas_ciclos_libre = ciclos;
+        }
+      }
     });
 
     return plain;
@@ -1231,9 +1858,17 @@ export const obtenerCreditosPorCliente = async (clienteId, query = {}) => {
 };
 
 /* ===================== Anulación / tareas pendientes ===================== */
-export const anularCredito = async (id, aprobadoPor = null) => {
+export const anularCredito = async (id) => {
   const credito = await Credito.findByPk(id);
   if (!credito) throw new Error('Crédito no encontrado');
+
+  // 🚫 No permitir anular un crédito ya pagado
+  if (String(credito.estado || '').toLowerCase() === 'pagado') {
+    const err = new Error('No se puede anular un crédito pagado.');
+    err.status = 400;
+    throw err;
+  }
+
   await Cuota.destroy({ where: { credito_id: id } });
   credito.estado = 'anulado';
   await credito.save();
@@ -1241,6 +1876,20 @@ export const anularCredito = async (id, aprobadoPor = null) => {
 };
 
 export const solicitarAnulacionCredito = async ({ creditoId, motivo, userId }) => {
+  // Validamos estado del crédito antes de generar la tarea
+  const credito = await Credito.findByPk(creditoId);
+  if (!credito) {
+    const err = new Error('Crédito no encontrado.');
+    err.status = 404;
+    throw err;
+  }
+
+  if (String(credito.estado || '').toLowerCase() === 'pagado') {
+    const err = new Error('No se puede solicitar la anulación de un crédito pagado.');
+    err.status = 400;
+    throw err;
+  }
+
   const existe = await TareaPendiente.findOne({
     where: { estado: 'pendiente', tipo: 'anular_credito', datos: { creditoId } }
   });
@@ -1257,7 +1906,7 @@ export const solicitarAnulacionCredito = async ({ creditoId, motivo, userId }) =
 };
 
 /* ===================== Resumen LIBRE (para UI/servicios) ===================== */
-export const obtenerResumenLibre = async (creditoId, fecha = new Date()) => {
+export const obtenerResumenLibre = async (creditoId, fecha = ymdDate(todayYMD())) => {
   const { obtenerResumenLibrePorCredito } = await import('./cuota.service.js');
   return obtenerResumenLibrePorCredito(creditoId, fecha);
 };
@@ -1265,4 +1914,197 @@ export const obtenerResumenLibre = async (creditoId, fecha = new Date()) => {
 /* ===================== Utilidades LIBRE exportadas ===================== */
 export const refreshCuotaLibre = async (creditoId) => {
   await refrescarCuotaLibre(creditoId);
+};
+
+/* ===================== PDF: Ficha del Crédito ===================== */
+export const imprimirFichaCredito = async (req, res) => {
+  try {
+    const { id } = req.params || {};
+    const credito = await obtenerCreditoPorId(id);
+    if (!credito) {
+      return res.status(404).json({ success: false, message: 'Crédito no encontrado' });
+    }
+
+    // Import dinámico de pdfkit
+    let PDFDocument;
+    try {
+      ({ default: PDFDocument } = await import('pdfkit'));
+    } catch {
+      return res.status(500).json({
+        success: false,
+        message: 'Falta la dependencia pdfkit. Ejecutá: npm i pdfkit'
+      });
+    }
+
+    const c = credito.get ? credito.get({ plain: true }) : credito;
+    const cli = c.cliente || {};
+    const cuotas = Array.isArray(c.cuotas) ? c.cuotas : [];
+    const total_actual = toNumber(c.total_actual ?? calcularTotalActualCreditoPlain(c));
+    const fechaEmision = todayYMD();
+
+    const ciclosLibre = esLibre(c) ? obtenerFechasCiclosLibre(c) : null;
+
+    // Vencimientos (ignorando ficticio y normalizando a YYYY-MM-DD)
+    const vtosValidos = cuotas
+      .map(ct => ct.fecha_vencimiento)
+      .filter(f => f && f !== LIBRE_VTO_FICTICIO)
+      .map(f => ymd(f))
+      .sort();
+
+    let primerVto = vtosValidos[0]
+      || (c.fecha_compromiso_pago ? ymd(c.fecha_compromiso_pago) : '-');
+
+    let ultimoVto = vtosValidos.length
+      ? vtosValidos[vtosValidos.length - 1]
+      : (c.fecha_compromiso_pago ? ymd(c.fecha_compromiso_pago) : '-');
+
+    // Para LIBRE, consideramos fin de crédito el vencimiento del 3er ciclo
+    if (ciclosLibre) {
+      primerVto = ciclosLibre.vencimiento_ciclo_1 || primerVto;
+      ultimoVto = ciclosLibre.vencimiento_ciclo_3 || ultimoVto;
+    }
+
+    // Headers PDF
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="ficha-credito-${c.id}.pdf"`);
+    res.setHeader('Cache-Control', 'no-store');
+
+    const doc = new PDFDocument({ size: 'A4', margin: 36 });
+
+    doc.on('error', (err) => {
+      console.error('[PDFKit][imprimirFichaCredito] Error de stream:', err?.message || err);
+      try { res.end(); } catch (_) { }
+    });
+
+    doc.pipe(res);
+
+    // Encabezado
+    doc.fontSize(16).text('Ficha de Crédito', { align: 'center' });
+    doc.moveDown(0.3);
+    doc.fontSize(9).fillColor('#555').text(`Emitido: ${fechaEmision}`, { align: 'center' });
+    doc.moveDown(1);
+    doc.fillColor('#000');
+
+    // Cliente
+    doc.fontSize(12).text('Cliente', { underline: true });
+    doc.moveDown(0.3);
+    doc.fontSize(10)
+      .text(`Nombre: ${[cli.nombre, cli.apellido].filter(Boolean).join(' ') || '-'}`)
+      .text(`DNI: ${cli.dni || '-'}`)
+      .text(`Teléfono(s): ${[cli.telefono_1, cli.telefono_2, cli.telefono].filter(Boolean).join(' / ') || '-'}`)
+      .text(`Dirección: ${[cli.direccion_1, cli.direccion_2, cli.direccion].filter(Boolean).join(' | ') || '-'}`);
+    doc.moveDown(0.8);
+
+    // Crédito (sin tasa ni monto_acreditar)
+    doc.fontSize(12).text('Crédito', { underline: true });
+    doc.moveDown(0.3);
+    doc.fontSize(10)
+      .text(`ID: ${c.id}`)
+      .text(`Modalidad: ${labelModalidad(c.modalidad_credito)}`)
+      .text(`Tipo: ${String(c.tipo_credito || '').toUpperCase()}`)
+      .text(`Cuotas: ${c.cantidad_cuotas ?? '-'}`)
+      .text(`Estado: ${String(c.estado || '').toUpperCase()}`)
+      .text(`Fecha solicitud: ${c.fecha_solicitud || '-'}`)
+      .text(`Fecha acreditación: ${c.fecha_acreditacion || '-'}`);
+
+    if (ciclosLibre) {
+      doc
+        .text(`Vto 1er ciclo: ${ciclosLibre.vencimiento_ciclo_1}`)
+        .text(`Vto 2° ciclo: ${ciclosLibre.vencimiento_ciclo_2}`)
+        .text(`Vto 3er ciclo: ${ciclosLibre.vencimiento_ciclo_3}`);
+    } else {
+      doc
+        .text(`Fecha 1er vencimiento: ${primerVto}`)
+        .text(`Fecha fin de crédito: ${ultimoVto}`);
+    }
+
+    doc.text(`Cobrador asignado: ${c.cobradorCredito?.nombre_completo || '-'}`);
+    doc.moveDown(0.3);
+    doc.fontSize(11).text(`Saldo actual declarado: ${fmtARS(c.saldo_actual)}`);
+    doc.fontSize(12).text(`TOTAL ACTUAL: ${fmtARS(total_actual)}`);
+    doc.moveDown(1);
+
+    // Tabla de cuotas
+    doc.fontSize(12).text('Detalle de cuotas', { underline: true });
+    doc.moveDown(0.4);
+    doc.fontSize(9);
+
+    const headers = ['#', 'Vencimiento', 'Importe', 'Pagado', 'Desc.', 'Mora', 'Saldo', 'Estado'];
+    const colWidths = [25, 85, 70, 70, 55, 55, 70, 70];
+
+    // Header
+    let x = doc.x, y = doc.y;
+    headers.forEach((h, i) => {
+      doc.text(h, x, y, { width: colWidths[i], align: i <= 1 ? 'left' : 'right' });
+      x += colWidths[i];
+    });
+    doc.moveDown(0.5);
+    doc.moveTo(36, doc.y).lineTo(559, doc.y).strokeColor('#ddd').stroke();
+    doc.strokeColor('#000');
+
+    // Rows
+    let totalPrincipalPend = 0, totalMora = 0;
+    cuotas.forEach((ct) => {
+      const principalPend = Math.max(
+        fix2(toNumber(ct.importe_cuota) - toNumber(ct.descuento_cuota) - toNumber(ct.monto_pagado_acumulado)), 0
+      );
+      const mora = fix2(toNumber(ct.intereses_vencidos_acumulados));
+      totalPrincipalPend = fix2(totalPrincipalPend + principalPend);
+      totalMora = fix2(totalMora + mora);
+
+      const vto =
+        ct.fecha_vencimiento === LIBRE_VTO_FICTICIO ? '—' :
+          (ct.fecha_vencimiento ? ymd(ct.fecha_vencimiento) : '-');
+
+      // Saldo = principal pendiente + mora
+      const saldoCuota = fix2(principalPend + mora);
+
+      const row = [
+        ct.numero_cuota,
+        vto,
+        fmtARS(ct.importe_cuota),
+        fmtARS(ct.monto_pagado_acumulado),
+        fmtARS(ct.descuento_cuota),
+        fmtARS(mora),
+        fmtARS(saldoCuota),
+        String(ct.estado || '').toUpperCase()
+      ];
+
+      let cx = 36;
+      row.forEach((cell, i) => {
+        doc.text(cell, cx, doc.y + 2, { width: colWidths[i], align: i <= 1 ? 'left' : 'right' });
+        cx += colWidths[i];
+      });
+      doc.moveDown(0.6);
+    });
+
+    doc.moveDown(0.2);
+    doc.moveTo(36, doc.y).lineTo(559, doc.y).strokeColor('#ddd').stroke();
+    doc.strokeColor('#000');
+    doc.moveDown(0.4);
+
+    // Totales de la tabla
+    const labelX = 36 + colWidths.slice(0, 5).reduce((a, b) => a + b, 0);
+    const valueX = 36 + colWidths.slice(0, 6).reduce((a, b) => a + b, 0);
+
+    doc.fontSize(10);
+    doc.text('Tot. Mora:', labelX, doc.y, { width: colWidths[5], align: 'right' });
+    doc.text(fmtARS(totalMora), valueX, doc.y, { width: colWidths[6], align: 'right' });
+    doc.moveDown(0.2);
+    doc.text('Tot. Principal pendiente:', labelX, doc.y, { width: colWidths[5], align: 'right' });
+    doc.text(fmtARS(totalPrincipalPend), valueX, doc.y, { width: colWidths[6], align: 'right' });
+
+    doc.moveDown(1);
+    doc.fontSize(9).fillColor('#666')
+      .text('Nota: Esta ficha es informativa. Los importes pueden variar según pagos registrados y recálculos de mora.', { align: 'left' });
+
+    doc.end();
+  } catch (error) {
+    console.error('[imprimirFichaCredito]', error);
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, message: 'Error al generar la ficha del crédito' });
+    } else {
+      try { res.end(); } catch (_) { }
+    }
+  }
 };

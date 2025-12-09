@@ -14,13 +14,22 @@ import { buildFilters } from '../utils/buildFilters.js';
 import { actualizarCuotasVencidas } from './cuota.service.js';
 
 /* ──────────────────────────────────────────────────────────────
+ * Config TZ (coherencia con resto del backend)
+ * ────────────────────────────────────────────────────────────── */
+const APP_TZ = process.env.APP_TZ || 'America/Argentina/Tucuman';
+const todayYMD = () =>
+    new Intl.DateTimeFormat('en-CA', {
+        timeZone: APP_TZ,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+    }).format(new Date());
+
+/* ──────────────────────────────────────────────────────────────
  * Helpers locales
  * ────────────────────────────────────────────────────────────── */
 
-/**
- * Normaliza booleanos recibidos como string o número.
- * 'true'/'1'/1 => true | 'false'/'0'/0 => false
- */
+/** Normaliza booleanos recibidos como string o número. */
 const asBool = (v) => {
     if (typeof v === 'boolean') return v;
     if (v === 1 || v === '1' || v === 'true') return true;
@@ -29,30 +38,46 @@ const asBool = (v) => {
 };
 
 /**
- * Construye un filtro de rango de fechas seguro en UTC (YYYY-MM-DD).
+ * Construye un filtro de rango de fechas seguro (YYYY-MM-DD).
  * - campo: nombre del campo en BD
  * - query: { desde, hasta }
  */
 const dateRangeWhere = (campo, query = {}) => {
     const { desde, hasta } = query || {};
     if (!desde && !hasta) return undefined;
-
     const w = {};
-    if (desde) w[Op.gte] = desde; // se espera YYYY-MM-DD
+    if (desde) w[Op.gte] = desde;
     if (hasta) w[Op.lte] = hasta;
     return { [campo]: w };
 };
 
 /**
+ * Construye un filtro de rango aplicado sobre **varios campos** usando OR.
+ * Ej.: OR(fecha_acreditacion in rango, fecha_compromiso_pago in rango)
+ */
+const dateRangeWhereOr = (campos = [], query = {}) => {
+    const { desde, hasta } = query || {};
+    if (!Array.isArray(caminos = campos) || caminos.length === 0) return undefined;
+    if (!desde && !hasta) return undefined;
+
+    const w = {};
+    if (desde) w[Op.gte] = desde;
+    if (hasta) w[Op.lte] = hasta;
+
+    return {
+        [Op.or]: caminos.map((campo) => ({ [campo]: w }))
+    };
+};
+
+/**
  * Filtro "search" genérico: q contra nombre/apellido del cliente.
- * Permite indicar el alias/route del include:
- *   - créditos: 'cliente'
- *   - cuotas:   'credito->cliente'
+ * clienteAlias:
+ *   - en créditos: 'cliente'
+ *   - en cuotas:   'credito->cliente'
  */
 const addGenericSearchForCliente = (q, clienteAlias = 'cliente') => {
     if (!q) return undefined;
     const like = { [Op.iLike]: `%${q}%` };
-    // Para nested include, Sequelize usa "credito->cliente.campo"
     const nombreCol = col(`${clienteAlias}.nombre`);
     const apellidoCol = col(`${clienteAlias}.apellido`);
     return {
@@ -90,7 +115,7 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
                 ];
             }
 
-            // Include básico; si piden "solo con créditos pendientes", pedimos include required
+            // Include: si piden “solo con créditos pendientes”, incluimos solo los NO pagados/anulados/refinanciados.
             const includeArr = [
                 {
                     model: Credito,
@@ -98,7 +123,7 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
                     attributes: ['id', 'estado'],
                     required: !!onlyPend,
                     where: onlyPend
-                        ? { estado: { [Op.notIn]: ['pagado', 'vencido', 'anulado'] } }
+                        ? { estado: { [Op.notIn]: ['pagado', 'anulado', 'refinanciado'] } }
                         : undefined
                 },
                 {
@@ -126,6 +151,8 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
             return clientes.map(c => {
                 const dto = c.get({ plain: true });
                 const { creditos, cobradorUsuario, clienteZona, ...rest } = dto;
+
+                // Si onlyPend => el include ya trae filtrados. Si no, contamos todos.
                 const numeroCreditos = Array.isArray(creditos) ? creditos.length : 0;
 
                 return {
@@ -140,27 +167,43 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
         /* ──────────── CREDITOS ──────────── */
         case 'creditos': {
             const onlyPend = asBool(query.conCreditosPendientes);
-            const whereCredito = {
+
+            // Mapeo de filtros al esquema real
+            const whereCreditoBase = {
                 ...buildFilters(query, {
-                    cobradorId: { field: 'cobrador_id', type: 'eq' },
-                    clienteId: { field: 'cliente_id', type: 'eq' },
-                    zonaId: { field: '$cliente.zona$', type: 'eq' },
-                    estadoCredito: { field: 'estado', type: 'in' },
-                    modalidad: { field: 'modalidad', type: 'in' }
-                }),
-                // rango por fecha de alta del crédito (si se provee)
-                ...dateRangeWhere('fecha_otorgamiento', query)
+                    cobradorId:     { field: 'cobrador_id', type: 'eq' },
+                    clienteId:      { field: 'cliente_id', type: 'eq' },
+                    zonaId:         { field: '$cliente.zona$', type: 'eq' }, // via include
+                    estadoCredito:  { field: 'estado', type: 'in' },
+                    modalidad:      { field: 'modalidad_credito', type: 'in' },
+                    tipoCredito:    { field: 'tipo_credito', type: 'in' }
+                })
             };
 
             if (onlyPend === true) {
-                whereCredito.estado = 'pendiente';
+                // Consideramos “pendientes” todo lo no pagado/anulado/refinanciado
+                whereCreditoBase.estado = { [Op.notIn]: ['pagado', 'anulado', 'refinanciado'] };
             }
 
-            // búsqueda libre por cliente (alias directo)
+            // Rango de fechas aplicado a (fecha_acreditacion OR fecha_compromiso_pago)
+            const whereRango = dateRangeWhereOr(
+                ['fecha_acreditacion', 'fecha_compromiso_pago'],
+                query
+            );
+
+            const whereCredito = whereRango
+                ? { [Op.and]: [whereCreditoBase, whereRango] }
+                : whereCreditoBase;
+
+            // Búsqueda libre por cliente
             const whereSearch = addGenericSearchForCliente(query.q, 'cliente');
 
+            const whereFinal = whereSearch
+                ? { [Op.and]: [whereCredito, whereSearch] }
+                : whereCredito;
+
             const creditos = await Credito.findAll({
-                where: whereSearch ? { [Op.and]: [whereCredito, whereSearch] } : whereCredito,
+                where: whereFinal,
                 include: [
                     {
                         model: Cliente,
@@ -191,25 +234,25 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
 
         /* ──────────── CUOTAS ──────────── */
         case 'cuotas': {
-            // Actualiza estados vencidos antes de calcular informe
+            // Antes de calcular, aseguramos que las cuotas estén actualizadas (vencidas)
             await actualizarCuotasVencidas();
 
             const whereCuotaBase = {
                 ...buildFilters(query, {
                     estadoCuota: { field: 'estado', type: 'in' },
-                    // filtro especial "hoy" (si tu buildFilters soporta 'today')
-                    hoy: { field: 'fecha_vencimiento', type: 'today' }
+                    // si tu buildFilters soporta 'today' para YMD en TZ, se usa. Si no, quitar.
+                    hoy:         { field: 'fecha_vencimiento', type: 'today' }
                 }),
-                // rango por fecha de vencimiento (si se provee)
+                // rango por fecha de vencimiento
                 ...dateRangeWhere('fecha_vencimiento', query)
             };
 
-            // Filtros relacionales: por forma de pago de los pagos registrados sobre la cuota
+            // Filtro por forma de pago (en pagos asociados a la cuota)
             if (query.formaPagoId) {
-                whereCuotaBase['$pagos.forma_pago_id$'] = query.formaPagoId;
+                whereCuotaBase['$pagos.forma_pago_id$'] = Number(query.formaPagoId);
             }
 
-            // Filtros relacionales adicionales: cobrador/cliente/zona desde el crédito->cliente
+            // Relacionales desde el crédito/cliente
             const whereRel = [];
             if (query.cobradorId) {
                 whereRel.push({ '$credito.cobrador_id$': Number(query.cobradorId) });
@@ -221,15 +264,19 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
                 whereRel.push({ '$credito.cliente.zona$': Number(query.zonaId) });
             }
 
-            const whereFinal = whereRel.length
+            const whereFinalBase = whereRel.length
                 ? { [Op.and]: [whereCuotaBase, ...whereRel] }
                 : whereCuotaBase;
 
-            // búsqueda libre por cliente (alias anidado)
+            // Búsqueda libre por cliente (alias anidado)
             const whereSearch = addGenericSearchForCliente(query.q, 'credito->cliente');
 
+            const whereFinal = whereSearch
+                ? { [Op.and]: [whereFinalBase, whereSearch] }
+                : whereFinalBase;
+
             const cuotas = await Cuota.findAll({
-                where: whereSearch ? { [Op.and]: [whereFinal, whereSearch] } : whereFinal,
+                where: whereFinal,
                 include: [
                     {
                         model: Credito,
@@ -243,11 +290,8 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
                     {
                         model: Pago,
                         as: 'pagos',
-                        // ⚠️ columnas reales en tu BD
                         attributes: ['id', 'monto_pagado', 'fecha_pago', 'forma_pago_id'],
-                        include: [
-                            { model: FormaPago, as: 'formaPago', attributes: ['nombre'] }
-                        ]
+                        include: [{ model: FormaPago, as: 'formaPago', attributes: ['nombre'] }]
                     }
                 ],
                 order: [['fecha_vencimiento', 'ASC'], ['numero_cuota', 'ASC']],
@@ -269,7 +313,7 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
                 return {
                     id: dto.id,
                     numero_cuota: dto.numero_cuota,
-                    importe_cuota: dto.importe_cuota,
+                    importe_cuota: Number(dto.importe_cuota || 0),
                     fecha_vencimiento: dto.fecha_vencimiento,
                     estado: dto.estado,
                     cliente: dto.credito?.cliente

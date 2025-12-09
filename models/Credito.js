@@ -1,4 +1,3 @@
-// models/Credito.js
 import { DataTypes, Sequelize } from 'sequelize';
 import sequelize from './sequelize.js';
 import Usuario from './Usuario.js';
@@ -14,6 +13,17 @@ import Cliente from './Cliente.js';
  * - saldo_actual se usa como "capital pendiente".
  * - interes_acumulado guarda el interés del ciclo no cubierto (si aplica).
  * - El descuento por pago total/adelantado se reflejará en Recibos.
+ *
+ * NUEVO:
+ * - total_actual: campo que refleja el total actual del crédito considerando
+ *   saldo_actual + interes_acumulado + intereses vencidos (si corresponde).
+ *   Se actualiza desde la capa de servicios (no se recalcula automáticamente
+ *   por DB). Se define aquí para facilitar consultas y ordenamientos.
+ *
+ * - origen_venta_manual_financiada: marca si el crédito fue generado
+ *   automáticamente desde una VentaManual financiada.
+ * - detalle_producto: describe el producto/servicio asociado a la venta
+ *   financiada que originó este crédito (cuando aplique).
  */
 
 const Credito = sequelize.define('Credito', {
@@ -78,6 +88,16 @@ const Credito = sequelize.define('Credito', {
         allowNull: false,
         defaultValue: 0.00
     },
+    // **TOTAL ACTUAL**: saldo + interés acumulado + (otros intereses/mora que calcule el service)
+    // NOTA: Este campo se actualiza desde la capa de servicios cada vez que hay cambios
+    // relevantes (registro de pagos, refrescar cuota libre, recalculo de mora, refinanciación, etc).
+    total_actual: {
+        type: DataTypes.DECIMAL(12, 2),
+        allowNull: false,
+        defaultValue: 0.00,
+        comment: 'Saldo actual + intereses acumulados / mora (actualizado por el service)'
+    },
+
     tasa_refinanciacion: {
         type: DataTypes.DECIMAL(5, 2),
         allowNull: true
@@ -111,12 +131,26 @@ const Credito = sequelize.define('Credito', {
     id_credito_origen: {
         type: DataTypes.INTEGER,
         allowNull: true
+    },
+
+    // 🔹 Marca si viene de una venta manual financiada
+    origen_venta_manual_financiada: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+        comment: 'true si el crédito se generó automáticamente desde una VentaManual financiada'
+    },
+
+    // 🔹 Detalle del producto que originó este crédito (si viene de venta financiada)
+    detalle_producto: {
+        type: DataTypes.STRING(255),
+        allowNull: true,
+        comment: 'Detalle / descripción del producto de la venta financiada que originó este crédito'
     }
+
 }, {
     tableName: 'creditos',
     timestamps: false
 });
 
 export default Credito;
-
-

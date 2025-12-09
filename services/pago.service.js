@@ -14,6 +14,10 @@ import { differenceInCalendarMonths } from 'date-fns';
     - registrarPagoParcial(...)
     - pagarCuota(...)  (pago total)
   Este archivo no duplica ese asiento para evitar doble contabilización.
+
+  ⚠️ IMPORTANTE: desde aquí AHORA también pasamos:
+    - usuario_id  (tomado de req.user)
+    - rol_id      (para control de descuentos en el service de cuotas)
 */
 
 /* ───────────────── Constantes ───────────────── */
@@ -75,15 +79,25 @@ const nonAplicaIfZero = (value) => {
     return n === 0 ? 'No aplica' : formatARS(n);
 };
 
+// Detección robusta de modalidad LIBRE a partir del payload del recibo
+const esReciboLibre = (recibo = {}) => {
+    const mod = String(recibo.modalidad_credito || '').toLowerCase();
+    if (mod === 'libre') return true;
+    const concepto = String(recibo.concepto || '');
+    return /LIBRE/i.test(concepto);
+};
+
 /**
  * Mapea el modelo Recibo (numérico) a un objeto de presentación para UI.
- * Reglas:
- *  - descuento_aplicado, mora_cobrada, interes_ciclo_cobrado → "No aplica" si 0
- *  - saldos y montos siempre con formato dinero
- *  - excepción: saldo_actual = 0 se muestra "$0,00" (no "No aplica")
+ * Reglas principales:
+ *  - SIEMPRE: saldo_anterior, pago, saldo_actual, mora_cobrada, descuento_aplicado (e importe_cuota_original si viene).
+ *  - SOLO LIBRE: principal_pagado, interes_ciclo_cobrado, saldo_credito_anterior/actual.
+ *  - Formateo ARS en todo, con excepción visual ya contemplada por el formateo ($0,00 cuando corresponde).
  */
 const buildReciboUI = (recibo) => {
     if (!recibo) return null;
+
+    const libre = esReciboLibre(recibo);
 
     // Campos numéricos (según armarDatosRecibo en cuota.service.js)
     const {
@@ -93,6 +107,8 @@ const buildReciboUI = (recibo) => {
         cliente_nombre,
         concepto,
         medio_pago,
+        nombre_cobrador,
+        modalidad_credito, // si viene, lo reenviamos tal cual
 
         // desglose
         importe_cuota_original,
@@ -106,18 +122,14 @@ const buildReciboUI = (recibo) => {
         pago_a_cuenta,
         saldo_anterior,
         saldo_actual,
-        saldo_credito_anterior,
-        saldo_credito_actual,
 
-        // opcionales de identificación
-        nombre_cobrador
+        // Saldos de capital del crédito (solo tienen sentido en LIBRE)
+        saldo_credito_anterior,
+        saldo_credito_actual
     } = recibo;
 
-    // Importante: saldos siempre en $ (incluido $0,00)
-    const saldoActualFmt = formatARS(saldo_actual);
-    const saldoCreditoActualFmt = formatARS(saldo_credito_actual);
-
-    return {
+    // Armado base (común a todas las modalidades)
+    const uiBase = {
         numero_recibo: numero_recibo ?? null,
         fecha: formatYMDToDMY(fecha),
         hora: hora || '',
@@ -125,23 +137,44 @@ const buildReciboUI = (recibo) => {
         cobrador: nombre_cobrador || '',
         medio_pago: medio_pago || '',
         concepto: concepto || '',
+        modalidad_credito: modalidad_credito || undefined, // display opcional
 
-        // Totales/montos
+        // Totales/montos (mostramos ambos para evitar ambigüedad)
         monto_pagado: formatARS(monto_pagado ?? pago_a_cuenta ?? 0),
         pago_a_cuenta: formatARS(pago_a_cuenta ?? monto_pagado ?? 0),
 
         // Saldos (monetarios siempre)
         saldo_anterior: formatARS(saldo_anterior),
-        saldo_actual: saldoActualFmt, // ← excepción: mostrar $0,00 si corresponde
-        saldo_credito_anterior: formatARS(saldo_credito_anterior),
-        saldo_credito_actual: saldoCreditoActualFmt,
+        saldo_actual: formatARS(saldo_actual),
 
-        // Desglose con "No aplica" como corresponde
-        importe_cuota_original: formatARS(importe_cuota_original),
-        descuento_aplicado: nonAplicaIfZero(descuento_aplicado),
-        mora_cobrada: nonAplicaIfZero(mora_cobrada),
-        principal_pagado: formatARS(principal_pagado),
-        interes_ciclo_cobrado: nonAplicaIfZero(interes_ciclo_cobrado)
+        // Desglose base SIEMPRE visible
+        importe_cuota_original:
+            importe_cuota_original !== undefined ? formatARS(importe_cuota_original) : undefined,
+        descuento_aplicado:
+            descuento_aplicado !== undefined ? nonAplicaIfZero(descuento_aplicado) : undefined,
+        mora_cobrada:
+            mora_cobrada !== undefined ? nonAplicaIfZero(mora_cobrada) : undefined
+    };
+
+    if (!libre) {
+        // ── NO LIBRE → ocultamos capital/interés de ciclo y saldos de capital del crédito
+        return {
+            ...uiBase
+            // explícitamente NO incluimos:
+            // principal_pagado, interes_ciclo_cobrado, saldo_credito_anterior, saldo_credito_actual
+        };
+    }
+
+    // ── LIBRE → agregamos lo específico del ciclo y saldos de capital (si llegaron)
+    return {
+        ...uiBase,
+        principal_pagado: principal_pagado !== undefined ? formatARS(principal_pagado) : undefined,
+        interes_ciclo_cobrado:
+            interes_ciclo_cobrado !== undefined ? nonAplicaIfZero(interes_ciclo_cobrado) : undefined,
+        saldo_credito_anterior:
+            saldo_credito_anterior !== undefined ? formatARS(saldo_credito_anterior) : undefined,
+        saldo_credito_actual:
+            saldo_credito_actual !== undefined ? formatARS(saldo_credito_actual) : undefined
     };
 };
 
@@ -174,6 +207,15 @@ const cicloLibreActual = (fechaAcreditacion) => {
 export const registrarPago = async (req, res) => {
     try {
         let { cuota_id, monto_pagado, forma_pago_id, observacion, descuento = 0, modo } = req.body ?? {};
+
+        // 🔐 Tomamos usuario y rol desde el token (para Caja y control de descuentos)
+        const usuarioId =
+            req.user?.id ??
+            req.user?.usuario_id ??
+            req.user?.userId ??
+            null;
+        const rolIdRaw = req.user?.rol_id ?? req.user?.rol ?? null;
+        const rolId = typeof rolIdRaw === 'number' ? rolIdRaw : toIntOrNull(rolIdRaw);
 
         // Validaciones mínimas
         const cuotaIdInt = toIntOrNull(cuota_id);
@@ -253,7 +295,10 @@ export const registrarPago = async (req, res) => {
             monto_pagado,
             forma_pago_id: formaPagoIdInt,
             observacion,
-            descuento
+            descuento,
+            // 🔐 pasamos al service para que impacte Caja con usuario y limite descuentos
+            usuario_id: usuarioId ?? undefined,
+            rol_id: rolId ?? undefined
         });
 
         const recibo_ui = buildReciboUI(recibo);
@@ -292,6 +337,15 @@ export const registrarPagoTotal = async (req, res) => {
     try {
         let { cuota_id, forma_pago_id, observacion, descuento = 0 } = req.body ?? {};
 
+        // 🔐 Tomamos usuario y rol desde el token (para Caja y control de descuentos)
+        const usuarioId =
+            req.user?.id ??
+            req.user?.usuario_id ??
+            req.user?.userId ??
+            null;
+        const rolIdRaw = req.user?.rol_id ?? req.user?.rol ?? null;
+        const rolId = typeof rolIdRaw === 'number' ? rolIdRaw : toIntOrNull(rolIdRaw);
+
         const cuotaIdInt = toIntOrNull(cuota_id);
         const formaPagoIdInt = toIntOrNull(forma_pago_id);
 
@@ -315,7 +369,10 @@ export const registrarPagoTotal = async (req, res) => {
             cuota_id: cuotaIdInt,
             forma_pago_id: formaPagoIdInt,
             descuento,
-            observacion
+            observacion,
+            // 🔐 pasamos al service para que impacte Caja con usuario y limite descuentos
+            usuario_id: usuarioId ?? undefined,
+            rol_id: rolId ?? undefined
         });
 
         const recibo_ui = buildReciboUI(recibo);

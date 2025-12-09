@@ -11,13 +11,17 @@ import {
   obtenerClientePorId,
   actualizarCliente,
   eliminarCliente,
-  obtenerClientesPorCobrador
+  obtenerClientesPorCobrador,
+  importarClientesDesdePlanilla
 } from '../services/cliente.service.js';
 import CobradorZona from '../models/CobradorZona.js';
+import * as XLSX from 'xlsx';
 
 const router = Router();
 
-// Configuración de multer para imagen del DNI
+/* ──────────────────────────────────────────────────────────
+   MULTER: Subida de imagen de DNI (disco)
+   ────────────────────────────────────────────────────────── */
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const dir = 'uploads/dni';
@@ -32,11 +36,250 @@ const storage = multer.diskStorage({
 const upload = multer({ storage });
 
 /* ──────────────────────────────────────────────────────────
+   MULTER: Importación CSV/XLSX (memoria)
+   ────────────────────────────────────────────────────────── */
+const uploadImport = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+  fileFilter: (req, file, cb) => {
+    const allowedMimes = [
+      'text/csv',
+      'application/vnd.ms-excel',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    ];
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    const allowedExts = ['.csv', '.xls', '.xlsx'];
+    if (allowedMimes.includes(file.mimetype) || allowedExts.includes(ext)) {
+      return cb(null, true);
+    }
+    cb(new Error('Formato no soportado. Subí un archivo CSV o XLSX.'));
+  }
+});
+
+/* ──────────────────────────────────────────────────────────
+   NUEVO: Plantilla base de importación
+   ────────────────────────────────────────────────────────── */
+/**
+ * GET /clientes/import/template?format=xlsx|csv
+ * - Por defecto: XLSX
+ * - Roles: superadmin (0) y admin (1)
+ */
+router.get('/import/template', verifyToken, checkRole([0, 1]), async (req, res) => {
+  try {
+    const format = String(req.query.format || 'xlsx').toLowerCase();
+    const headers = [
+      'nombre',
+      'apellido',
+      'dni',
+      'fecha_nacimiento',
+      'fecha_registro',
+      'email',
+      'telefono',
+      'telefono_secundario',
+      'direccion',
+      'direccion_secundaria',
+      'referencia_direccion',
+      'referencia_secundaria',
+      'observaciones',
+      'provincia',
+      'localidad',
+      'cobrador',          // ID de usuario (opcional)
+      'cobrador_nombre',   // Alternativa por nombre (opcional)
+      'zona',              // ID de zona (opcional)
+      'zona_nombre',       // Alternativa por nombre (opcional)
+      'historial_crediticio',
+      'puntaje_crediticio'
+    ];
+
+    const example = {
+      nombre: 'Juan',
+      apellido: 'Pérez',
+      dni: '30111222',
+      fecha_nacimiento: '1990-05-10',
+      fecha_registro: new Date().toISOString().slice(0, 10),
+      email: 'juan.perez@example.com',
+      telefono: '3815551234',
+      telefono_secundario: '',
+      direccion: 'Av. Siempreviva 742',
+      direccion_secundaria: '',
+      referencia_direccion: 'Puerta negra',
+      referencia_secundaria: '',
+      observaciones: 'Cliente nuevo',
+      provincia: 'Tucumán',
+      localidad: 'San Miguel de Tucumán',
+      cobrador: '',
+      cobrador_nombre: '',
+      zona: '',
+      zona_nombre: '',
+      historial_crediticio: 'Desaprobado',
+      puntaje_crediticio: 0
+    };
+
+    const rows = [example];
+
+    if (format === 'csv') {
+      const escape = (v) => {
+        if (v == null) return '';
+        const s = String(v);
+        if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+        return s;
+      };
+      const csvHeader = headers.map(escape).join(',');
+      const csvBody = rows
+        .map((r) => headers.map((h) => escape(r[h] ?? '')).join(','))
+        .join('\n');
+      const csv = `${csvHeader}\n${csvBody}\n`;
+
+      const filename = `plantilla_import_clientes_${new Date().toISOString().slice(0, 10)}.csv`;
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      return res.send(csv);
+    }
+
+    const wsData = [headers, ...rows.map(r => headers.map(h => r[h] ?? ''))];
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet(wsData);
+    XLSX.utils.book_append_sheet(wb, ws, 'Plantilla');
+
+    const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    const filename = `plantilla_import_clientes_${new Date().toISOString().slice(0, 10)}.xlsx`;
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    return res.send(buffer);
+  } catch (error) {
+    console.error('Error al generar plantilla de importación:', error);
+    return res.status(500).json({ success: false, message: 'Error al generar la plantilla' });
+  }
+});
+
+/* ──────────────────────────────────────────────────────────
+   NUEVO: Definición de columnas/alias/tipos para validación front
+   ────────────────────────────────────────────────────────── */
+/**
+ * GET /clientes/import/columns
+ * - Devuelve columnas requeridas/opcionales, alias, tipos, ejemplos y notas
+ * - Roles: superadmin (0) y admin (1)
+ */
+router.get('/import/columns', verifyToken, checkRole([0, 1]), (req, res) => {
+  try {
+    const payload = {
+      required: ['nombre', 'apellido', 'dni'],
+      optional: [
+        'fecha_nacimiento', 'fecha_registro', 'email', 'telefono', 'telefono_secundario',
+        'direccion', 'direccion_secundaria',
+        'referencia_direccion', 'referencia_secundaria',
+        'observaciones', 'provincia', 'localidad',
+        'cobrador', 'cobrador_nombre',
+        'zona', 'zona_nombre',
+        'historial_crediticio', 'puntaje_crediticio'
+      ],
+      aliases: {
+        telefono: ['telefono_1', 'teléfono'],
+        telefono_secundario: ['telefono_2'],
+        fecha_nacimiento: ['fecha nacimiento'],
+        fecha_registro: ['fecha registro'],
+        direccion: ['direccion_1', 'domicilio'],
+        direccion_secundaria: ['direccion_2']
+      },
+      types: {
+        nombre: 'string',
+        apellido: 'string',
+        dni: 'string-digits',
+        fecha_nacimiento: 'date',
+        fecha_registro: 'date',
+        email: 'email',
+        telefono: 'string',
+        telefono_secundario: 'string',
+        direccion: 'string',
+        direccion_secundaria: 'string',
+        referencia_direccion: 'string',
+        referencia_secundaria: 'string',
+        observaciones: 'string',
+        provincia: 'string',
+        localidad: 'string',
+        cobrador: 'number|empty',
+        cobrador_nombre: 'string|empty',
+        zona: 'number|empty',
+        zona_nombre: 'string|empty',
+        historial_crediticio: 'string|empty',
+        puntaje_crediticio: 'number|empty'
+      },
+      examples: {
+        nombre: 'Juan',
+        apellido: 'Pérez',
+        dni: '30111222',
+        fecha_nacimiento: '1990-05-10',
+        fecha_registro: '2025-10-31',
+        email: 'juan.perez@example.com',
+        telefono: '3815551234',
+        direccion: 'Av. Siempreviva 742',
+        provincia: 'Tucumán',
+        localidad: 'San Miguel de Tucumán',
+        cobrador: '5',
+        zona: '2'
+      },
+      notes: [
+        'Upsert por "dni": si el DNI existe, se actualiza; si no, se crea.',
+        '`cobrador`/`zona` aceptan ID numérico; `cobrador_nombre`/`zona_nombre` aceptan texto (case-insensitive).',
+        'Fechas en formato ISO (YYYY-MM-DD).',
+        'Los campos no incluidos se ignoran; `dni_foto` no forma parte de la importación por ahora.'
+      ]
+    };
+    return res.json({ success: true, data: payload });
+  } catch (error) {
+    console.error('Error al exponer columnas de importación:', error);
+    return res.status(500).json({ success: false, message: 'Error al obtener columnas' });
+  }
+});
+
+/* ──────────────────────────────────────────────────────────
    ENDPOINTS
    ────────────────────────────────────────────────────────── */
 
+// 🟣 Importar clientes por planilla (CSV/XLSX)
+router.post(
+  '/import',
+  verifyToken,
+  checkRole([0, 1]),
+  uploadImport.single('file'),
+  async (req, res) => {
+    try {
+      if (!req.file?.buffer) {
+        return res.status(400).json({
+          success: false,
+          message: 'No se recibió ningún archivo. Usá el campo "file".'
+        });
+      }
+
+      // dryRun: por defecto true (preview). Para commit: ?dryRun=false
+      const dryRun = String(req.query.dryRun ?? 'true').toLowerCase() !== 'false';
+
+      const { summary, rows } = await importarClientesDesdePlanilla(
+        req.file.buffer,
+        req.file.originalname || 'import',
+        { dryRun }
+      );
+
+      return res.json({
+        success: true,
+        message: dryRun
+          ? 'Previsualización (dryRun) generada correctamente'
+          : 'Importación realizada correctamente',
+        summary,
+        rows
+      });
+    } catch (error) {
+      console.error('Error en importación de clientes:', error);
+      return res.status(500).json({
+        success: false,
+        message: error?.message || 'Error al importar clientes'
+      });
+    }
+  }
+);
+
 // Ruta: Subir foto del DNI y actualizar cliente
-router.post('/:id/dni-foto', verifyToken, checkRole([0, 1]), upload.single('imagen'), async (req, res) => {
+router.post('/:id/dni-foto', verifyToken, checkRole([0]), upload.single('imagen'), async (req, res) => {
   try {
     const { id } = req.params;
     const dni_foto = req.file?.filename;
@@ -137,8 +380,8 @@ router.post('/', verifyToken, checkRole([0, 1]), async (req, res) => {
   }
 });
 
-// PUT - Actualizar cliente
-router.put('/:id', verifyToken, checkRole([0, 1]), async (req, res) => {
+// PUT - Actualizar cliente (solo superadmin)
+router.put('/:id', verifyToken, checkRole([0]), async (req, res) => {
   try {
     const { id } = req.params;
     const body = req.body;
@@ -167,7 +410,7 @@ router.put('/:id', verifyToken, checkRole([0, 1]), async (req, res) => {
   }
 });
 
-// DELETE - Eliminar cliente
+// DELETE - Eliminar cliente (superadmin y admin)
 router.delete('/:id', verifyToken, checkRole([0, 1]), async (req, res) => {
   try {
     await eliminarCliente(req.params.id);

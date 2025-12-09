@@ -4,6 +4,7 @@ import * as XLSX from 'xlsx';
 
 import CajaMovimiento from '../models/CajaMovimiento.js';
 import FormaPago from '../models/FormaPago.js';
+import Usuario from '../models/Usuario.js';
 
 // Para exportación (4 hojas)
 import Gasto from '../models/Gasto.js';
@@ -105,27 +106,52 @@ const ensureRange = (desde, hasta) => {
 export const crearMovimiento = async (req, res) => {
     try {
         const {
-            fecha, hora, tipo, monto,
+            fecha,
+            hora,
+            tipo,
+            monto,
             forma_pago_id = null,
             concepto,
             referencia_tipo = null,
             referencia_id = null,
-            usuario_id = null
+            // usuario_id en body se ignora, usamos el usuario logueado
         } = req.body || {};
 
         const tipoNorm = String(tipo || '').toLowerCase().trim();
         if (!TIPOS_VALIDOS.has(tipoNorm)) {
-            return res.status(400).json({ success: false, message: 'tipo inválido. Use ingreso, egreso, ajuste, apertura o cierre.' });
+            return res.status(400).json({
+                success: false,
+                message: 'tipo inválido. Use ingreso, egreso, ajuste, apertura o cierre.',
+            });
         }
 
         let montoNum = fix2(sanitizeNumber(monto));
 
         if (!(montoNum > 0)) {
-            return res.status(400).json({ success: false, message: 'monto debe ser un número > 0' });
+            return res
+                .status(400)
+                .json({ success: false, message: 'monto debe ser un número > 0' });
         }
         const conceptoTrim = String(concepto || '').trim();
         if (!conceptoTrim) {
             return res.status(400).json({ success: false, message: 'concepto es obligatorio' });
+        }
+
+        // ✅ Usuario logueado (JWT middleware debe setear req.user)
+        const usuarioId =
+            req.user?.id ??
+            req.user?.usuario_id ??
+            req.user?.userId ??
+            null;
+
+        const rolUsuario = (req.user?.rol ?? req.user?.role ?? req.user?.tipo ?? '').toLowerCase();
+
+        // 🔒 Solo superadmin puede registrar movimientos manuales desde la caja diaria
+        if (rolUsuario !== 'superadmin') {
+            return res.status(403).json({
+                success: false,
+                message: 'Solo el usuario superadmin puede registrar movimientos manuales en Caja.',
+            });
         }
 
         const registro = await CajaMovimiento.create({
@@ -137,13 +163,17 @@ export const crearMovimiento = async (req, res) => {
             concepto: conceptoTrim.slice(0, 255),
             referencia_tipo: referencia_tipo ?? null,
             referencia_id: referencia_id ?? null,
-            usuario_id: usuario_id ?? null
+            usuario_id: usuarioId,
         });
 
         res.json({ success: true, data: registro });
     } catch (err) {
         console.error('[crearMovimiento]', err);
-        res.status(500).json({ success: false, message: 'Error al crear movimiento', error: err?.message });
+        res.status(500).json({
+            success: false,
+            message: 'Error al crear movimiento',
+            error: err?.message,
+        });
     }
 };
 
@@ -159,7 +189,7 @@ export const obtenerMovimientos = async (req, res) => {
             referencia_id,
             q,
             page = 1,
-            limit = 50
+            limit = 50,
         } = req.query || {};
 
         const where = {};
@@ -167,6 +197,13 @@ export const obtenerMovimientos = async (req, res) => {
         // Rango de fechas
         let d = asYMD(desde);
         let h = asYMD(hasta);
+
+        // 🔧 DEFAULT: últimos 3 días (solo si no se enviaron filtros de fecha)
+        if (!d && !h) {
+            h = nowYMD();
+            d = addDays(h, -2);
+        }
+
         [d, h] = ensureRange(d, h);
         if (d && h) where.fecha = { [Op.between]: [d, h] };
         else if (d) where.fecha = { [Op.gte]: d };
@@ -175,9 +212,11 @@ export const obtenerMovimientos = async (req, res) => {
         // Tipos
         if (tipo) {
             const tipos = Array.isArray(tipo)
-                ? tipo.map(s => String(s).trim().toLowerCase())
-                : String(tipo).split(',').map(s => s.trim().toLowerCase());
-            const validos = tipos.filter(t => TIPOS_VALIDOS.has(t));
+                ? tipo.map((s) => String(s).trim().toLowerCase())
+                : String(tipo)
+                      .split(',')
+                      .map((s) => s.trim().toLowerCase());
+            const validos = tipos.filter((t) => TIPOS_VALIDOS.has(t));
             if (validos.length) where.tipo = { [Op.in]: validos };
         }
 
@@ -195,16 +234,19 @@ export const obtenerMovimientos = async (req, res) => {
         // referencia_tipo
         if (typeof referencia_tipo !== 'undefined') {
             if (Array.isArray(referencia_tipo)) {
-                const vals = referencia_tipo.map(s => String(s).trim().toLowerCase()).filter(Boolean);
+                const vals = referencia_tipo
+                    .map((s) => String(s).trim().toLowerCase())
+                    .filter(Boolean);
                 if (vals.length === 1 && (vals[0] === 'null' || vals[0] === 'none')) {
                     where.referencia_tipo = { [Op.is]: null };
                 } else if (vals.length) {
                     const hasNull = vals.includes('null') || vals.includes('none');
                     where[Op.and] = where[Op.and] || [];
                     if (hasNull) {
-                        const onlyVals = vals.filter(v => v !== 'null' && v !== 'none');
+                        const onlyVals = vals.filter((v) => v !== 'null' && v !== 'none');
                         const or = [];
-                        if (onlyVals.length) or.push({ referencia_tipo: { [Op.in]: onlyVals } });
+                        if (onlyVals.length)
+                            or.push({ referencia_tipo: { [Op.in]: onlyVals } });
                         or.push({ referencia_tipo: { [Op.is]: null } });
                         where[Op.and].push({ [Op.or]: or });
                     } else {
@@ -216,7 +258,10 @@ export const obtenerMovimientos = async (req, res) => {
                 if (raw === 'null' || raw === 'none') {
                     where.referencia_tipo = { [Op.is]: null };
                 } else {
-                    const vals = raw.split(',').map(s => s.trim()).filter(Boolean);
+                    const vals = raw
+                        .split(',')
+                        .map((s) => s.trim())
+                        .filter(Boolean);
                     if (vals.length) where.referencia_tipo = { [Op.in]: vals };
                 }
             }
@@ -225,7 +270,7 @@ export const obtenerMovimientos = async (req, res) => {
         // referencia_id
         if (typeof referencia_id !== 'undefined') {
             if (Array.isArray(referencia_id)) {
-                const nums = referencia_id.map(n => Number(n)).filter(Number.isFinite);
+                const nums = referencia_id.map((n) => Number(n)).filter(Number.isFinite);
                 if (nums.length) where.referencia_id = { [Op.in]: nums };
             } else {
                 const num = Number(referencia_id);
@@ -244,25 +289,45 @@ export const obtenerMovimientos = async (req, res) => {
 
         const { rows, count } = await CajaMovimiento.findAndCountAll({
             where,
-            include: [{ model: FormaPago, as: 'formaPago', attributes: ['id', 'nombre'] }],
-            order: [['fecha', 'DESC'], ['hora', 'DESC'], ['id', 'DESC']],
+            include: [
+                {
+                    model: FormaPago,
+                    as: 'formaPago',
+                    attributes: ['id', 'nombre'],
+                },
+                {
+                    model: Usuario,
+                    as: 'usuario',
+                    // ⬅️ Usamos columnas reales del modelo Usuario
+                    attributes: ['id', 'nombre_completo', 'nombre_usuario'],
+                },
+            ],
+            order: [
+                ['fecha', 'DESC'],
+                ['hora', 'DESC'],
+                ['id', 'DESC'],
+            ],
             limit: limitNum,
-            offset
+            offset,
         });
 
-        const data = rows.map(r => ({
+        const data = rows.map((r) => ({
             ...r.get({ plain: true }),
-            monto: fix2(r.monto)
+            monto: fix2(r.monto),
         }));
 
         res.json({
             success: true,
             data,
-            pagination: { page: pageNum, limit: limitNum, total: count }
+            pagination: { page: pageNum, limit: limitNum, total: count },
         });
     } catch (err) {
         console.error('[obtenerMovimientos]', err);
-        res.status(500).json({ success: false, message: 'Error al listar movimientos', error: err?.message });
+        res.status(500).json({
+            success: false,
+            message: 'Error al listar movimientos',
+            error: err?.message,
+        });
     }
 };
 
@@ -278,7 +343,7 @@ export const resumenDiario = async (req, res) => {
             where: { fecha: f },
             attributes: ['tipo', [fn('SUM', col('monto')), 'total']],
             group: ['tipo'],
-            raw: true
+            raw: true,
         });
 
         // Suma por forma_pago_id y tipo
@@ -286,45 +351,70 @@ export const resumenDiario = async (req, res) => {
             where: { fecha: f },
             attributes: ['forma_pago_id', 'tipo', [fn('SUM', col('monto')), 'total']],
             group: ['forma_pago_id', 'tipo'],
-            raw: true
+            raw: true,
         });
 
-        const formas = await FormaPago.findAll({ attributes: ['id', 'nombre'], raw: true });
+        const formas = await FormaPago.findAll({
+            attributes: ['id', 'nombre'],
+            raw: true,
+        });
         const nombreForma = (id) => {
-            const found = formas.find(fp => fp.id === id);
-            return found ? found.nombre : (id == null ? 'Sin especificar' : `FP #${id}`);
+            const found = formas.find((fp) => fp.id === id);
+            return found ? found.nombre : id == null ? 'Sin especificar' : `FP #${id}`;
         };
 
-        const totalIngreso = fix2(totalesPorTipo.find(t => t.tipo === 'ingreso')?.total || 0);
-        const totalEgreso  = fix2(totalesPorTipo.find(t => t.tipo === 'egreso')?.total  || 0);
-        const totalAjuste  = fix2(totalesPorTipo.find(t => t.tipo === 'ajuste')?.total  || 0);
-        const totalApert   = fix2(totalesPorTipo.find(t => t.tipo === 'apertura')?.total|| 0);
-        const totalCierre  = fix2(totalesPorTipo.find(t => t.tipo === 'cierre')?.total  || 0);
+        const totalIngreso = fix2(
+            totalesPorTipo.find((t) => t.tipo === 'ingreso')?.total || 0,
+        );
+        const totalEgreso = fix2(
+            totalesPorTipo.find((t) => t.tipo === 'egreso')?.total || 0,
+        );
+        const totalAjuste = fix2(
+            totalesPorTipo.find((t) => t.tipo === 'ajuste')?.total || 0,
+        );
+        const totalApert = fix2(
+            totalesPorTipo.find((t) => t.tipo === 'apertura')?.total || 0,
+        );
+        const totalCierre = fix2(
+            totalesPorTipo.find((t) => t.tipo === 'cierre')?.total || 0,
+        );
 
-        const saldoDia = fix2(totalApert + totalIngreso - totalEgreso + totalAjuste - totalCierre);
+        const saldoDia = fix2(
+            totalApert + totalIngreso - totalEgreso + totalAjuste - totalCierre,
+        );
 
         // Estructura existente: porFormaPago[NombreFP] = { ingreso, egreso, ajuste, apertura, cierre }
         const porFormaPago = {};
         for (const row of porForma) {
             const key = nombreForma(row.forma_pago_id);
-            if (!porFormaPago[key]) porFormaPago[key] = { ingreso: 0, egreso: 0, ajuste: 0, apertura: 0, cierre: 0 };
+            if (!porFormaPago[key])
+                porFormaPago[key] = {
+                    ingreso: 0,
+                    egreso: 0,
+                    ajuste: 0,
+                    apertura: 0,
+                    cierre: 0,
+                };
             porFormaPago[key][row.tipo] = fix2(row.total);
         }
 
-        // NUEVO: porTipo[ tipo ] = [ { id, nombre, total } ... ]  (ideal para UI por card)
-        const vacioTipo = () => ({ ingreso: [], egreso: [], ajuste: [], apertura: [], cierre: [] });
+        // NUEVO: porTipo[ tipo ] = [ { id, nombre, total } ... ]
+        const vacioTipo = () => ({
+            ingreso: [],
+            egreso: [],
+            ajuste: [],
+            apertura: [],
+            cierre: [],
+        });
         const porTipo = vacioTipo();
         for (const row of porForma) {
             const item = {
                 id: row.forma_pago_id ?? null,
                 nombre: nombreForma(row.forma_pago_id),
-                total: fix2(row.total)
+                total: fix2(row.total),
             };
             porTipo[row.tipo].push(item);
         }
-
-        // Orden opcional: por defecto no ordeno; si querés por monto desc, podemos ordenar acá:
-        // Object.keys(porTipo).forEach(t => porTipo[t].sort((a,b)=> b.total - a.total));
 
         res.json({
             success: true,
@@ -336,15 +426,19 @@ export const resumenDiario = async (req, res) => {
                     ajuste: totalAjuste,
                     apertura: totalApert,
                     cierre: totalCierre,
-                    saldoDia
+                    saldoDia,
                 },
                 porFormaPago, // compatibilidad
-                porTipo       // NUEVO para las cards
-            }
+                porTipo, // para las cards en el front
+            },
         });
     } catch (err) {
         console.error('[resumenDiario]', err);
-        res.status(500).json({ success: false, message: 'Error al calcular resumen diario', error: err?.message });
+        res.status(500).json({
+            success: false,
+            message: 'Error al calcular resumen diario',
+            error: err?.message,
+        });
     }
 };
 
@@ -360,7 +454,7 @@ export const resumenSemanal = async (req, res) => {
             where: rango,
             attributes: ['tipo', [fn('SUM', col('monto')), 'total']],
             group: ['tipo'],
-            raw: true
+            raw: true,
         });
 
         const porDia = await CajaMovimiento.findAll({
@@ -368,77 +462,111 @@ export const resumenSemanal = async (req, res) => {
             attributes: ['fecha', 'tipo', [fn('SUM', col('monto')), 'total']],
             group: ['fecha', 'tipo'],
             order: [['fecha', 'ASC']],
-            raw: true
+            raw: true,
         });
 
         const porForma = await CajaMovimiento.findAll({
             where: rango,
             attributes: ['forma_pago_id', 'tipo', [fn('SUM', col('monto')), 'total']],
             group: ['forma_pago_id', 'tipo'],
-            raw: true
+            raw: true,
         });
 
-        const formas = await FormaPago.findAll({ attributes: ['id', 'nombre'], raw: true });
+        const formas = await FormaPago.findAll({
+            attributes: ['id', 'nombre'],
+            raw: true,
+        });
         const nombreForma = (id) => {
-            const found = formas.find(fp => fp.id === id);
-            return found ? found.nombre : (id == null ? 'Sin especificar' : `FP #${id}`);
+            const found = formas.find((fp) => fp.id === id);
+            return found ? found.nombre : id == null ? 'Sin especificar' : `FP #${id}`;
         };
 
         const totales = {
-            ingreso: fix2(totalesPorTipo.find(t => t.tipo === 'ingreso')?.total || 0),
-            egreso:  fix2(totalesPorTipo.find(t => t.tipo === 'egreso')?.total  || 0),
-            ajuste:  fix2(totalesPorTipo.find(t => t.tipo === 'ajuste')?.total  || 0),
-            apertura:fix2(totalesPorTipo.find(t => t.tipo === 'apertura')?.total|| 0),
-            cierre:  fix2(totalesPorTipo.find(t => t.tipo === 'cierre')?.total  || 0),
+            ingreso: fix2(
+                totalesPorTipo.find((t) => t.tipo === 'ingreso')?.total || 0,
+            ),
+            egreso: fix2(
+                totalesPorTipo.find((t) => t.tipo === 'egreso')?.total || 0,
+            ),
+            ajuste: fix2(
+                totalesPorTipo.find((t) => t.tipo === 'ajuste')?.total || 0,
+            ),
+            apertura: fix2(
+                totalesPorTipo.find((t) => t.tipo === 'apertura')?.total || 0,
+            ),
+            cierre: fix2(
+                totalesPorTipo.find((t) => t.tipo === 'cierre')?.total || 0,
+            ),
         };
 
         const porDiaIndex = {};
         for (const row of porDia) {
             const k = row.fecha;
-            if (!porDiaIndex[k]) porDiaIndex[k] = { ingreso: 0, egreso: 0, ajuste: 0, apertura: 0, cierre: 0 };
+            if (!porDiaIndex[k])
+                porDiaIndex[k] = {
+                    ingreso: 0,
+                    egreso: 0,
+                    ajuste: 0,
+                    apertura: 0,
+                    cierre: 0,
+                };
             porDiaIndex[k][row.tipo] = fix2(row.total);
         }
 
         const porFormaPago = {};
         for (const row of porForma) {
             const key = nombreForma(row.forma_pago_id);
-            if (!porFormaPago[key]) porFormaPago[key] = { ingreso: 0, egreso: 0, ajuste: 0, apertura: 0, cierre: 0 };
+            if (!porFormaPago[key])
+                porFormaPago[key] = {
+                    ingreso: 0,
+                    egreso: 0,
+                    ajuste: 0,
+                    apertura: 0,
+                    cierre: 0,
+                };
             porFormaPago[key][row.tipo] = fix2(row.total);
         }
 
         res.json({
             success: true,
             data: {
-                desde, hasta,
+                desde,
+                hasta,
                 totales,
                 porDia: porDiaIndex,
-                porFormaPago
-            }
+                porFormaPago,
+            },
         });
     } catch (err) {
         console.error('[resumenSemanal]', err);
-        res.status(500).json({ success: false, message: 'Error al calcular resumen semanal', error: err?.message });
+        res.status(500).json({
+            success: false,
+            message: 'Error al calcular resumen semanal',
+            error: err?.message,
+        });
     }
 };
 
 export const resumenMensual = async (req, res) => {
     try {
         const anio = Number(req.query?.anio) || new Date().getFullYear();
-        const mes = Number(req.query?.mes) || (new Date().getMonth() + 1);
+        const mes = Number(req.query?.mes) || new Date().getMonth() + 1;
         const desde = `${anio}-${String(mes).padStart(2, '0')}-01`;
 
         const rangoMes = {
             fecha: {
                 [Op.gte]: desde,
-                [Op.lt]: literal(`(DATE_TRUNC('month', DATE '${desde}') + INTERVAL '1 month')::date`)
-            }
+                [Op.lt]: literal(
+                    `(DATE_TRUNC('month', DATE '${desde}') + INTERVAL '1 month')::date`,
+                ),
+            },
         };
 
         const totalesPorTipo = await CajaMovimiento.findAll({
             where: rangoMes,
             attributes: ['tipo', [fn('SUM', col('monto')), 'total']],
             group: ['tipo'],
-            raw: true
+            raw: true,
         });
 
         const porDia = await CajaMovimiento.findAll({
@@ -446,41 +574,68 @@ export const resumenMensual = async (req, res) => {
             attributes: ['fecha', 'tipo', [fn('SUM', col('monto')), 'total']],
             group: ['fecha', 'tipo'],
             order: [['fecha', 'ASC']],
-            raw: true
+            raw: true,
         });
 
         const porForma = await CajaMovimiento.findAll({
             where: rangoMes,
             attributes: ['forma_pago_id', 'tipo', [fn('SUM', col('monto')), 'total']],
             group: ['forma_pago_id', 'tipo'],
-            raw: true
+            raw: true,
         });
 
-        const formas = await FormaPago.findAll({ attributes: ['id', 'nombre'], raw: true });
+        const formas = await FormaPago.findAll({
+            attributes: ['id', 'nombre'],
+            raw: true,
+        });
         const nombreForma = (id) => {
-            const found = formas.find(fp => fp.id === id);
-            return found ? found.nombre : (id == null ? 'Sin especificar' : `FP #${id}`);
+            const found = formas.find((fp) => fp.id === id);
+            return found ? found.nombre : id == null ? 'Sin especificar' : `FP #${id}`;
         };
 
         const totales = {
-            ingreso: fix2(totalesPorTipo.find(t => t.tipo === 'ingreso')?.total || 0),
-            egreso:  fix2(totalesPorTipo.find(t => t.tipo === 'egreso')?.total  || 0),
-            ajuste:  fix2(totalesPorTipo.find(t => t.tipo === 'ajuste')?.total  || 0),
-            apertura:fix2(totalesPorTipo.find(t => t.tipo === 'apertura')?.total|| 0),
-            cierre:  fix2(totalesPorTipo.find(t => t.tipo === 'cierre')?.total  || 0),
+            ingreso: fix2(
+                totalesPorTipo.find((t) => t.tipo === 'ingreso')?.total || 0,
+            ),
+            egreso: fix2(
+                totalesPorTipo.find((t) => t.tipo === 'egreso')?.total || 0,
+            ),
+            ajuste: fix2(
+                totalesPorTipo.find((t) => t.tipo === 'ajuste')?.total || 0,
+            ),
+            apertura: fix2(
+                totalesPorTipo.find((t) => t.tipo === 'apertura')?.total || 0,
+            ),
+            cierre: fix2(
+                totalesPorTipo.find((t) => t.tipo === 'cierre')?.total || 0,
+            ),
         };
 
         const porDiaIndex = {};
         for (const row of porDia) {
             const k = row.fecha;
-            if (!porDiaIndex[k]) porDiaIndex[k] = { ingreso: 0, egreso: 0, ajuste: 0, apertura: 0, cierre: 0 };
+            if (!porDiaIndex[k])
+                porDiaIndex[k] = {
+                    ingreso: 0,
+                    egreso: 0,
+                    ajuste: 0,
+                    apertura: 0,
+                    cierre: 0,
+                };
             porDiaIndex[k][row.tipo] = fix2(row.total);
         }
 
         const porFormaPago = {};
         for (const row of porForma) {
             const key = nombreForma(row.forma_pago_id);
-            if (!porFormaPago[key]) porFormaPago[key] = { ingreso: 0, egreso: 0, ajuste: 0, apertura: 0, cierre: 0 };
+            if (!porFormaPago[key])
+                porFormaPago[key] = {
+                    ingreso: 0,
+                    egreso: 0,
+                    ajuste: 0,
+                    apertura: 0,
+                    cierre: 0,
+                };
             porFormaPago[key][row.tipo] = fix2(row.total);
         }
 
@@ -491,25 +646,32 @@ export const resumenMensual = async (req, res) => {
                 mes,
                 totales,
                 porDia: porDiaIndex,
-                porFormaPago
-            }
+                porFormaPago,
+            },
         });
     } catch (err) {
         console.error('[resumenMensual]', err);
-        res.status(500).json({ success: false, message: 'Error al calcular resumen mensual', error: err?.message });
+        res.status(500).json({
+            success: false,
+            message: 'Error al calcular resumen mensual',
+            error: err?.message,
+        });
     }
 };
 
 /* ───────────────── Helpers de integración automática (créditos/recibos) ───────────────── */
-export const registrarIngresoDesdeRecibo = async ({
-    fecha,
-    hora,
-    monto,
-    forma_pago_id = null,
-    concepto,
-    referencia_id = null,
-    usuario_id = null
-}, options = {}) => {
+export const registrarIngresoDesdeRecibo = async (
+    {
+        fecha,
+        hora,
+        monto,
+        forma_pago_id = null,
+        concepto,
+        referencia_id = null,
+        usuario_id = null,
+    },
+    options = {},
+) => {
     const { transaction } = options;
     const fechaFinal = asYMD(fecha) || nowYMD();
     const horaFinal = hora || nowHMS();
@@ -517,71 +679,91 @@ export const registrarIngresoDesdeRecibo = async ({
     let montoNum = fix2(sanitizeNumber(monto));
     if (!(montoNum > 0)) throw new Error('monto debe ser > 0 para registrar ingreso');
 
-    const conceptoFinal = String(concepto || (referencia_id ? `Cobro recibo #${referencia_id}` : 'Ingreso')).slice(0, 255);
+    const conceptoFinal = String(
+        concepto || (referencia_id ? `Cobro recibo #${referencia_id}` : 'Ingreso'),
+    ).slice(0, 255);
 
     if (referencia_id) {
         const exists = await CajaMovimiento.findOne({
-            where: { tipo: 'ingreso', referencia_tipo: 'recibo', referencia_id },
-            transaction
+            where: {
+                tipo: 'ingreso',
+                referencia_tipo: 'recibo',
+                referencia_id,
+            },
+            transaction,
         });
-        if (exists) return { ...exists.get({ plain: true }), monto: fix2(exists.monto) };
+        if (exists)
+            return { ...exists.get({ plain: true }), monto: fix2(exists.monto) };
     }
 
-    const creado = await CajaMovimiento.create({
-        fecha: fechaFinal,
-        hora: horaFinal,
-        tipo: 'ingreso',
-        monto: montoNum,
-        forma_pago_id,
-        concepto: conceptoFinal,
-        referencia_tipo: 'recibo',
-        referencia_id,
-        usuario_id
-    }, { transaction });
+    const creado = await CajaMovimiento.create(
+        {
+            fecha: fechaFinal,
+            hora: horaFinal,
+            tipo: 'ingreso',
+            monto: montoNum,
+            forma_pago_id,
+            concepto: conceptoFinal,
+            referencia_tipo: 'recibo',
+            referencia_id,
+            usuario_id: usuario_id ?? null,
+        },
+        { transaction },
+    );
 
     return { ...creado.get({ plain: true }), monto: fix2(creado.monto) };
 };
 
-export const registrarEgresoPorAcreditacionCredito = async ({
-    credito_id,
-    monto,
-    fecha = null,
-    hora = null,
-    forma_pago_id = null,
-    usuario_id = null,
-    concepto = null
-}, options = {}) => {
+export const registrarEgresoPorAcreditacionCredito = async (
+    {
+        credito_id,
+        monto,
+        fecha = null,
+        hora = null,
+        forma_pago_id = null,
+        usuario_id = null,
+        concepto = null,
+    },
+    options = {},
+) => {
     const { transaction } = options;
     const fechaFinal = asYMD(fecha) || nowYMD();
     const horaFinal = hora || nowHMS();
 
     let montoNum = fix2(sanitizeNumber(monto));
-    if (!(montoNum > 0)) throw new Error('monto debe ser > 0 para registrar egreso de acreditación');
-    const conceptoFinal = String(concepto || `Acreditación crédito #${credito_id}`).slice(0, 255);
+    if (!(montoNum > 0))
+        throw new Error('monto debe ser > 0 para registrar egreso de acreditación');
+    const conceptoFinal = String(
+        concepto || `Acreditación crédito #${credito_id}`,
+    ).slice(0, 255);
 
     if (credito_id) {
         const exists = await CajaMovimiento.findOne({
             where: {
                 tipo: 'egreso',
                 referencia_tipo: 'credito',
-                referencia_id: credito_id
+                referencia_id: credito_id,
             },
-            transaction
+            transaction,
         });
-        if (exists) return { ...exists.get({ plain: true }), monto: fix2(exists.monto) };
+        if (exists)
+            return { ...exists.get({ plain: true }), monto: fix2(exists.monto) };
     }
 
-    const creado = await CajaMovimiento.create({
-        fecha: fechaFinal,
-        hora: horaFinal,
-        tipo: 'egreso',
-        monto: montoNum,
-        forma_pago_id,
-        concepto: conceptoFinal,
-        referencia_tipo: 'credito',
-        referencia_id: credito_id,
-        usuario_id
-    }, { transaction });
+    const creado = await CajaMovimiento.create(
+        {
+            fecha: fechaFinal,
+            hora: horaFinal,
+            tipo: 'egreso',
+            monto: montoNum,
+            forma_pago_id,
+            concepto: conceptoFinal,
+            referencia_tipo: 'credito',
+            referencia_id: credito_id,
+            usuario_id: usuario_id ?? null,
+        },
+        { transaction },
+    );
 
     return { ...creado.get({ plain: true }), monto: fix2(creado.monto) };
 };
@@ -589,54 +771,67 @@ export const registrarEgresoPorAcreditacionCredito = async ({
 /* ───────────────── Helpers de integración MANUAL (Gasto / Compra / VentaManual) ───────────────── */
 
 /** EGRESO por Gasto */
-export const registrarEgresoDesdeGasto = async ({
-    gasto_id,
-    total,
-    fecha_imputacion,
-    forma_pago_id = null,
-    usuario_id = null,
-    concepto = null
-}, options = {}) => {
+export const registrarEgresoDesdeGasto = async (
+    {
+        gasto_id,
+        total,
+        fecha_imputacion,
+        forma_pago_id = null,
+        usuario_id = null,
+        concepto = null,
+    },
+    options = {},
+) => {
     const { transaction } = options;
     const fechaFinal = asYMD(fecha_imputacion) || nowYMD();
 
     let montoNum = fix2(sanitizeNumber(total));
-    if (!(montoNum > 0)) throw new Error('total debe ser > 0 para registrar egreso (gasto)');
+    if (!(montoNum > 0))
+        throw new Error('total debe ser > 0 para registrar egreso (gasto)');
     const conceptoFinal = String(concepto || `Gasto #${gasto_id}`).slice(0, 255);
 
     // Idempotencia por referencia
     const exists = await CajaMovimiento.findOne({
-        where: { tipo: 'egreso', referencia_tipo: 'gasto', referencia_id: gasto_id },
-        transaction
+        where: {
+            tipo: 'egreso',
+            referencia_tipo: 'gasto',
+            referencia_id: gasto_id,
+        },
+        transaction,
     });
-    if (exists) return { ...exists.get({ plain: true }), monto: fix2(exists.monto) };
+    if (exists)
+        return { ...exists.get({ plain: true }), monto: fix2(exists.monto) };
 
-    const creado = await CajaMovimiento.create({
-        fecha: fechaFinal,
-        hora: nowHMS(),
-        tipo: 'egreso',
-        monto: montoNum,
-        forma_pago_id,
-        concepto: conceptoFinal,
-        referencia_tipo: 'gasto',
-        referencia_id: gasto_id,
-        usuario_id
-    }, { transaction });
+    const creado = await CajaMovimiento.create(
+        {
+            fecha: fechaFinal,
+            hora: nowHMS(),
+            tipo: 'egreso',
+            monto: montoNum,
+            forma_pago_id,
+            concepto: conceptoFinal,
+            referencia_tipo: 'gasto',
+            referencia_id: gasto_id,
+            usuario_id: usuario_id ?? null,
+        },
+        { transaction },
+    );
 
     return { ...creado.get({ plain: true }), monto: fix2(creado.monto) };
 };
 
-export const actualizarMovimientoDesdeGasto = async ({
-    gasto_id,
-    total,
-    fecha_imputacion,
-    forma_pago_id = null,
-    concepto = null
-}, options = {}) => {
+export const actualizarMovimientoDesdeGasto = async (
+    { gasto_id, total, fecha_imputacion, forma_pago_id = null, concepto = null },
+    options = {},
+) => {
     const { transaction } = options;
     const mov = await CajaMovimiento.findOne({
-        where: { tipo: 'egreso', referencia_tipo: 'gasto', referencia_id: gasto_id },
-        transaction
+        where: {
+            tipo: 'egreso',
+            referencia_tipo: 'gasto',
+            referencia_id: gasto_id,
+        },
+        transaction,
     });
     if (!mov) return null;
 
@@ -654,14 +849,17 @@ export const actualizarMovimientoDesdeGasto = async ({
 };
 
 /** EGRESO por Compra — toma SIEMPRE el total real desde la tabla Compra */
-export const registrarEgresoDesdeCompra = async ({
-    compra_id,
-    // total ignorado
-    fecha_imputacion,
-    forma_pago_id = null,
-    usuario_id = null,
-    concepto = null
-}, options = {}) => {
+export const registrarEgresoDesdeCompra = async (
+    {
+        compra_id,
+        // total ignorado
+        fecha_imputacion,
+        forma_pago_id = null,
+        usuario_id = null,
+        concepto = null,
+    },
+    options = {},
+) => {
     const { transaction } = options;
     if (!compra_id) throw new Error('compra_id es requerido');
 
@@ -669,45 +867,65 @@ export const registrarEgresoDesdeCompra = async ({
     if (!compra) throw new Error(`Compra #${compra_id} no encontrada`);
 
     let montoNum = fix2(sanitizeNumber(compra.total));
-    if (!(montoNum > 0)) throw new Error('total debe ser > 0 para registrar egreso (compra)');
+    if (!(montoNum > 0))
+        throw new Error('total debe ser > 0 para registrar egreso (compra)');
 
-    const fechaFinal = asYMD(fecha_imputacion || compra.fecha_imputacion) || nowYMD();
-    const conceptoFinal = String(concepto || `Compra #${compra_id}`).slice(0, 255);
+    const fechaFinal =
+        asYMD(fecha_imputacion || compra.fecha_imputacion) || nowYMD();
+    const conceptoFinal = String(concepto || `Compra #${compra_id}`).slice(
+        0,
+        255,
+    );
 
     const exists = await CajaMovimiento.findOne({
-        where: { tipo: 'egreso', referencia_tipo: 'compra', referencia_id: compra_id },
-        transaction
+        where: {
+            tipo: 'egreso',
+            referencia_tipo: 'compra',
+            referencia_id: compra_id,
+        },
+        transaction,
     });
-    if (exists) return { ...exists.get({ plain: true }), monto: fix2(exists.monto) };
+    if (exists)
+        return { ...exists.get({ plain: true }), monto: fix2(exists.monto) };
 
-    const creado = await CajaMovimiento.create({
-        fecha: fechaFinal,
-        hora: nowHMS(),
-        tipo: 'egreso',
-        monto: montoNum,
-        forma_pago_id: forma_pago_id ?? compra.forma_pago_id ?? null,
-        concepto: conceptoFinal,
-        referencia_tipo: 'compra',
-        referencia_id: compra_id,
-        usuario_id
-    }, { transaction });
+    const creado = await CajaMovimiento.create(
+        {
+            fecha: fechaFinal,
+            hora: nowHMS(),
+            tipo: 'egreso',
+            monto: montoNum,
+            forma_pago_id: forma_pago_id ?? compra.forma_pago_id ?? null,
+            concepto: conceptoFinal,
+            referencia_tipo: 'compra',
+            referencia_id: compra_id,
+            usuario_id: usuario_id ?? null,
+        },
+        { transaction },
+    );
 
     return { ...creado.get({ plain: true }), monto: fix2(creado.monto) };
 };
 
-export const actualizarMovimientoDesdeCompra = async ({
-    compra_id,
-    // total ignorado
-    fecha_imputacion,
-    forma_pago_id = null,
-    concepto = null
-}, options = {}) => {
+export const actualizarMovimientoDesdeCompra = async (
+    {
+        compra_id,
+        // total ignorado
+        fecha_imputacion,
+        forma_pago_id = null,
+        concepto = null,
+    },
+    options = {},
+) => {
     const { transaction } = options;
     if (!compra_id) return null;
 
     const mov = await CajaMovimiento.findOne({
-        where: { tipo: 'egreso', referencia_tipo: 'compra', referencia_id: compra_id },
-        transaction
+        where: {
+            tipo: 'egreso',
+            referencia_tipo: 'compra',
+            referencia_id: compra_id,
+        },
+        transaction,
     });
     if (!mov) return null;
 
@@ -716,8 +934,10 @@ export const actualizarMovimientoDesdeCompra = async ({
 
     const updates = {};
     updates.monto = fix2(sanitizeNumber(compra.total));
-    updates.fecha = asYMD(fecha_imputacion || compra.fecha_imputacion) || mov.fecha;
-    if (forma_pago_id !== undefined) updates.forma_pago_id = forma_pago_id ?? compra.forma_pago_id ?? null;
+    updates.fecha =
+        asYMD(fecha_imputacion || compra.fecha_imputacion) || mov.fecha;
+    if (forma_pago_id !== undefined)
+        updates.forma_pago_id = forma_pago_id ?? compra.forma_pago_id ?? null;
     if (concepto) updates.concepto = String(concepto).slice(0, 255);
 
     await mov.update(updates, { transaction });
@@ -726,53 +946,69 @@ export const actualizarMovimientoDesdeCompra = async ({
 };
 
 /** INGRESO por VentaManual */
-export const registrarIngresoDesdeVentaManual = async ({
-    venta_id,
-    total,
-    fecha_imputacion,
-    forma_pago_id = null,
-    usuario_id = null,
-    concepto = null
-}, options = {}) => {
+export const registrarIngresoDesdeVentaManual = async (
+    {
+        venta_id,
+        total,
+        fecha_imputacion,
+        forma_pago_id = null,
+        usuario_id = null,
+        concepto = null,
+    },
+    options = {},
+) => {
     const { transaction } = options;
     const fechaFinal = asYMD(fecha_imputacion) || nowYMD();
 
     let montoNum = fix2(sanitizeNumber(total));
-    if (!(montoNum > 0)) throw new Error('total debe ser > 0 para registrar ingreso (venta)');
-    const conceptoFinal = String(concepto || `Venta #${venta_id}`).slice(0, 255);
+    if (!(montoNum > 0))
+        throw new Error('total debe ser > 0 para registrar ingreso (venta)');
+    const conceptoFinal = String(concepto || `Venta #${venta_id}`).slice(
+        0,
+        255,
+    );
 
     const exists = await CajaMovimiento.findOne({
-        where: { tipo: 'ingreso', referencia_tipo: 'venta', referencia_id: venta_id },
-        transaction
+        where: {
+            tipo: 'ingreso',
+            referencia_tipo: 'venta',
+            referencia_id: venta_id,
+        },
+        transaction,
     });
-    if (exists) return { ...exists.get({ plain: true }), monto: fix2(exists.monto) };
+    if (exists)
+        return { ...exists.get({ plain: true }), monto: fix2(exists.monto) };
 
-    const creado = await CajaMovimiento.create({
-        fecha: fechaFinal,
-        hora: nowHMS(),
-        tipo: 'ingreso',
-        monto: montoNum,
-        forma_pago_id,
-        concepto: conceptoFinal,
-        referencia_tipo: 'venta',
-        referencia_id: venta_id,
-        usuario_id
-    }, { transaction });
+    const creado = await CajaMovimiento.create(
+        {
+            fecha: fechaFinal,
+            hora: nowHMS(),
+            tipo: 'ingreso',
+            monto: montoNum,
+            forma_pago_id,
+            concepto: conceptoFinal,
+            referencia_tipo: 'venta',
+            referencia_id: venta_id,
+            usuario_id: usuario_id ?? null,
+        },
+        { transaction },
+    );
 
     return { ...creado.get({ plain: true }), monto: fix2(creado.monto) };
 };
 
-export const actualizarMovimientoDesdeVentaManual = async ({
-    venta_id,
-    total,
-    fecha_imputacion,
-    forma_pago_id = null,
-    concepto = null
-}, options = {}) => {
+export const actualizarMovimientoDesdeVentaManual = async (
+    { venta_id, total, fecha_imputacion, forma_pago_id = null, concepto = null },
+    options = {},
+) => {
     const { transaction } = options;
     const mov = await CajaMovimiento.findOne({
-        where: { tipo: 'ingreso', referencia_tipo: 'venta', referencia_id: venta_id },
-        transaction
+        where: {
+            tipo: 'ingreso',
+            referencia_tipo: 'venta',
+            referencia_id: venta_id,
+        },
+        transaction,
     });
     if (!mov) return null;
 
@@ -792,8 +1028,12 @@ export const actualizarMovimientoDesdeVentaManual = async ({
 export const eliminarMovimientoDesdeCompra = async (compra_id, options = {}) => {
     const { transaction } = options;
     const deleted = await CajaMovimiento.destroy({
-        where: { tipo: 'egreso', referencia_tipo: 'compra', referencia_id: compra_id },
-        transaction
+        where: {
+            tipo: 'egreso',
+            referencia_tipo: 'compra',
+            referencia_id: compra_id,
+        },
+        transaction,
     });
     return deleted;
 };
@@ -801,17 +1041,28 @@ export const eliminarMovimientoDesdeCompra = async (compra_id, options = {}) => 
 export const eliminarMovimientoDesdeGasto = async (gasto_id, options = {}) => {
     const { transaction } = options;
     const deleted = await CajaMovimiento.destroy({
-        where: { tipo: 'egreso', referencia_tipo: 'gasto', referencia_id: gasto_id },
-        transaction
+        where: {
+            tipo: 'egreso',
+            referencia_tipo: 'gasto',
+            referencia_id: gasto_id,
+        },
+        transaction,
     });
     return deleted;
 };
 
-export const eliminarMovimientoDesdeVentaManual = async (venta_id, options = {}) => {
+export const eliminarMovimientoDesdeVentaManual = async (
+    venta_id,
+    options = {},
+) => {
     const { transaction } = options;
     const deleted = await CajaMovimiento.destroy({
-        where: { tipo: 'ingreso', referencia_tipo: 'venta', referencia_id: venta_id },
-        transaction
+        where: {
+            tipo: 'ingreso',
+            referencia_tipo: 'venta',
+            referencia_id: venta_id,
+        },
+        transaction,
     });
     return deleted;
 };
@@ -824,9 +1075,11 @@ export const exportarExcel = async (req, res) => {
         hasta = asYMD(hasta);
 
         if (!desde && periodo === 'diario') {
-            desde = nowYMD(); hasta = desde;
+            desde = nowYMD();
+            hasta = desde;
         } else if (!desde && periodo === 'semanal') {
-            desde = nowYMD(); hasta = addDays(desde, 6);
+            desde = nowYMD();
+            hasta = addDays(desde, 6);
         } else if (!desde && periodo === 'mensual') {
             const d = new Date();
             const y = d.getUTCFullYear();
@@ -838,7 +1091,8 @@ export const exportarExcel = async (req, res) => {
         }
 
         if (!desde && !hasta) {
-            desde = nowYMD(); hasta = desde;
+            desde = nowYMD();
+            hasta = desde;
         } else if (desde && !hasta) {
             hasta = desde;
         } else if (hasta && !desde) {
@@ -849,147 +1103,205 @@ export const exportarExcel = async (req, res) => {
         const rangoFechaImput = { [Op.between]: [desde, hasta] };
         const rangoCaja = { [Op.between]: [desde, hasta] };
 
-        const formas = await FormaPago.findAll({ attributes: ['id', 'nombre'], raw: true });
+        const formas = await FormaPago.findAll({
+            attributes: ['id', 'nombre'],
+            raw: true,
+        });
         const nombreFP = (id) => {
-            const fp = formas.find(f => f.id === id);
-            return fp ? fp.nombre : (id == null ? 'Sin especificar' : `FP #${id}`);
+            const fp = formas.find((f) => f.id === id);
+            return fp ? fp.nombre : id == null ? 'Sin especificar' : `FP #${id}`;
         };
 
         /* ── 1) GASTOS ── */
-        const gastos = await Gasto.findAll({ where: { fecha_imputacion: rangoFechaImput }, raw: true });
-        const sheetGastos = gastos.map(g => ({
+        const gastos = await Gasto.findAll({
+            where: { fecha_imputacion: rangoFechaImput },
+            raw: true,
+        });
+        const sheetGastos = gastos.map((g) => ({
             'FECHA IMPUTACION': g.fecha_imputacion,
             'FECHA GASTO': g.fecha_gasto || '',
             'TIPO DE COMPROBANTE': g.tipo_comprobante || '',
             'N° DE COMP': g.numero_comprobante || '',
-            'PROVEEDOR': g.proveedor_nombre || '',
+            PROVEEDOR: g.proveedor_nombre || '',
             'CUIT/CUIL': g.proveedor_cuit || '',
-            'CONCEPTO': g.concepto || '',
-            'TOTAL': Number(g.total),
+            CONCEPTO: g.concepto || '',
+            TOTAL: Number(g.total),
             'FORMA DE PAGO': nombreFP(g.forma_pago_id),
-            'CLASIFICACION': g.clasificacion || '',
-            'MES': g.mes,
-            'AÑO': g.anio,
+            CLASIFICACION: g.clasificacion || '',
+            MES: g.mes,
+            AÑO: g.anio,
             'GASTO REALIZADO POR': g.gasto_realizado_por || '',
-            'OBSERVACION': g.observacion || '',
-            'CajaMovID': g.caja_movimiento_id || ''
+            OBSERVACION: g.observacion || '',
+            CajaMovID: g.caja_movimiento_id || '',
         }));
 
         /* ── 2) COMPRAS ── */
-        const compras = await Compra.findAll({ where: { fecha_imputacion: rangoFechaImput }, raw: true });
-        const sheetCompras = compras.map(c => ({
+        const compras = await Compra.findAll({
+            where: { fecha_imputacion: rangoFechaImput },
+            raw: true,
+        });
+        const sheetCompras = compras.map((c) => ({
             'FECHA IMPUTACIÓN': c.fecha_imputacion,
             'FECHA DE COMPR': c.fecha_compra || '',
             'TIPO DE COMPROBANTE': c.tipo_comprobante || '',
             'N° DE COMP': c.numero_comprobante || '',
             'NOMBRE Y APELLIDO- RS': c.proveedor_nombre || '',
             'CUIT-CUIL': c.proveedor_cuit || '',
-            'NETO': Number(c.neto),
-            'IVA': Number(c.iva),
+            NETO: Number(c.neto),
+            IVA: Number(c.iva),
             'PER IVA': Number(c.per_iva),
             'PER IIBB TUC': Number(c.per_iibb_tuc),
             'PER TEM': Number(c.per_tem),
-            'TOTAL': Number(c.total),
+            TOTAL: Number(c.total),
             'DEPOSITO DESTINO': c.deposito_destino || '',
             'REFERENCIA DE COMP': c.referencia_compra || '',
-            'CLASIFICACION': c.clasificacion || '',
-            'MES': c.mes,
-            'AÑO': c.anio,
+            CLASIFICACION: c.clasificacion || '',
+            MES: c.mes,
+            AÑO: c.anio,
             'FACTURADO A': c.facturado_a || '',
             'GASTO REALIZADO POR': c.gasto_realizado_por || '',
             'FORMA DE PAGO': nombreFP(c.forma_pago_id),
-            'CajaMovID': c.caja_movimiento_id || ''
+            CajaMovID: c.caja_movimiento_id || '',
         }));
 
         /* ── 3) VENTAS ── */
-        const ventas = await VentaManual.findAll({ where: { fecha_imputacion: rangoFechaImput }, raw: true });
-        const sheetVentas = ventas.map(v => ({
+        const ventas = await VentaManual.findAll({
+            where: { fecha_imputacion: rangoFechaImput },
+            raw: true,
+        });
+        const sheetVentas = ventas.map((v) => ({
             'FECHA IMPUTACION': v.fecha_imputacion,
             'N° DE COMP': v.numero_comprobante || '',
             'NOMBRE Y APELLIDO': v.cliente_nombre || '',
             'CUIT-CUIL/ DNI': v.doc_cliente || '',
-            'NETO': Number(v.neto),
-            'IVA': Number(v.iva),
+            NETO: Number(v.neto),
+            IVA: Number(v.iva),
             'RET GAN': Number(v.ret_gan),
-            'RETIVA': Number(v.ret_iva),
+            RETIVA: Number(v.ret_iva),
             'RET IIBB TUC': Number(v.ret_iibb_tuc),
-            'capital': Number(v.capital),
-            'interes': Number(v.interes),
-            'cuotas': Number(v.cuotas),
-            'TOTAL': Number(v.total),
+            capital: Number(v.capital),
+            interes: Number(v.interes),
+            cuotas: Number(v.cuotas),
+            TOTAL: Number(v.total),
             'FORMA DE PAGO': nombreFP(v.forma_pago_id),
             'FECHA FIN DE FINANCIACION': v.fecha_fin || '',
             'BONIFICACION (FALSO / VERD)': v.bonificacion ? 'VERDADERO' : 'FALSO',
-            'VENDEDOR': v.vendedor || '',
-            'MES': v.mes,
-            'AÑO': v.anio,
-            'CajaMovID': v.caja_movimiento_id || ''
+            VENDEDOR: v.vendedor || '',
+            MES: v.mes,
+            AÑO: v.anio,
+            CajaMovID: v.caja_movimiento_id || '',
         }));
 
         /* ── 4) CREDITO (Acreditaciones y Cobros) ── */
         const movsCredito = await CajaMovimiento.findAll({
             where: {
                 fecha: rangoCaja,
-                referencia_tipo: { [Op.in]: ['credito', 'recibo'] }
+                referencia_tipo: { [Op.in]: ['credito', 'recibo'] },
             },
-            raw: true
+            raw: true,
         });
 
-        const credIds = [...new Set(movsCredito
-            .filter(m => m.referencia_tipo === 'credito')
-            .map(m => m.referencia_id)
-            .filter(Boolean))];
+        const credIds = [
+            ...new Set(
+                movsCredito
+                    .filter((m) => m.referencia_tipo === 'credito')
+                    .map((m) => m.referencia_id)
+                    .filter(Boolean),
+            ),
+        ];
 
-        const creditos = credIds.length ? await Credito.findAll({
-            where: { id: { [Op.in]: credIds } },
-            include: [{ model: Cliente, as: 'cliente', attributes: ['id', 'nombre', 'apellido'] }],
-            raw: true, nest: true
-        }) : [];
+        const creditos = credIds.length
+            ? await Credito.findAll({
+                  where: { id: { [Op.in]: credIds } },
+                  include: [
+                      {
+                          model: Cliente,
+                          as: 'cliente',
+                          attributes: ['id', 'nombre', 'apellido'],
+                      },
+                  ],
+                  raw: true,
+                  nest: true,
+              })
+            : [];
         const mapCreditoCliente = new Map(
-            creditos.map(c => [c.id, [c.cliente?.nombre, c.cliente?.apellido].filter(Boolean).join(' ')])
+            creditos.map((c) => [
+                c.id,
+                [c.cliente?.nombre, c.cliente?.apellido]
+                    .filter(Boolean)
+                    .join(' '),
+            ]),
         );
 
-        const reciboIds = [...new Set(movsCredito
-            .filter(m => m.referencia_tipo === 'recibo')
-            .map(m => m.referencia_id)
-            .filter(Boolean))];
+        const reciboIds = [
+            ...new Set(
+                movsCredito
+                    .filter((m) => m.referencia_tipo === 'recibo')
+                    .map((m) => m.referencia_id)
+                    .filter(Boolean),
+            ),
+        ];
 
-        const recibos = reciboIds.length ? await Recibo.findAll({
-            where: { id: { [Op.in]: reciboIds } },
-            include: [{
-                model: Cuota, as: 'cuota',
-                include: [{
-                    model: Credito, as: 'credito',
-                    include: [{ model: Cliente, as: 'cliente', attributes: ['id', 'nombre', 'apellido'] }]
-                }]
-            }],
-            raw: true, nest: true
-        }) : [];
+        const recibos = reciboIds.length
+            ? await Recibo.findAll({
+                  where: { id: { [Op.in]: reciboIds } },
+                  include: [
+                      {
+                          model: Cuota,
+                          as: 'cuota',
+                          include: [
+                              {
+                                  model: Credito,
+                                  as: 'credito',
+                                  include: [
+                                      {
+                                          model: Cliente,
+                                          as: 'cliente',
+                                          attributes: ['id', 'nombre', 'apellido'],
+                                      },
+                                  ],
+                              },
+                          ],
+                      },
+                  ],
+                  raw: true,
+                  nest: true,
+              })
+            : [];
         const mapReciboCliente = new Map(
-            recibos.map(r => {
+            recibos.map((r) => {
                 const cli = r?.cuota?.credito?.cliente;
-                const nombre = [cli?.nombre, cli?.apellido].filter(Boolean).join(' ');
+                const nombre = [cli?.nombre, cli?.apellido]
+                    .filter(Boolean)
+                    .join(' ');
                 return [r.id, nombre];
-            })
+            }),
         );
 
-        const sheetCredito = movsCredito.map(m => {
-            const tipoMov = m.referencia_tipo === 'credito' ? 'Acreditación' : 'Cobro';
+        const sheetCredito = movsCredito.map((m) => {
+            const tipoMov =
+                m.referencia_tipo === 'credito' ? 'Acreditación' : 'Cobro';
             const cliente =
                 m.referencia_tipo === 'credito'
-                    ? (mapCreditoCliente.get(m.referencia_id) || '')
-                    : (mapReciboCliente.get(m.referencia_id) || '');
+                    ? mapCreditoCliente.get(m.referencia_id) || ''
+                    : mapReciboCliente.get(m.referencia_id) || '';
             return {
-                'Fecha': m.fecha,
-                'Hora': m.hora || '',
+                Fecha: m.fecha,
+                Hora: m.hora || '',
                 'Tipo Mov.': tipoMov,
-                'CréditoID': m.referencia_tipo === 'credito' ? (m.referencia_id || '') : '',
-                'ReciboID': m.referencia_tipo === 'recibo' ? (m.referencia_id || '') : '',
-                'Cliente': cliente,
+                CréditoID:
+                    m.referencia_tipo === 'credito'
+                        ? m.referencia_id || ''
+                        : '',
+                ReciboID:
+                    m.referencia_tipo === 'recibo'
+                        ? m.referencia_id || ''
+                        : '',
+                Cliente: cliente,
                 'Forma de pago': nombreFP(m.forma_pago_id),
-                'Concepto': m.concepto || '',
-                'Monto': Number(m.monto),
-                'CajaMovID': m.id
+                Concepto: m.concepto || '',
+                Monto: Number(m.monto),
+                CajaMovID: m.id,
             };
         });
 
@@ -1008,11 +1320,21 @@ export const exportarExcel = async (req, res) => {
         const buffer = XLSX.write(wb, { bookType: 'xlsx', type: 'buffer' });
 
         const fname = `caja_${desde}_a_${hasta}.xlsx`;
-        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-        res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
+        res.setHeader(
+            'Content-Type',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        );
+        res.setHeader(
+            'Content-Disposition',
+            `attachment; filename="${fname}"`,
+        );
         res.send(buffer);
     } catch (err) {
         console.error('[exportarExcel]', err);
-        res.status(500).json({ success: false, message: 'Error al exportar Excel', error: err?.message });
+        res.status(500).json({
+            success: false,
+            message: 'Error al exportar Excel',
+            error: err?.message,
+        });
     }
 };

@@ -125,6 +125,9 @@ router.delete('/:id', verifyToken, checkRole([0, 1]), async (req, res) => {
  * - Crédito "libre": el service hace LIQUIDACIÓN TOTAL (interés del/los ciclo/s SIN mora + capital),
  *   pudiendo aplicar descuento opcional (%) sobre el total si lo enviás en el body como "descuento".
  * RESPUESTA: { cuota, recibo } + campos legacy para compatibilidad
+ *
+ * ⚠️ Impactar pago: solo Admin (1) y Superadmin (0).
+ * ⚠️ Descuento: se validará en el service para que solo rol 0 pueda aplicarlo.
  * ────────────────────────────────────────────────────────────────────────── */
 router.put('/pagar/:id', verifyToken, checkRole([0, 1]), async (req, res) => {
     try {
@@ -140,7 +143,9 @@ router.put('/pagar/:id', verifyToken, checkRole([0, 1]), async (req, res) => {
             cuota_id: req.params.id,
             forma_pago_id,
             descuento,
-            observacion
+            observacion,
+            rol_id: req.user.rol_id,      // para reglas de descuento en el service
+            usuario_id: req.user.id       // 🆕 para registrar el usuario en CajaMovimiento
         });
 
         // Nuevo service retorna { cuota, recibo }
@@ -283,10 +288,17 @@ router.get('/credito/:creditoId', verifyToken, checkRole([0, 1, 2]), async (req,
  * Registrar pago parcial (acepta descuento opcional en body)
  * - En "libre": primero interés del/los ciclo/s transcurridos, luego capital.
  * - En común/progresivo: primero mora, luego principal.
+ *
+ * ⚠️ Impactar pago: solo Admin (1) y Superadmin (0).
+ * ⚠️ Descuento: se validará en el service para que solo rol 0 pueda aplicarlo.
  * ────────────────────────────────────────────────────────────────────────── */
-router.post('/pago-parcial', verifyToken, checkRole([0, 1, 2]), async (req, res) => {
+router.post('/pago-parcial', verifyToken, checkRole([0, 1]), async (req, res) => {
     try {
-        const data = await registrarPagoParcial(req.body);
+        const data = await registrarPagoParcial({
+            ...req.body,
+            rol_id: req.user.rol_id,   // reglas de descuento en el service
+            usuario_id: req.user.id    // 🆕 registrar usuario en CajaMovimiento
+        });
         res.status(200).json({
             success: true,
             message: 'Pago parcial registrado exitosamente',

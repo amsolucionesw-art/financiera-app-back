@@ -1,7 +1,15 @@
+// backend/src/services/gasto.service.js
 import { Op } from 'sequelize';
 import sequelize from '../models/sequelize.js';
 import Gasto from '../models/Gasto.js';
-import CajaMovimiento from '../models/CajaMovimiento.js';
+import CajaMovimiento from '../models/CajaMovimiento.js'; // opcional, por compat si lo usás en otro lado
+
+// Centralizamos la lógica de caja usando los helpers ya definidos en caja.service
+import {
+    registrarEgresoDesdeGasto,
+    actualizarMovimientoDesdeGasto,
+    eliminarMovimientoDesdeGasto,
+} from './caja.service.js';
 
 /* ───────────────── Helpers ───────────────── */
 
@@ -100,7 +108,7 @@ export const crearGasto = async (req, res) => {
             await t.rollback();
             return res.status(400).json({
                 success: false,
-                message: 'fecha_imputacion, total y concepto son obligatorios'
+                message: 'fecha_imputacion, total y concepto son obligatorios',
             });
         }
 
@@ -130,7 +138,7 @@ export const crearGasto = async (req, res) => {
             total: fix2(dataIn.total),
             forma_pago_id: normalizeFormaPagoId(dataIn.forma_pago_id),
             mes,
-            anio
+            anio,
         };
 
         if (!(payload.total > 0)) {
@@ -146,41 +154,44 @@ export const crearGasto = async (req, res) => {
             'concepto',
             'clasificacion',
             'gasto_realizado_por',
-            'observacion'
+            'observacion',
         ]);
         if (payload.concepto) payload.concepto = payload.concepto.slice(0, 255);
 
         // Crear gasto
         const nuevo = await Gasto.create(payload, { transaction: t });
 
-        // Impacto en caja (EGRESO) y link
+        // Impacto en caja (EGRESO) usando helper centralizado
         const usuario_id = dataIn.usuario_id ?? req.user?.id ?? null;
-        const mov = await CajaMovimiento.create(
+
+        const mov = await registrarEgresoDesdeGasto(
             {
-                fecha: fechaImp,
-                hora: nowHMS(),
-                tipo: 'egreso',
-                monto: fix2(nuevo.total),
+                gasto_id: nuevo.id,
+                total: nuevo.total, // ya viene normalizado a pesos reales
+                fecha_imputacion: nuevo.fecha_imputacion,
                 forma_pago_id: nuevo.forma_pago_id ?? null,
+                usuario_id,
                 concepto: conceptoGasto(nuevo),
-                referencia_tipo: 'gasto',
-                referencia_id: nuevo.id,
-                usuario_id
             },
             { transaction: t }
         );
 
-        await nuevo.update({ caja_movimiento_id: mov.id }, { transaction: t });
+        // Vincular movimiento al gasto
+        if (mov?.id) {
+            await nuevo.update({ caja_movimiento_id: mov.id }, { transaction: t });
+        }
 
         await t.commit();
         return res.status(201).json({ success: true, data: nuevo });
     } catch (err) {
         console.error('[crearGasto]', err);
-        try { await t.rollback(); } catch (_) { }
+        try {
+            await t.rollback();
+        } catch (_) {}
         return res.status(500).json({
             success: false,
             message: 'Error al crear gasto',
-            error: err?.message
+            error: err?.message,
         });
     }
 };
@@ -198,7 +209,7 @@ export const listarGastos = async (req, res) => {
             proveedor_cuit,
             proveedor_nombre,
             numero_comprobante,
-            clasificacion
+            clasificacion,
         } = req.query || {};
 
         const where = {};
@@ -234,7 +245,8 @@ export const listarGastos = async (req, res) => {
         }
         if (proveedor_cuit) where.proveedor_cuit = { [Op.iLike]: `%${String(proveedor_cuit).trim()}%` };
         if (proveedor_nombre) where.proveedor_nombre = { [Op.iLike]: `%${String(proveedor_nombre).trim()}%` };
-        if (numero_comprobante) where.numero_comprobante = { [Op.iLike]: `%${String(numero_comprobante).trim()}%` };
+        if (numero_comprobante)
+            where.numero_comprobante = { [Op.iLike]: `%${String(numero_comprobante).trim()}%` };
         if (clasificacion) where.clasificacion = { [Op.iLike]: `%${String(clasificacion).trim()}%` };
 
         if (q && String(q).trim() !== '') {
@@ -245,19 +257,24 @@ export const listarGastos = async (req, res) => {
                 { numero_comprobante: { [Op.iLike]: `%${qs}%` } },
                 { concepto: { [Op.iLike]: `%${qs}%` } },
                 { clasificacion: { [Op.iLike]: `%${qs}%` } },
-                { gasto_realizado_por: { [Op.iLike]: `%${qs}%` } }
+                { gasto_realizado_por: { [Op.iLike]: `%${qs}%` } },
             ];
         }
 
         const rows = await Gasto.findAll({
             where,
-            order: [['fecha_imputacion', 'ASC'], ['id', 'ASC']]
+            order: [
+                ['fecha_imputacion', 'ASC'],
+                ['id', 'ASC'],
+            ],
         });
 
         return res.json({ success: true, data: rows });
     } catch (err) {
         console.error('[listarGastos]', err);
-        return res.status(500).json({ success: false, message: 'Error al listar gastos', error: err?.message });
+        return res
+            .status(500)
+            .json({ success: false, message: 'Error al listar gastos', error: err?.message });
     }
 };
 
@@ -269,7 +286,9 @@ export const obtenerGasto = async (req, res) => {
         return res.json({ success: true, data: row });
     } catch (err) {
         console.error('[obtenerGasto]', err);
-        return res.status(500).json({ success: false, message: 'Error al obtener gasto', error: err?.message });
+        return res
+            .status(500)
+            .json({ success: false, message: 'Error al obtener gasto', error: err?.message });
     }
 };
 
@@ -277,7 +296,10 @@ export const obtenerGasto = async (req, res) => {
 export const actualizarGasto = async (req, res) => {
     const t = await sequelize.transaction();
     try {
-        const row = await Gasto.findByPk(req.params.id, { transaction: t, lock: t.LOCK.UPDATE });
+        const row = await Gasto.findByPk(req.params.id, {
+            transaction: t,
+            lock: t.LOCK.UPDATE,
+        });
         if (!row) {
             await t.rollback();
             return res.status(404).json({ success: false, message: 'Gasto no encontrado' });
@@ -295,7 +317,8 @@ export const actualizarGasto = async (req, res) => {
             }
             patch.fecha_imputacion = base;
             // fecha_gasto: si viene inválida → fallback a imputación
-            const fG = ('fecha_gasto' in patch) ? asYMD(patch.fecha_gasto) : asYMD(row.fecha_gasto);
+            const fG =
+                'fecha_gasto' in patch ? asYMD(patch.fecha_gasto) : asYMD(row.fecha_gasto);
             patch.fecha_gasto = fG ?? base;
 
             // Derivar m/a (UTC)
@@ -321,67 +344,83 @@ export const actualizarGasto = async (req, res) => {
 
         // Normalizaciones
         if ('total' in patch) patch.total = fix2(patch.total);
-        if ('forma_pago_id' in patch) patch.forma_pago_id = normalizeFormaPagoId(patch.forma_pago_id);
+        if ('forma_pago_id' in patch)
+            patch.forma_pago_id = normalizeFormaPagoId(patch.forma_pago_id);
 
         // Trims
-        Object.assign(patch, trimStr(patch, [
-            'tipo_comprobante',
-            'numero_comprobante',
-            'proveedor_nombre',
-            'proveedor_cuit',
-            'concepto',
-            'clasificacion',
-            'gasto_realizado_por',
-            'observacion'
-        ]));
+        Object.assign(
+            patch,
+            trimStr(patch, [
+                'tipo_comprobante',
+                'numero_comprobante',
+                'proveedor_nombre',
+                'proveedor_cuit',
+                'concepto',
+                'clasificacion',
+                'gasto_realizado_por',
+                'observacion',
+            ])
+        );
         if ('concepto' in patch && typeof patch.concepto === 'string') {
             patch.concepto = patch.concepto.slice(0, 255);
         }
 
         // Validar total final
-        const totalFinal = ('total' in patch) ? patch.total : row.total;
+        const totalFinal = 'total' in patch ? patch.total : row.total;
         if (!(fix2(totalFinal) > 0)) {
             await t.rollback();
             return res.status(400).json({ success: false, message: 'El total debe ser mayor a 0' });
         }
 
-        // Update
+        // Update gasto
         await row.update(patch, { transaction: t });
 
-        // Upsert movimiento de caja (EGRESO)
+        // Upsert movimiento de caja (EGRESO) usando helper
         const usuario_id = patch.usuario_id ?? req.user?.id ?? null;
-        const movPayload = {
-            fecha: asYMD(row.fecha_imputacion) || nowYMD(),
-            hora: nowHMS(),
-            tipo: 'egreso',
-            monto: fix2(row.total),
-            forma_pago_id: row.forma_pago_id ?? null,
-            concepto: conceptoGasto(row),
-            referencia_tipo: 'gasto',
-            referencia_id: row.id,
-            usuario_id
-        };
+        const mov = await actualizarMovimientoDesdeGasto(
+            {
+                gasto_id: row.id,
+                total: row.total,
+                fecha_imputacion: row.fecha_imputacion,
+                forma_pago_id: row.forma_pago_id ?? null,
+                concepto: conceptoGasto(row),
+            },
+            { transaction: t }
+        );
 
-        if (row.caja_movimiento_id) {
-            const mov = await CajaMovimiento.findByPk(row.caja_movimiento_id, { transaction: t });
-            if (mov) {
-                movPayload.hora = mov.hora || movPayload.hora; // preserva hora original si existía
-                await mov.update(movPayload, { transaction: t });
-            } else {
-                const nuevoMov = await CajaMovimiento.create(movPayload, { transaction: t });
-                await row.update({ caja_movimiento_id: nuevoMov.id }, { transaction: t });
+        // Si por alguna razón no existía el movimiento, lo creamos
+        if (!mov) {
+            const creado = await registrarEgresoDesdeGasto(
+                {
+                    gasto_id: row.id,
+                    total: row.total,
+                    fecha_imputacion: row.fecha_imputacion,
+                    forma_pago_id: row.forma_pago_id ?? null,
+                    usuario_id,
+                    concepto: conceptoGasto(row),
+                },
+                { transaction: t }
+            );
+            if (creado?.id) {
+                await row.update({ caja_movimiento_id: creado.id }, { transaction: t });
             }
-        } else {
-            const nuevoMov = await CajaMovimiento.create(movPayload, { transaction: t });
-            await row.update({ caja_movimiento_id: nuevoMov.id }, { transaction: t });
+        } else if (mov.id && row.caja_movimiento_id !== mov.id) {
+            // alineamos el link si cambió
+            await row.update({ caja_movimiento_id: mov.id }, { transaction: t });
         }
 
         await t.commit();
         return res.json({ success: true, data: row });
     } catch (err) {
         console.error('[actualizarGasto]', err);
-        try { await t.rollback(); } catch (_) { }
-        return res.status(500).json({ success: false, message: 'Error al actualizar gasto', error: err?.message });
+        try {
+            await t.rollback();
+        } catch (_) {}
+        return res.status(500).json({
+            success: false,
+            message: 'Error al actualizar gasto',
+            error: err?.message,
+        });
     }
 };
 
@@ -389,29 +428,32 @@ export const actualizarGasto = async (req, res) => {
 export const eliminarGasto = async (req, res) => {
     const t = await sequelize.transaction();
     try {
-        const row = await Gasto.findByPk(req.params.id, { transaction: t, lock: t.LOCK.UPDATE });
+        const row = await Gasto.findByPk(req.params.id, {
+            transaction: t,
+            lock: t.LOCK.UPDATE,
+        });
         if (!row) {
             await t.rollback();
             return res.status(404).json({ success: false, message: 'Gasto no encontrado' });
         }
 
-        // Borrar movimiento de caja asociado (o por referencia)
-        if (row.caja_movimiento_id) {
-            await CajaMovimiento.destroy({ where: { id: row.caja_movimiento_id }, transaction: t });
-        } else {
-            await CajaMovimiento.destroy({
-                where: { referencia_tipo: 'gasto', referencia_id: row.id },
-                transaction: t
-            });
-        }
+        // Borrar movimiento de caja asociado usando helper centralizado
+        await eliminarMovimientoDesdeGasto(row.id, { transaction: t });
 
+        // Borrar gasto
         await Gasto.destroy({ where: { id: row.id }, transaction: t });
 
         await t.commit();
         return res.json({ success: true, deleted: true });
     } catch (err) {
         console.error('[eliminarGasto]', err);
-        try { await t.rollback(); } catch (_) { }
-        return res.status(500).json({ success: false, message: 'Error al eliminar gasto', error: err?.message });
+        try {
+            await t.rollback();
+        } catch (_) {}
+        return res.status(500).json({
+            success: false,
+            message: 'Error al eliminar gasto',
+            error: err?.message,
+        });
     }
 };

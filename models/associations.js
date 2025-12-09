@@ -1,4 +1,4 @@
-// backend/src/models/associations.js
+// src/models/index.js
 import Cliente from './Cliente.js';
 import Credito from './Credito.js';
 import Cuota from './Cuota.js';
@@ -13,6 +13,7 @@ import Compra from './Compra.js';                 // ⬅️ Compras
 import VentaManual from './VentaManual.js';       // ⬅️ Ventas manuales
 import Gasto from './Gasto.js';                   // ⬅️ Gastos
 import Proveedor from './Proveedor.js';           // ⬅️ Proveedores
+import Presupuesto from './Presupuesto.js';       // ⬅️ Presupuestos
 
 /* ───────── Relaciones base (con guards) ───────── */
 
@@ -191,5 +192,6 @@ export {
     Compra,
     VentaManual,
     Gasto,
-    Proveedor, // ➕ export
+    Proveedor,
+    Presupuesto // ➕ export
 };

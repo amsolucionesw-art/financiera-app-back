@@ -1,4 +1,3 @@
-// backend/src/utils/buildFilters.js
 import { Op } from 'sequelize';
 
 /* ─────────── helpers ─────────── */
@@ -27,14 +26,47 @@ const todayYMDUTC = () => {
     return `${yyyy}-${mm}-${dd}`;
 };
 
+/**
+ * Normaliza el parámetro `mapping` para aceptar:
+ * - Array<string>  => cada item se interpreta como { field: item, type: 'eq' } con la misma clave en query
+ * - Object mapping => { param: { field, type } }
+ * - Falsy/undefined=> se mapean todas las keys presentes en `query` a { field: key, type: 'eq' }
+ */
+const normalizeMapping = (query = {}, mapping) => {
+    // Array de strings → eq directo
+    if (Array.isArray(mapping)) {
+        const out = {};
+        for (const key of mapping) {
+            out[key] = { field: key, type: 'eq' };
+        }
+        return out;
+    }
+
+    // Objeto mapping válido
+    if (mapping && typeof mapping === 'object') {
+        return mapping;
+    }
+
+    // Sin mapping → todas las keys de query como eq
+    const all = {};
+    for (const key of Object.keys(query || {})) {
+        all[key] = { field: key, type: 'eq' };
+    }
+    return all;
+};
+
 /* ─────────── función principal ─────────── */
 export const buildFilters = (query = {}, mapping = {}) => {
     const where = {};
+    const map = normalizeMapping(query, mapping);
 
-    for (const param in mapping) {
+    for (const param in map) {
         if (!(param in query)) continue;
-        const { field, type = 'eq' } = mapping[param];
+        const conf = map[param] || {};
+        const field = conf.field ?? param;
+        const type = conf.type ?? 'eq';
         const value = query[param];
+
         if (value === '' || value == null) continue;
 
         switch (type) {
@@ -81,3 +113,4 @@ export const buildFilters = (query = {}, mapping = {}) => {
 };
 
 export default buildFilters;
+

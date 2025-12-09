@@ -79,7 +79,7 @@ const trimStr = (obj, keys) => {
 // Tipos de crédito admitidos al crear el crédito desde venta
 const TIPOS_VALIDOS = new Set(['mensual', 'semanal', 'quincenal']);
 const normalizarTipoCredito = (v) => {
-    const s = String(v || '').toLowerCase();
+    const s = String(v || '').toLowerCase().trim();
     return TIPOS_VALIDOS.has(s) ? s : 'mensual';
 };
 
@@ -131,6 +131,13 @@ const intentarCrearCreditoDesdeVenta = async (venta, rawData, t) => {
     // Tipo de crédito proveniente de la venta, si lo envían
     const tipo_credito = normalizarTipoCredito(rawData?.tipo_credito);
 
+    // Detalle de producto (venta financiada) – lo usamos como metadata para el crédito
+    const detalle_producto =
+        (rawData?.detalle_producto ??
+            venta?.detalle_producto ??
+            ''
+        ).toString().trim() || null;
+
     const payloadCredito = {
         cliente_id,
         cobrador_id,
@@ -143,7 +150,8 @@ const intentarCrearCreditoDesdeVenta = async (venta, rawData, t) => {
         tipo_credito,
         cantidad_cuotas: cuotas,
         modalidad_credito: 'comun', // mantenemos modalidad, pero forzamos interés abajo
-        origen_venta_manual_financiada: true // hint no disruptivo
+        origen_venta_manual_financiada: true, // hint no disruptivo
+        detalle_producto: detalle_producto || null, // opcional, para mostrar luego en la ficha
     };
 
     // ✅ Interés MANUAL si vino en la venta
@@ -204,6 +212,10 @@ export const crearVentaManual = async (req, res) => {
             return res.status(400).json({ success: false, message: 'Mes o año inválidos' });
         }
 
+        // 🔄 Normalizar tipo_credito y dejarlo ya coherente en la venta
+        const tipo_credito = normalizarTipoCredito(data.tipo_credito);
+        data.tipo_credito = tipo_credito;
+
         // Normalizaciones + placeholders
         let payload = {
             ...data,
@@ -234,7 +246,8 @@ export const crearVentaManual = async (req, res) => {
             'cliente_nombre',
             'doc_cliente',
             'vendedor',
-            'observacion'
+            'observacion',
+            'detalle_producto', // ✅ nuevo: detalle del producto vendido
         ]);
 
         if (!(payload.total > 0)) {
@@ -415,6 +428,11 @@ export const actualizarVentaManual = async (req, res) => {
             }
         }
 
+        // 🔄 Normalizar tipo_credito si viene en la actualización
+        if ('tipo_credito' in data) {
+            data.tipo_credito = normalizarTipoCredito(data.tipo_credito);
+        }
+
         // Números
         const nums = ['neto', 'iva', 'ret_gan', 'ret_iva', 'ret_iibb_tuc', 'capital', 'interes', 'total'];
         for (const k of nums) if (k in data) data[k] = fix2(data[k]);
@@ -424,7 +442,17 @@ export const actualizarVentaManual = async (req, res) => {
         if ('cliente_id' in data) data.cliente_id = Number(data.cliente_id) || row.cliente_id; // mantener valor válido
 
         // Strings
-        Object.assign(data, trimStr(data, ['numero_comprobante', 'cliente_nombre', 'doc_cliente', 'vendedor', 'observacion']));
+        Object.assign(
+            data,
+            trimStr(data, [
+                'numero_comprobante',
+                'cliente_nombre',
+                'doc_cliente',
+                'vendedor',
+                'observacion',
+                'detalle_producto', // ✅ nuevo: detalle editable
+            ])
+        );
 
         // Validación total
         const totalFinal = ('total' in data) ? data.total : row.total;

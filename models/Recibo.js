@@ -15,7 +15,7 @@ const Recibo = sequelize.define('Recibo', {
     },
     hora: {
         type: DataTypes.TIME,
-        defaultValue: sequelize.literal("CURRENT_TIME")
+        defaultValue: sequelize.literal('CURRENT_TIME')
     },
     cliente_id: {
         type: DataTypes.INTEGER,
@@ -26,7 +26,7 @@ const Recibo = sequelize.define('Recibo', {
         allowNull: false
     },
     monto_pagado: {
-        type: DataTypes.DECIMAL(10,2),
+        type: DataTypes.DECIMAL(10, 2),
         allowNull: false
     },
     concepto: {
@@ -34,15 +34,15 @@ const Recibo = sequelize.define('Recibo', {
         allowNull: false
     },
     saldo_anterior: {
-        type: DataTypes.DECIMAL(10,2),
+        type: DataTypes.DECIMAL(10, 2),
         allowNull: false
     },
     pago_a_cuenta: {
-        type: DataTypes.DECIMAL(10,2),
+        type: DataTypes.DECIMAL(10, 2),
         allowNull: false
     },
     saldo_actual: {
-        type: DataTypes.DECIMAL(10,2),
+        type: DataTypes.DECIMAL(10, 2),
         allowNull: false
     },
     nombre_cobrador: {
@@ -64,40 +64,50 @@ const Recibo = sequelize.define('Recibo', {
 
     // ── Campos de desglose ──
     importe_cuota_original: {
-        type: DataTypes.DECIMAL(10,2),
+        type: DataTypes.DECIMAL(10, 2),
         allowNull: false,
         defaultValue: 0.00
     },
     descuento_aplicado: {
-        type: DataTypes.DECIMAL(10,2),
+        type: DataTypes.DECIMAL(10, 2),
         allowNull: false,
         defaultValue: 0.00
     },
     mora_cobrada: {
-        type: DataTypes.DECIMAL(10,2),
+        type: DataTypes.DECIMAL(10, 2),
         allowNull: false,
         defaultValue: 0.00
     },
     principal_pagado: {
-        type: DataTypes.DECIMAL(10,2),
+        type: DataTypes.DECIMAL(10, 2),
         allowNull: false,
         defaultValue: 0.00
     },
     // Para modalidad "libre": interés del/los ciclo/s cobrado/s en liquidación total/adelantada
     interes_ciclo_cobrado: {
-        type: DataTypes.DECIMAL(10,2),
+        type: DataTypes.DECIMAL(10, 2),
         allowNull: false,
         defaultValue: 0.00
     },
     saldo_credito_anterior: {
-        type: DataTypes.DECIMAL(10,2),
+        type: DataTypes.DECIMAL(10, 2),
         allowNull: false,
         defaultValue: 0.00
     },
     saldo_credito_actual: {
-        type: DataTypes.DECIMAL(10,2),
+        type: DataTypes.DECIMAL(10, 2),
         allowNull: false,
         defaultValue: 0.00
+    },
+
+    // 🟦 Saldo de mora pendiente (alias de columna para compatibilidad con la DB)
+    //     - Atributo JS: saldo_mora
+    //     - Columna en BD: saldo_mora_pendiente
+    saldo_mora: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: false,
+        defaultValue: 0.00,
+        field: 'saldo_mora_pendiente'
     }
 }, {
     tableName: 'recibos',

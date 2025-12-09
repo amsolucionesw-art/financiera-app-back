@@ -21,7 +21,12 @@ const Cuota = sequelize.define('Cuota', {
         allowNull: false
     },
     estado: {
-        type: DataTypes.ENUM('pendiente', 'pagada', 'parcial', 'vencida'),
+        // ⬇️ Extendemos el enum para evitar 22P02 al marcar cuotas con pagos durante la refinanciación.
+        // Estados contemplados:
+        // - pendiente | parcial | vencida | pagada  → flujo normal
+        // - refinanciada → cuota con pagos preexistentes que se "cierra" del circuito (no borrar por FK)
+        // - anulada     → cuota anulada (para anulación de crédito sin borrar si hay pagos)
+        type: DataTypes.ENUM('pendiente', 'pagada', 'parcial', 'vencida', 'refinanciada', 'anulada'),
         allowNull: false,
         defaultValue: 'pendiente'
     },
@@ -54,3 +59,4 @@ const Cuota = sequelize.define('Cuota', {
 Cuota.belongsTo(FormaPago, { foreignKey: 'forma_pago_id', as: 'formaPago' });
 
 export default Cuota;
+

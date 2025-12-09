@@ -6,6 +6,9 @@ import Cuota from '../models/Cuota.js';
 import FormaPago from '../models/FormaPago.js';
 import { buildFilters } from '../utils/buildFilters.js';
 
+/* ⬇️ NUEVO: lectura de CSV/XLSX */
+import * as XLSX from 'xlsx';
+
 const BASE_URL = 'http://localhost:3000'; // Centralizado
 
 /* ──────────────────────────────────────────────────────────
@@ -108,7 +111,7 @@ export const crearCliente = async (data) => {
         localidad: data.localidad,
         cobrador: data.cobrador,
         zona: data.zona,
-        dni_foto: data.dni_foto || null,
+        // dni_foto: data.dni_foto || null, // ⛔️ Por ahora fuera de la importación (se mantiene el campo en el modelo)
         historial_crediticio: data.historial_crediticio || 'Desaprobado',
         puntaje_crediticio: data.puntaje_crediticio ?? 0
     });
@@ -137,3 +140,338 @@ export const actualizarCliente = async (id, data) => {
 // 🟢 Eliminar cliente por ID
 export const eliminarCliente = (id) =>
     Cliente.destroy({ where: { id } });
+
+/* ──────────────────────────────────────────────────────────
+   IMPORTACIÓN POR PLANILLA (CSV/XLSX)
+   ────────────────────────────────────────────────────────── */
+
+/**
+ * Mapea encabezados posibles de la planilla a campos del modelo.
+ * Podés agregar alias sin problemas (case-insensitive).
+ */
+const HEADER_MAP = {
+    // requeridos
+    nombre: 'nombre',
+    apellido: 'apellido',
+    dni: 'dni',
+
+    // opcionales
+    'fecha_nacimiento': 'fecha_nacimiento',
+    'fecha nacimiento': 'fecha_nacimiento',
+
+    'fecha_registro': 'fecha_registro',
+    'fecha registro': 'fecha_registro',
+
+    email: 'email',
+    correo: 'email',
+
+    telefono: 'telefono',
+    'telefono_1': 'telefono',
+    'teléfono': 'telefono',
+
+    telefono_secundario: 'telefono_secundario',
+    'telefono_2': 'telefono_secundario',
+
+    direccion: 'direccion',
+    'direccion_1': 'direccion',
+    domicilio: 'direccion',
+
+    direccion_secundaria: 'direccion_secundaria',
+    'direccion_2': 'direccion_secundaria',
+
+    referencia_direccion: 'referencia_direccion',
+    'referencia_direccion_1': 'referencia_direccion',
+
+    referencia_secundaria: 'referencia_secundaria',
+    'referencia_direccion_2': 'referencia_secundaria',
+
+    observaciones: 'observaciones',
+
+    provincia: 'provincia',
+    localidad: 'localidad',
+
+    // cobrador / zona (por id o por nombre)
+    cobrador: 'cobrador',
+    'cobrador_id': 'cobrador',
+    'cobrador_nombre': 'cobrador_nombre',
+
+    zona: 'zona',
+    'zona_id': 'zona',
+    'zona_nombre': 'zona_nombre',
+
+    // campo que mantenemos en CRUD pero no importamos: dni_foto (ignorado)
+};
+
+/** Helpers básicos */
+const str = (v) => (v ?? '').toString().trim();
+const cleanDni = (v) => str(v).replace(/\D+/g, ''); // deja solo dígitos
+const isEmpty = (v) => v === undefined || v === null || (typeof v === 'string' && v.trim() === '');
+const toDateOrNull = (v) => {
+    if (isEmpty(v)) return null;
+    // XLSX puede entregar Date, número (serial excel) o string
+    if (v instanceof Date && !isNaN(v)) return v;
+    if (typeof v === 'number') {
+        // serial Excel -> Date
+        const d = XLSX.SSF.parse_date_code(v);
+        if (!d) return null;
+        const dt = new Date(Date.UTC(d.y, (d.m || 1) - 1, d.d || 1));
+        return isNaN(dt) ? null : dt;
+    }
+    const t = str(v);
+    const dt = new Date(t);
+    return isNaN(dt) ? null : dt;
+};
+
+/**
+ * Normaliza una fila cruda (keys arbitrarias) a nuestro shape interno según HEADER_MAP.
+ */
+const normalizeRow = (raw) => {
+    const out = {};
+    for (const [k, v] of Object.entries(raw)) {
+        if (k == null) continue;
+        const key = k.toString().trim().toLowerCase();
+        const mapped = HEADER_MAP[key];
+        if (mapped) out[mapped] = v;
+    }
+    return out;
+};
+
+/**
+ * Busca IDs de cobrador/zona a partir de id directo o por nombre.
+ * - Cobrador: busca por id o por nombre_completo (case-insensitive).
+ * - Zona: busca por id o por nombre (case-insensitive).
+ */
+const resolveCobradorYZona = async (row) => {
+    let resolvedCobrador = null;
+    let resolvedZona = null;
+
+    // COBRADOR
+    if (!isEmpty(row.cobrador)) {
+        const id = Number(row.cobrador);
+        if (!Number.isNaN(id)) {
+            const u = await Usuario.findByPk(id, { attributes: ['id'] });
+            if (u) resolvedCobrador = u.id;
+        }
+    }
+    if (!resolvedCobrador && !isEmpty(row.cobrador_nombre)) {
+        const nombre = str(row.cobrador_nombre).toLowerCase();
+        const u = await Usuario.findOne({
+            where: { nombre_completo: Usuario.sequelize.where(
+                Usuario.sequelize.fn('LOWER', Usuario.sequelize.col('nombre_completo')),
+                nombre
+            ) },
+            attributes: ['id']
+        });
+        if (u) resolvedCobrador = u.id;
+    }
+
+    // ZONA
+    if (!isEmpty(row.zona)) {
+        const id = Number(row.zona);
+        if (!Number.isNaN(id)) {
+            const z = await Zona.findByPk(id, { attributes: ['id'] });
+            if (z) resolvedZona = z.id;
+        }
+    }
+    if (!resolvedZona && !isEmpty(row.zona_nombre)) {
+        const nombre = str(row.zona_nombre).toLowerCase();
+        const z = await Zona.findOne({
+            where: { nombre: Zona.sequelize.where(
+                Zona.sequelize.fn('LOWER', Zona.sequelize.col('nombre')),
+                nombre
+            ) },
+            attributes: ['id']
+        });
+        if (z) resolvedZona = z.id;
+    }
+
+    return { cobrador: resolvedCobrador, zona: resolvedZona };
+};
+
+/**
+ * Valida una fila normalizada. Devuelve array de errores (strings).
+ */
+const validateRow = (row) => {
+    const errors = [];
+
+    // requeridos
+    const dni = cleanDni(row.dni);
+    if (isEmpty(row.nombre)) errors.push('El campo "nombre" es requerido.');
+    if (isEmpty(row.apellido)) errors.push('El campo "apellido" es requerido.');
+    if (isEmpty(dni)) errors.push('El campo "dni" es requerido o inválido.');
+
+    // opcional: otras validaciones simples
+    if (!isEmpty(row.email)) {
+        const ok = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(str(row.email));
+        if (!ok) errors.push('El campo "email" tiene formato inválido.');
+    }
+
+    return { errors, dni };
+};
+
+/**
+ * Convierte una fila normalizada al shape final compatible con crear/actualizar.
+ * No incluye dni_foto (por pedido).
+ */
+const toClientPayload = (row, resolved) => ({
+    nombre: str(row.nombre) || null,
+    apellido: str(row.apellido) || null,
+    dni: cleanDni(row.dni) || null,
+
+    fecha_nacimiento: toDateOrNull(row.fecha_nacimiento),
+    fecha_registro: toDateOrNull(row.fecha_registro),
+
+    email: isEmpty(row.email) ? null : str(row.email),
+
+    telefono: isEmpty(row.telefono) ? null : str(row.telefono),
+    telefono_secundario: isEmpty(row.telefono_secundario) ? null : str(row.telefono_secundario),
+
+    direccion: isEmpty(row.direccion) ? null : str(row.direccion),
+    direccion_secundaria: isEmpty(row.direccion_secundaria) ? null : str(row.direccion_secundaria),
+
+    referencia_direccion: isEmpty(row.referencia_direccion) ? null : str(row.referencia_direccion),
+    referencia_secundaria: isEmpty(row.referencia_secundaria) ? null : str(row.referencia_secundaria),
+
+    observaciones: isEmpty(row.observaciones) ? null : str(row.observaciones),
+
+    provincia: isEmpty(row.provincia) ? null : str(row.provincia),
+    localidad: isEmpty(row.localidad) ? null : str(row.localidad),
+
+    cobrador: resolved.cobrador ?? null,
+    zona: resolved.zona ?? null,
+
+    // historial_crediticio/puntaje_crediticio: si vienen, se respetan; si no, defaults
+    historial_crediticio: isEmpty(row.historial_crediticio) ? undefined : str(row.historial_crediticio),
+    puntaje_crediticio: isEmpty(row.puntaje_crediticio) ? undefined : Number(row.puntaje_crediticio),
+});
+
+/**
+ * Lee el buffer con XLSX y retorna un array de objetos (una por fila).
+ * Soporta CSV y XLSX.
+ */
+const readBufferToRows = (buffer, filename) => {
+    const wb = XLSX.read(buffer, { type: 'buffer' });
+    const firstSheetName = wb.SheetNames[0];
+    const sheet = wb.Sheets[firstSheetName];
+    // defval: '' para no perder columnas vacías; raw: false para normalizar fechas como strings cuando no sean serial
+    const rows = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
+    return rows;
+};
+
+/**
+ * Importador principal (CSV/XLSX) con soporte dryRun/commit.
+ * @param {Buffer} fileBuffer - buffer del archivo subido
+ * @param {string} filename   - nombre del archivo (solo informativo)
+ * @param {{dryRun?: boolean}} options
+ * @returns {{summary: object, rows: Array}}
+ */
+export const importarClientesDesdePlanilla = async (fileBuffer, filename, { dryRun = true } = {}) => {
+    const rawRows = readBufferToRows(fileBuffer, filename);
+
+    const results = [];
+    let created = 0;
+    let updated = 0;
+    let errorsCount = 0;
+
+    let index = 0;
+    for (const raw of rawRows) {
+        index += 1;
+
+        // 1) Normalizar headers a nuestros campos
+        const norm = normalizeRow(raw);
+
+        // 2) Validar requeridos/formato
+        const { errors: valErrors, dni } = validateRow(norm);
+
+        // 3) Resolver cobrador/zona (solo si no hay errores de requeridos)
+        let resolved = { cobrador: null, zona: null };
+        if (valErrors.length === 0) {
+            resolved = await resolveCobradorYZona(norm);
+        }
+
+        // 4) Armar payload final
+        const payload = toClientPayload(norm, resolved);
+
+        // 5) Determinar acción (create/update) y aplicar según dryRun
+        let action = null;
+        let targetId = null;
+
+        try {
+            if (valErrors.length > 0) {
+                errorsCount += 1;
+                results.push({
+                    index,
+                    status: 'error',
+                    action: null,
+                    dni,
+                    id: null,
+                    errors: valErrors,
+                    dataApplied: null
+                });
+                continue;
+            }
+
+            const existing = await Cliente.findOne({ where: { dni } });
+
+            if (!existing) {
+                action = 'create';
+                if (!dryRun) {
+                    const createdClient = await Cliente.create({
+                        ...payload,
+                        // si no vienen estos campos, mantener defaults del modelo
+                        historial_crediticio: payload.historial_crediticio ?? 'Desaprobado',
+                        puntaje_crediticio: Number.isFinite(payload.puntaje_crediticio)
+                            ? payload.puntaje_crediticio
+                            : 0
+                    });
+                    targetId = createdClient.id;
+                    created += 1;
+                } else {
+                    created += 1;
+                }
+            } else {
+                action = 'update';
+                targetId = existing.id;
+                if (!dryRun) {
+                    // No pisamos id ni dni; el dni se mantiene igual
+                    const { dni: _omitDni, ...rest } = payload;
+                    await Cliente.update(rest, { where: { id: existing.id } });
+                    updated += 1;
+                } else {
+                    updated += 1;
+                }
+            }
+
+            results.push({
+                index,
+                status: 'ok',
+                action,
+                dni,
+                id: targetId,
+                errors: [],
+                dataApplied: payload
+            });
+        } catch (e) {
+            errorsCount += 1;
+            results.push({
+                index,
+                status: 'error',
+                action,
+                dni,
+                id: targetId,
+                errors: [e.message || 'Error inesperado al procesar la fila.'],
+                dataApplied: payload
+            });
+        }
+    }
+
+    const summary = {
+        total: rawRows.length,
+        created,
+        updated,
+        errors: errorsCount,
+        dryRun
+    };
+
+    return { summary, rows: results };
+};
