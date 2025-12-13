@@ -15,6 +15,10 @@ import Cuota from '../models/Cuota.js';
 import Credito from '../models/Credito.js';
 import Cliente from '../models/Cliente.js';
 
+/* ───────────────── Config TZ ───────────────── */
+
+const APP_TZ = process.env.APP_TZ || 'America/Argentina/Cordoba';
+
 /* ───────────────── Helpers ───────────────── */
 const toNumber = (v) => {
     const n = Number(v);
@@ -72,13 +76,55 @@ const asYMD = (s) => {
     }
 };
 
-const nowYMD = () => asYMD(new Date());
+/**
+ * Fecha "hoy" en la zona horaria del negocio (APP_TZ),
+ * para evitar que después de las 21 hs se pase al día siguiente por UTC.
+ */
+const nowYMD = () => {
+    try {
+        const fmt = new Intl.DateTimeFormat('en-CA', {
+            timeZone: APP_TZ,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+        });
+        // en-CA → "YYYY-MM-DD"
+        return fmt.format(new Date());
+    } catch {
+        // Fallback al timezone local del servidor
+        const d = new Date();
+        const yyyy = d.getFullYear();
+        const mm = String(d.getMonth() + 1).padStart(2, '0');
+        const dd = String(d.getDate()).padStart(2, '0');
+        return `${yyyy}-${mm}-${dd}`;
+    }
+};
+
+/**
+ * Hora actual en HH:mm:ss en la zona horaria del negocio.
+ */
 const nowHMS = () => {
-    const d = new Date();
-    const hh = String(d.getHours()).padStart(2, '0');
-    const mm = String(d.getMinutes()).padStart(2, '0');
-    const ss = String(d.getSeconds()).padStart(2, '0');
-    return `${hh}:${mm}:${ss}`;
+    try {
+        const fmt = new Intl.DateTimeFormat('en-GB', {
+            timeZone: APP_TZ,
+            hour12: false,
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+        });
+        const parts = fmt.formatToParts(new Date());
+        const get = (type) => parts.find((p) => p.type === type)?.value || '00';
+        const hh = get('hour').padStart(2, '0');
+        const mm = get('minute').padStart(2, '0');
+        const ss = get('second').padStart(2, '0');
+        return `${hh}:${mm}:${ss}`;
+    } catch {
+        const d = new Date();
+        const hh = String(d.getHours()).padStart(2, '0');
+        const mm = String(d.getMinutes()).padStart(2, '0');
+        const ss = String(d.getSeconds()).padStart(2, '0');
+        return `${hh}:${mm}:${ss}`;
+    }
 };
 
 const addDays = (ymd, days) => {
@@ -144,13 +190,40 @@ export const crearMovimiento = async (req, res) => {
             req.user?.userId ??
             null;
 
-        const rolUsuario = (req.user?.rol ?? req.user?.role ?? req.user?.tipo ?? '').toLowerCase();
+        // ✅ Resolución robusta del rol (numérico y/o nombre)
+        const rawRolId =
+            req.user?.rol_id ??
+            req.user?.role_id ??
+            req.user?.id_rol ??
+            req.user?.rolId ??
+            req.user?.rol ??
+            req.user?.role ??
+            null;
 
-        // 🔒 Solo superadmin puede registrar movimientos manuales desde la caja diaria
-        if (rolUsuario !== 'superadmin') {
+        let rolId = null;
+        if (typeof rawRolId === 'number' && Number.isInteger(rawRolId)) {
+            rolId = rawRolId;
+        } else if (typeof rawRolId === 'string' && /^\d+$/.test(rawRolId)) {
+            rolId = parseInt(rawRolId, 10);
+        }
+
+        const rolNombre = String(
+            req.user?.rol_nombre ??
+            req.user?.rol ??
+            req.user?.role ??
+            req.user?.tipo ??
+            ''
+        ).toLowerCase();
+
+        const esSuperadmin = rolId === 0 || rolNombre === 'superadmin';
+        const esAdmin = rolId === 1 || rolNombre === 'admin';
+
+        // 🔒 Regla de negocio: solo admin / superadmin pueden registrar movimientos manuales
+        // (la ruta ya está protegida con checkRole([0, 1]), esto es una segunda defensa)
+        if (!esSuperadmin && !esAdmin) {
             return res.status(403).json({
                 success: false,
-                message: 'Solo el usuario superadmin puede registrar movimientos manuales en Caja.',
+                message: 'Solo usuarios con rol admin o superadmin pueden registrar movimientos manuales en Caja.',
             });
         }
 
@@ -214,8 +287,8 @@ export const obtenerMovimientos = async (req, res) => {
             const tipos = Array.isArray(tipo)
                 ? tipo.map((s) => String(s).trim().toLowerCase())
                 : String(tipo)
-                      .split(',')
-                      .map((s) => s.trim().toLowerCase());
+                    .split(',')
+                    .map((s) => s.trim().toLowerCase());
             const validos = tipos.filter((t) => TIPOS_VALIDOS.has(t));
             if (validos.length) where.tipo = { [Op.in]: validos };
         }
@@ -298,7 +371,6 @@ export const obtenerMovimientos = async (req, res) => {
                 {
                     model: Usuario,
                     as: 'usuario',
-                    // ⬅️ Usamos columnas reales del modelo Usuario
                     attributes: ['id', 'nombre_completo', 'nombre_usuario'],
                 },
             ],
@@ -311,10 +383,65 @@ export const obtenerMovimientos = async (req, res) => {
             offset,
         });
 
-        const data = rows.map((r) => ({
-            ...r.get({ plain: true }),
-            monto: fix2(r.monto),
-        }));
+        // ───────────────── Detección de VENTA FINANCIADA ─────────────────
+        // 1) Plain rows + normalización de monto
+        const plainRows = rows.map((r) => {
+            const p = r.get({ plain: true });
+            p.monto = fix2(p.monto);
+            return p;
+        });
+
+        // 2) IDs de ventas asociadas a movimientos de tipo 'venta'
+        const ventaIds = [
+            ...new Set(
+                plainRows
+                    .filter(
+                        (p) =>
+                            p.referencia_tipo === 'venta' &&
+                            p.referencia_id != null
+                    )
+                    .map((p) => p.referencia_id)
+            ),
+        ];
+
+        let mapVentaFinanciada = new Map();
+        if (ventaIds.length > 0) {
+            const ventas = await VentaManual.findAll({
+                where: { id: { [Op.in]: ventaIds } },
+                attributes: ['id', 'capital', 'cuotas', 'credito_id'],
+                raw: true,
+            });
+
+            mapVentaFinanciada = new Map(
+                ventas.map((v) => {
+                    const capital = sanitizeNumber(v.capital);
+                    const cuotas = Number(v.cuotas || 1);
+                    const esFinanciada = capital > 0 && cuotas > 1;
+                    return [v.id, esFinanciada];
+                })
+            );
+        }
+
+        // 3) Enriquecemos cada movimiento con flag y forma de pago "FINANCIADA" cuando corresponda
+        const data = plainRows.map((p) => {
+            const esVentaFinanciada =
+                p.referencia_tipo === 'venta' &&
+                mapVentaFinanciada.get(p.referencia_id) === true;
+
+            if (esVentaFinanciada) {
+                p.es_venta_financiada = true;
+
+                // Forzamos etiqueta de forma de pago a "FINANCIADA"
+                p.formaPago = {
+                    id: p.formaPago?.id ?? null,
+                    nombre: 'FINANCIADA',
+                };
+            } else {
+                p.es_venta_financiada = false;
+            }
+
+            return p;
+        });
 
         res.json({
             success: true,
@@ -1212,17 +1339,17 @@ export const exportarExcel = async (req, res) => {
 
         const creditos = credIds.length
             ? await Credito.findAll({
-                  where: { id: { [Op.in]: credIds } },
-                  include: [
-                      {
-                          model: Cliente,
-                          as: 'cliente',
-                          attributes: ['id', 'nombre', 'apellido'],
-                      },
-                  ],
-                  raw: true,
-                  nest: true,
-              })
+                where: { id: { [Op.in]: credIds } },
+                include: [
+                    {
+                        model: Cliente,
+                        as: 'cliente',
+                        attributes: ['id', 'nombre', 'apellido'],
+                    },
+                ],
+                raw: true,
+                nest: true,
+            })
             : [];
         const mapCreditoCliente = new Map(
             creditos.map((c) => [
@@ -1244,29 +1371,29 @@ export const exportarExcel = async (req, res) => {
 
         const recibos = reciboIds.length
             ? await Recibo.findAll({
-                  where: { id: { [Op.in]: reciboIds } },
-                  include: [
-                      {
-                          model: Cuota,
-                          as: 'cuota',
-                          include: [
-                              {
-                                  model: Credito,
-                                  as: 'credito',
-                                  include: [
-                                      {
-                                          model: Cliente,
-                                          as: 'cliente',
-                                          attributes: ['id', 'nombre', 'apellido'],
-                                      },
-                                  ],
-                              },
-                          ],
-                      },
-                  ],
-                  raw: true,
-                  nest: true,
-              })
+                where: { id: { [Op.in]: reciboIds } },
+                include: [
+                    {
+                        model: Cuota,
+                        as: 'cuota',
+                        include: [
+                            {
+                                model: Credito,
+                                as: 'credito',
+                                include: [
+                                    {
+                                        model: Cliente,
+                                        as: 'cliente',
+                                        attributes: ['id', 'nombre', 'apellido'],
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+                raw: true,
+                nest: true,
+            })
             : [];
         const mapReciboCliente = new Map(
             recibos.map((r) => {

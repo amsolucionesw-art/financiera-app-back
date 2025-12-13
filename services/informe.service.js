@@ -57,7 +57,9 @@ const dateRangeWhere = (campo, query = {}) => {
  */
 const dateRangeWhereOr = (campos = [], query = {}) => {
     const { desde, hasta } = query || {};
-    if (!Array.isArray(caminos = campos) || caminos.length === 0) return undefined;
+
+    // Validaciones básicas
+    if (!Array.isArray(campos) || campos.length === 0) return undefined;
     if (!desde && !hasta) return undefined;
 
     const w = {};
@@ -65,7 +67,7 @@ const dateRangeWhereOr = (campos = [], query = {}) => {
     if (hasta) w[Op.lte] = hasta;
 
     return {
-        [Op.or]: caminos.map((campo) => ({ [campo]: w }))
+        [Op.or]: campos.map((campo) => ({ [campo]: w }))
     };
 };
 
@@ -208,7 +210,14 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
                     {
                         model: Cliente,
                         as: 'cliente',
-                        attributes: ['nombre', 'apellido', 'zona']
+                        attributes: ['nombre', 'apellido'],
+                        include: [
+                            {
+                                model: Zona,
+                                as: 'clienteZona',
+                                attributes: ['nombre']
+                            }
+                        ]
                     },
                     {
                         model: Usuario,
@@ -223,10 +232,11 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
             return creditos.map(cr => {
                 const dto = cr.get({ plain: true });
                 const { cliente, cobradorCredito, cliente_id, cobrador_id, ...rest } = dto;
+
                 return {
                     ...rest,
                     cliente: cliente ? `${cliente.nombre} ${cliente.apellido}` : '',
-                    zona: cliente?.zona ?? '',
+                    zona: cliente?.clienteZona?.nombre ?? '',
                     cobrador: cobradorCredito?.nombre_completo ?? ''
                 };
             });
@@ -283,8 +293,23 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
                         as: 'credito',
                         required: true,
                         include: [
-                            { model: Cliente, as: 'cliente', attributes: ['nombre', 'apellido', 'zona'] },
-                            { model: Usuario, as: 'cobradorCredito', attributes: ['nombre_completo'] }
+                            {
+                                model: Cliente,
+                                as: 'cliente',
+                                attributes: ['nombre', 'apellido'],
+                                include: [
+                                    {
+                                        model: Zona,
+                                        as: 'clienteZona',
+                                        attributes: ['nombre']
+                                    }
+                                ]
+                            },
+                            {
+                                model: Usuario,
+                                as: 'cobradorCredito',
+                                attributes: ['nombre_completo']
+                            }
                         ]
                     },
                     {
@@ -319,7 +344,7 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
                     cliente: dto.credito?.cliente
                         ? `${dto.credito.cliente.nombre} ${dto.credito.cliente.apellido}`
                         : '',
-                    zona: dto.credito?.cliente?.zona ?? '',
+                    zona: dto.credito?.cliente?.clienteZona?.nombre ?? '',
                     cobrador: dto.credito?.cobradorCredito?.nombre_completo ?? '',
                     formasPago: formasPagoUnicas,
                     monto_pagado_acumulado: Number(montoPagadoAcumulado.toFixed(2))

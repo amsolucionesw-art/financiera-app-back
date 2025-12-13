@@ -100,6 +100,31 @@ const esLibre = (credito) => {
   return String(mod) === 'libre';
 };
 
+/* ===================== Helpers refinanciación (flags para UI) ===================== */
+
+/**
+ * Dado un crédito "plain", adjunta banderas estables para el front:
+ * - es_refinanciado: crédito original marcado como refinanciado
+ * - es_credito_de_refinanciacion: crédito nuevo que nace de una refinanciación
+ * - credito_origen_id: alias del id del crédito origen (además de id_credito_origen)
+ * - credito_refinanciado_hacia_id: (solo para originales refinanciados) id del crédito nuevo, si existe
+ */
+const anexarFlagsRefinanciacionPlain = (creditoPlain, hijoId = null) => {
+  if (!creditoPlain) return creditoPlain;
+
+  const estado = String(creditoPlain.estado || '').toLowerCase();
+  const origenId = creditoPlain.id_credito_origen ?? creditoPlain.credito_origen_id ?? null;
+
+  creditoPlain.credito_origen_id = origenId ?? null;
+  creditoPlain.es_credito_de_refinanciacion = Boolean(origenId);
+
+  creditoPlain.es_refinanciado = (estado === 'refinanciado');
+  creditoPlain.credito_refinanciado_hacia_id =
+    creditoPlain.es_refinanciado ? (hijoId ?? creditoPlain.credito_refinanciado_hacia_id ?? null) : null;
+
+  return creditoPlain;
+};
+
 /* ===================== Helpers internos Caja ===================== */
 
 /**
@@ -427,19 +452,6 @@ const generarCuotasServicio = async (credito, t = null) => {
 };
 
 /* ===================== Simulación de plan (Cotizador) ===================== */
-/**
- * Simula un crédito COMÚN o PROGRESIVO usando la misma lógica
- * que crearCredito/generarCuotasServicio, pero sin tocar la base.
- *
- * data:
- *  - monto_acreditar
- *  - tipo_credito: 'mensual' | 'semanal' | 'quincenal'
- *  - cantidad_cuotas
- *  - modalidad_credito: 'comun' | 'progresivo'
- *  - descuento (opcional, solo aplica si rol_id === 0)
- *  - interes (opcional, solo se usa directo si origen_venta_manual_financiada = true)
- *  - fecha_compromiso_pago (base para vencimientos; default: hoy)
- */
 export const simularPlanCredito = (data = {}) => {
   const {
     monto_acreditar,
@@ -550,15 +562,6 @@ export const simularPlanCredito = (data = {}) => {
 };
 
 /* ===================== Precálculo para CRÉDITOS ANTIGUOS ===================== */
-/**
- * Regla corregida (TZ y YMD):
- * - Si fv < hoyYMD(TZ) → marcar 'vencida' y calcular mora por días completos.
- * - Si fv === hoyYMD(TZ) → NO marcar 'vencida' y mora = 0 (no corre el mismo día).
- * - Si fv > hoyYMD(TZ) → mora = 0.
- *
- * IMPORTANTE:
- * - Nunca tocar cuotas 'pagada', 'refinanciada' o 'anulada'.
- */
 const marcarVencidasYCalcularMora = async (
   creditoId,
   {
@@ -586,7 +589,6 @@ const marcarVencidasYCalcularMora = async (
     }
 
     if (fvY < hoyY) {
-      // Día posterior al vencimiento → calcular mora por días completos (versión simple, se pisará luego)
       const dias = Math.max(differenceInCalendarDays(ymdDate(hoy), ymdDate(fv)), 0);
       const mora = fix2(toNumber(c.importe_cuota) * MORA_DIARIA * dias);
       await c.update({
@@ -594,7 +596,6 @@ const marcarVencidasYCalcularMora = async (
         intereses_vencidos_acumulados: mora
       });
     } else if (fvY === hoyY) {
-      // Mismo día → NO se marca vencida, mora 0
       if (!sumarSoloVencidas && toNumber(c.intereses_vencidos_acumulados) !== 0) {
         await c.update({ intereses_vencidos_acumulados: 0 });
       }
@@ -602,7 +603,6 @@ const marcarVencidasYCalcularMora = async (
         await c.update({ estado: 'pendiente' });
       }
     } else if (!sumarSoloVencidas) {
-      // Futuras → sin mora
       if (toNumber(c.intereses_vencidos_acumulados) !== 0) {
         await c.update({ intereses_vencidos_acumulados: 0 });
       }
@@ -612,7 +612,6 @@ const marcarVencidasYCalcularMora = async (
 
 /* ===================== Listado / detalle ===================== */
 export const obtenerCreditos = async (query, { rol_id = null } = {}) => {
-  // Visualización de créditos solo para admin/superadmin cuando se pasa rol_id
   if (rol_id !== null && rol_id !== 0 && rol_id !== 1) {
     const err = new Error('No tenés permisos para ver créditos.');
     err.status = 403;
@@ -630,18 +629,10 @@ export const obtenerCreditos = async (query, { rol_id = null } = {}) => {
   });
 };
 
-/**
- * ✅ Versión robusta:
- * - Lee el crédito con todas sus relaciones.
- * - Si existe, recalcula LIBRE o común/progresivo (mora/estado) dentro de un try/catch.
- * - Relee el crédito actualizado.
- * - Siempre que la fila exista, devuelve algo (evitamos 404 fantasma).
- */
 export const obtenerCreditoPorId = async (id, { rol_id = null } = {}) => {
   const pk = Number(id);
   if (!Number.isFinite(pk)) return null;
 
-  // Visualización de un crédito solo para admin/superadmin cuando se pasa rol_id
   if (rol_id !== null && rol_id !== 0 && rol_id !== 1) {
     const err = new Error('No tenés permisos para ver créditos.');
     err.status = 403;
@@ -661,18 +652,13 @@ export const obtenerCreditoPorId = async (id, { rol_id = null } = {}) => {
   // 2) Recalcular en función de modalidad (protegido con try/catch)
   try {
     if (esLibre(cred)) {
-      // LIBRE → refresca cuota abierta y mora
       await refrescarCuotaLibre(pk);
     } else {
-      // COMÚN / PROGRESIVO:
-      // 1) Normalizamos estados 'vencida' según fecha (versión simple).
       await marcarVencidasYCalcularMora(pk, {
         sumarSoloVencidas: true,
         fechaCorte: todayYMD()
       });
 
-      // 2) Recalculamos la MORA usando la misma lógica que usa el modal de pago
-      //    (cuota.service → simularMoraCuotaHasta), para que ficha y modal coincidan.
       try {
         const { recalcularMoraPorCredito } = await import('./cuota.service.js');
         await recalcularMoraPorCredito(pk);
@@ -680,18 +666,15 @@ export const obtenerCreditoPorId = async (id, { rol_id = null } = {}) => {
         console.error('[obtenerCreditoPorId] Error al recalcular mora por crédito:', e2?.message || e2);
       }
 
-      // 3) Ajustamos estado global del crédito (pendiente / vencido / pagado)
       await actualizarEstadoCredito(pk);
     }
 
-    // Releer actualizado (si por alguna razón no vuelve nada, nos quedamos con el original)
     const refetched = await Credito.findByPk(pk, { include: includeOpts });
     if (refetched) {
       cred = refetched;
     }
   } catch (e) {
     console.error('[obtenerCreditoPorId] Error al recalcular crédito:', e?.message || e);
-    // No tiramos error para no romper la ficha ni la ficha PDF
   }
 
   // 3) total_actual calculado + fechas de ciclos para LIBRE
@@ -704,6 +687,33 @@ export const obtenerCreditoPorId = async (id, { rol_id = null } = {}) => {
     if (ciclos) {
       cred.setDataValue('fechas_ciclos_libre', ciclos);
     }
+  }
+
+  // ✅ Flags refinanciación para UI (R roja / R verde)
+  try {
+    let hijoId = null;
+    if (String(plain.estado || '').toLowerCase() === 'refinanciado') {
+      const hijo = await Credito.findOne({
+        where: { id_credito_origen: plain.id },
+        attributes: ['id', 'id_credito_origen'],
+        order: [['id', 'DESC']],
+        raw: true
+      });
+      hijoId = hijo?.id ?? null;
+    }
+
+    const plainTagged = anexarFlagsRefinanciacionPlain({ ...plain }, hijoId);
+
+    cred.setDataValue('credito_origen_id', plainTagged.credito_origen_id);
+    cred.setDataValue('es_credito_de_refinanciacion', plainTagged.es_credito_de_refinanciacion);
+    cred.setDataValue('es_refinanciado', plainTagged.es_refinanciado);
+    cred.setDataValue('credito_refinanciado_hacia_id', plainTagged.credito_refinanciado_hacia_id);
+  } catch (e) {
+    console.error('[obtenerCreditoPorId] No se pudieron anexar flags de refinanciación:', e?.message || e);
+    cred.setDataValue('credito_origen_id', plain.id_credito_origen ?? null);
+    cred.setDataValue('es_credito_de_refinanciacion', Boolean(plain.id_credito_origen));
+    cred.setDataValue('es_refinanciado', String(plain.estado || '').toLowerCase() === 'refinanciado');
+    cred.setDataValue('credito_refinanciado_hacia_id', null);
   }
 
   return cred;
@@ -731,7 +741,6 @@ export const crearCredito = async (data, options = {}) => {
     recalcular_hasta_hoy = true,
     sumar_interes_solo_vencidas = true,
     fecha_corte = null,
-    // 👇 nuevo: usuario que origina el movimiento de caja
     usuario_id = null
   } = data;
 
@@ -746,7 +755,7 @@ export const crearCredito = async (data, options = {}) => {
       fecha_solicitud: fecha_solicitud || todayYMD(),
       fecha_acreditacion,
       fecha_compromiso_pago,
-      interes: tasaPorCicloPct,    // base para mora (interés del mes)
+      interes: tasaPorCicloPct,
       tipo_credito: 'mensual',
       cantidad_cuotas: 1,
       modalidad_credito,
@@ -761,8 +770,6 @@ export const crearCredito = async (data, options = {}) => {
     verificarTopeCiclosLibre(nuevo);
     await generarCuotasServicio(nuevo, t || null);
 
-    // EGRESO en Caja por desembolso (LIBRE)
-    // Si el crédito proviene de una venta manual financiada, NO impactamos Caja aquí
     if (!origen_venta_manual_financiada) {
       try {
         const cli = await Cliente.findByPk(cliente_id, t ? { transaction: t } : undefined);
@@ -792,7 +799,6 @@ export const crearCredito = async (data, options = {}) => {
 
   let totalBase = Number((monto_acreditar * (1 + interestPct / 100)).toFixed(2));
 
-  // Descuento opcional (superadmin)
   let descuentoPct = 0;
   if (rol_id === 0 && Number(descuento) > 0) {
     descuentoPct = Number(descuento);
@@ -828,15 +834,12 @@ export const crearCredito = async (data, options = {}) => {
     });
   }
 
-  // 🔁 Ajustamos el estado global del crédito según la situación de sus cuotas (todas vencidas → 'vencido')
   try {
     await actualizarEstadoCredito(nuevo.id);
   } catch (e) {
     console.error('[crearCredito] No se pudo actualizar estado del crédito:', e?.message || e);
   }
 
-  // EGRESO en Caja por desembolso (común/progresivo)
-  // Si el crédito proviene de una venta manual financiada, NO generamos egreso en Caja aquí
   if (!origen_venta_manual_financiada) {
     try {
       const cli = await Cliente.findByPk(cliente_id, t ? { transaction: t } : undefined);
@@ -857,11 +860,6 @@ export const crearCredito = async (data, options = {}) => {
 
 };
 
-/**
- * Actualizar un crédito:
- *  - común/progresivo → recalcula interés (proporcional, mínimo 60) y REGENERA cuotas
- *  - libre            → refresca cuota abierta (capital) y recalcula MORA según regla
- */
 export const actualizarCredito = async (id, data) => {
   const existente = await Credito.findByPk(id);
   if (!existente) throw new Error('Crédito no encontrado');
@@ -898,7 +896,7 @@ export const actualizarCredito = async (id, data) => {
         fecha_solicitud: fecha_solicitud || existente.fecha_solicitud || todayYMD(),
         fecha_acreditacion: fecha_acreditacion || existente.fecha_acreditacion,
         fecha_compromiso_pago: fecha_compromiso_pago || existente.fecha_compromiso_pago,
-        interes: tasaPorCicloPct,  // base para mora mensual
+        interes: tasaPorCicloPct,
         tipo_credito: 'mensual',
         cantidad_cuotas: 1,
         modalidad_credito,
@@ -965,7 +963,6 @@ export const actualizarCredito = async (id, data) => {
     });
   }
 
-  // 🔁 Después de regenerar cuotas y recalcular mora, actualizamos el estado global
   try {
     await actualizarEstadoCredito(actualizado.id);
   } catch (e) {
@@ -983,13 +980,10 @@ export async function actualizarEstadoCredito(credito_id, transaction = null) {
 
   const estadoActual = String(credito.estado || '').toLowerCase();
 
-  // 🛡️ Si el crédito ya está marcado como "refinanciado",
-  // no pisamos ese estado automáticamente.
   if (estadoActual === 'refinanciado') {
     return;
   }
 
-  // Respetamos la regla: no cambiar estado automáticamente para LIBRE
   if (esLibre(credito)) return;
 
   const cuotas = await Cuota.findAll({
@@ -998,7 +992,6 @@ export async function actualizarEstadoCredito(credito_id, transaction = null) {
   });
 
   if (!cuotas || cuotas.length === 0) {
-    // Sin cuotas: mantenemos pendiente
     await Credito.update(
       { estado: 'pendiente' },
       { where: { id: credito_id }, ...(transaction && { transaction }) }
@@ -1007,8 +1000,6 @@ export async function actualizarEstadoCredito(credito_id, transaction = null) {
   }
 
   const todasPagadas = cuotas.every(c => String(c.estado).toLowerCase() === 'pagada');
-
-  // Solo consideramos "activas" las que no están pagadas
   const activas = cuotas.filter(c => String(c.estado).toLowerCase() !== 'pagada');
   const todasActivasVencidas = activas.length > 0 && activas.every(c => String(c.estado).toLowerCase() === 'vencida');
 
@@ -1024,9 +1015,6 @@ export async function actualizarEstadoCredito(credito_id, transaction = null) {
 
 /* ============================================================
  *  CANCELACIÓN / PAGO ANTICIPADO
- *  Ahora con modo de descuento configurable en LIQUIDACIÓN:
- *  - descuento_sobre: 'mora' (default, comportamiento previo) | 'total'
- *    En 'total': el descuento impacta primero en MORA y luego en PRINCIPAL.
  * ============================================================ */
 
 const cancelarCreditoLibre = async ({
@@ -1036,7 +1024,6 @@ const cancelarCreditoLibre = async ({
   descuento_sobre = 'mora',
   observacion = null,
   rol_id = null,
-  // 👇 nuevo: usuario que realiza la cancelación
   usuario_id = null
 }) => {
   if (!forma_pago_id) {
@@ -1061,19 +1048,15 @@ const cancelarCreditoLibre = async ({
     };
   }
 
-  // Mora vigente (sin contar día del compromiso)
   const moraLibre = fix2(calcularMoraLibre(credito, ymdDate(todayYMD())));
-
   const pct = Math.min(Math.max(toNumber(descuento_porcentaje), 0), 100);
 
-  // 🚫 Descuento solo permitido para superadmin cuando se pasa rol_id
   if (pct > 0 && rol_id !== null && rol_id !== 0) {
     const err = new Error('Solo un superadmin puede aplicar descuentos en la cancelación del crédito.');
     err.status = 403;
     throw err;
   }
 
-  // Distribución del descuento
   let descSobreMora = 0;
   let descSobrePrincipal = 0;
 
@@ -1084,7 +1067,6 @@ const cancelarCreditoLibre = async ({
     totalDescuento = fix2(totalDescuento - descSobreMora);
     descSobrePrincipal = Math.min(totalDescuento, saldoPendiente);
   } else {
-    // Comportamiento anterior: solo sobre mora
     descSobreMora = fix2(moraLibre * (pct / 100));
     descSobrePrincipal = 0;
   }
@@ -1094,7 +1076,6 @@ const cancelarCreditoLibre = async ({
   const totalAPagar = fix2(principalNeto + moraNeta);
   const totalDescuento = fix2(descSobreMora + descSobrePrincipal);
 
-  // Cuota única libre
   const cuotaLibre = await Cuota.findOne({
     where: { credito_id: credito.id },
     order: [['numero_cuota', 'ASC']]
@@ -1116,7 +1097,6 @@ const cancelarCreditoLibre = async ({
       { where: { id: credito.id }, transaction: t }
     );
 
-    // Actualizo la cuota: si hubo descuento sobre principal, lo reflejo en descuento_cuota
     const nuevoDescCuota = fix2(toNumber(cuotaLibre.descuento_cuota) + descSobrePrincipal);
 
     await Cuota.update(
@@ -1124,7 +1104,6 @@ const cancelarCreditoLibre = async ({
         estado: 'pagada',
         forma_pago_id,
         descuento_cuota: nuevoDescCuota,
-        // monto pagado sobre principal = importe - descuento aplicado al principal
         monto_pagado_acumulado: fix2(toNumber(cuotaLibre.importe_cuota) - nuevoDescCuota),
         intereses_vencidos_acumulados: 0
       },
@@ -1169,16 +1148,14 @@ const cancelarCreditoLibre = async ({
         saldo_anterior: saldoAntes,
         saldo_actual: 0,
 
-        // desgloses
         mora_cobrada: moraNeta,
         principal_pagado: principalNeto,
         interes_ciclo_cobrado: 0,
 
-        descuento_aplicado: totalDescuento, // incluye mora + principal si 'total'
+        descuento_aplicado: totalDescuento,
         saldo_credito_anterior: saldoAntes,
         saldo_credito_actual: 0,
 
-        // Mora restante (en cancelación total = 0)
         saldo_mora: 0.00
       },
       { transaction: t }
@@ -1214,10 +1191,9 @@ export const cancelarCredito = async ({
   credito_id,
   forma_pago_id,
   descuento_porcentaje = 0,
-  descuento_sobre = 'mora', // 'mora' (default) | 'total'
+  descuento_sobre = 'mora',
   observacion = null,
   rol_id = null,
-  // 👇 nuevo: usuario que realiza la cancelación
   usuario_id = null
 }) => {
   if (!forma_pago_id) {
@@ -1226,14 +1202,12 @@ export const cancelarCredito = async ({
     throw err;
   }
 
-  // 🚫 Impacto de cancelación: si se pasa rol_id, solo admin/superadmin
   if (rol_id !== null && rol_id !== 0 && rol_id !== 1) {
     const err = new Error('No tenés permisos para cancelar créditos.');
     err.status = 403;
     throw err;
   }
 
-  // Traer crédito + cuotas no pagadas
   const credito = await Credito.findByPk(credito_id, {
     include: [
       {
@@ -1246,7 +1220,6 @@ export const cancelarCredito = async ({
   });
   if (!credito) throw new Error('Crédito no encontrado');
 
-  // —— LIBRE —— 
   if (esLibre(credito)) {
     verificarTopeCiclosLibre(credito);
     return cancelarCreditoLibre({
@@ -1260,7 +1233,6 @@ export const cancelarCredito = async ({
     });
   }
 
-  // —— común / progresivo —— 
   const { recalcularMoraCuota } = await import('./cuota.service.js');
 
   const cuotasPend = (credito.cuotas || [])
@@ -1281,7 +1253,6 @@ export const cancelarCredito = async ({
     };
   }
 
-  // 1) Principal pendiente por cuota y total
   const info = [];
   let totalPrincipalPendiente = 0;
   for (const c of cuotasPend) {
@@ -1293,7 +1264,6 @@ export const cancelarCredito = async ({
     totalPrincipalPendiente = fix2(totalPrincipalPendiente + principalPend);
   }
 
-  // 2) Mora del día (idempotente y en TZ)
   let totalMoraDia = 0;
   const moraHoyPorCuota = {};
   for (const { c } of info) {
@@ -1304,26 +1274,22 @@ export const cancelarCredito = async ({
 
   const pct = Math.min(Math.max(toNumber(descuento_porcentaje), 0), 100);
 
-  // 🚫 Descuento en cancelación solo para superadmin cuando se pasa rol_id
   if (pct > 0 && rol_id !== null && rol_id !== 0) {
     const err = new Error('Solo un superadmin puede aplicar descuentos en la cancelación del crédito.');
     err.status = 403;
     throw err;
   }
 
-  // 3) Estrategia de descuento
   let descSobreMoraTotal = 0;
   let descSobrePrincipalTotal = 0;
 
-  const descuentosMora = new Map();      // cuota_id -> descuento aplicado a mora (para referencia, no se guarda en cuota)
-  const descuentosPrincipal = new Map(); // cuota_id -> descuento aplicado al principal (se refleja en descuento_cuota)
+  const descuentosMora = new Map();
+  const descuentosPrincipal = new Map();
 
   if (String(descuento_sobre) === 'total') {
-    // Descuento sobre (principal + mora): primero a mora, luego al principal
     const baseTotal = fix2(totalPrincipalPendiente + totalMoraDia);
     let totalDescuento = fix2(baseTotal * (pct / 100));
 
-    // a) Aplicar a mora por proporción de mora de cada cuota
     if (totalMoraDia > 0) {
       let asignadoMora = 0;
       for (let i = 0; i < info.length; i++) {
@@ -1337,7 +1303,6 @@ export const cancelarCredito = async ({
       totalDescuento = fix2(Math.max(totalDescuento - asignadoMora, 0));
     }
 
-    // b) El remanente va al principal por proporción del principal pendiente
     if (totalDescuento > 0 && totalPrincipalPendiente > 0) {
       let asignadoPrincipal = 0;
       for (let i = 0; i < info.length; i++) {
@@ -1347,7 +1312,6 @@ export const cancelarCredito = async ({
         asignadoPrincipal = fix2(asignadoPrincipal + d);
       }
       descSobrePrincipalTotal = asignadoPrincipal;
-      // ✅ Fix bug: variable correcta en el ajuste fino
       const delta = fix2(totalDescuento - asignadoPrincipal);
       if (Math.abs(delta) >= 0.01) {
         const last = info[info.length - 1].c;
@@ -1357,7 +1321,6 @@ export const cancelarCredito = async ({
     }
 
   } else {
-    // Comportamiento anterior: descuento solo sobre mora, proporcional a la mora del día
     const totalDescuento = fix2(totalMoraDia * (pct / 100));
     if (totalMoraDia > 0 && totalDescuento > 0) {
       let asignado = 0;
@@ -1377,18 +1340,13 @@ export const cancelarCredito = async ({
       }
       descSobreMoraTotal = fix2(totalDescuento);
     }
-    // Principal no se descuenta en este modo
   }
 
-  // 4) TX de cierre
   const t = await Credito.sequelize.transaction();
   try {
-    // Actualización de cuotas: se cancela cada una.
     for (const { c } of info) {
       const descPrincipalC = fix2(descuentosPrincipal.get(c.id) || 0);
       const nuevoDescCuota = fix2(toNumber(c.descuento_cuota) + descPrincipalC);
-
-      // Al liquidar: pagado acumulado = importe - descuento_cuota
       const nuevoPagadoAcum = fix2(toNumber(c.importe_cuota) - nuevoDescCuota);
 
       await Cuota.update(
@@ -1397,7 +1355,6 @@ export const cancelarCredito = async ({
           forma_pago_id,
           descuento_cuota: nuevoDescCuota,
           monto_pagado_acumulado: nuevoPagadoAcum,
-          // cortamos mora
           intereses_vencidos_acumulados: 0
         },
         { where: { id: c.id }, transaction: t }
@@ -1459,14 +1416,12 @@ export const cancelarCredito = async ({
         saldo_anterior: saldoAntes,
         saldo_actual: 0,
 
-        // Desgloses coherentes con el modo de descuento
         mora_cobrada: moraNeta,
         principal_pagado: principalNeto,
-        descuento_aplicado: totalDescuento, // incluye descuento a mora y, si corresponde, a principal
+        descuento_aplicado: totalDescuento,
         saldo_credito_anterior: saldoAntes,
         saldo_credito_actual: 0,
 
-        // Mora restante luego de la operación (en cancelación total = 0)
         saldo_mora: 0.00
       },
       { transaction: t }
@@ -1503,10 +1458,10 @@ export const cancelarCredito = async ({
 /* ===================== Refinanciación ===================== */
 export const refinanciarCredito = async ({
   creditoId,
-  opcion,           // 'P1' | 'P2' | 'manual'
-  tasaManual = 0,   // tasa mensual en %
+  opcion,
+  tasaManual = 0,
   cantidad_cuotas,
-  tipo_credito,     // 'mensual' | 'semanal' | 'quincenal'
+  tipo_credito,
   rol_id = null
 }) => {
   let original = await Credito.findByPk(creditoId, {
@@ -1514,7 +1469,6 @@ export const refinanciarCredito = async ({
   });
   if (!original) throw new Error('Crédito no encontrado');
 
-  // 🛡️ Bloqueo: un crédito ya refinanciado no se puede volver a refinanciar.
   const estadoOriginal = String(original.estado || '').toLowerCase();
   if (estadoOriginal === 'refinanciado') {
     const err = new Error('Este crédito ya fue refinanciado y no puede volver a refinanciarse.');
@@ -1524,14 +1478,12 @@ export const refinanciarCredito = async ({
 
   const modalidad = String(original.modalidad_credito || '').toLowerCase();
 
-  // ✅ Permitimos refinanciar: común, progresivo y libre
   if (!['comun', 'progresivo', 'libre'].includes(modalidad)) {
     const err = new Error('Solo se permite refinanciar créditos de modalidad "comun", "progresivo" o "libre".');
     err.status = 400;
     throw err;
   }
 
-  // 🔁 Si es LIBRE, refrescamos primero la cuota para tener la MORA actualizada
   if (modalidad === 'libre') {
     try {
       await refrescarCuotaLibre(creditoId);
@@ -1543,21 +1495,16 @@ export const refinanciarCredito = async ({
     }
   }
 
-  // 🚫 P3 (manual) solo superadmin cuando se pasa rol_id
   if (opcion === 'manual' && rol_id !== null && rol_id !== 0) {
     const err = new Error('Solo un superadmin puede usar la tasa manual (P3) en la refinanciación.');
     err.status = 403;
     throw err;
   }
 
-  // Base: saldo_actual + mora pendiente
-  // En LIBRE esto implementa exactamente la regla:
-  //   saldoBase = saldo_actual (capital) + mora (cuota abierta)
   const cuotasNP = (original.cuotas || []).filter(q => q.estado !== 'pagada');
   const moraPendiente = cuotasNP.reduce((acc, q) => acc + toNumber(q.intereses_vencidos_acumulados), 0);
   const saldoBase = fix2(toNumber(original.saldo_actual) + moraPendiente);
 
-  // Tasa mensual
   let tasaMensual;
   if (opcion === 'P1') tasaMensual = 25;
   else if (opcion === 'P2') tasaMensual = 15;
@@ -1570,8 +1517,7 @@ export const refinanciarCredito = async ({
     throw err;
   }
 
-  // Periodicidad y cuotas
-  const nuevoTipo = tipo_credito || original.tipo_credito; // semanal | quincenal | mensual
+  const nuevoTipo = tipo_credito || original.tipo_credito;
   const nuevasCuotas = Number.isFinite(Number(cantidad_cuotas)) && Number(cantidad_cuotas) > 0
     ? Number(cantidad_cuotas)
     : original.cantidad_cuotas;
@@ -1579,22 +1525,18 @@ export const refinanciarCredito = async ({
   const pl = periodLengthFromTipo(nuevoTipo);
   const tasaPorPeriodo = tasaMensual / pl;
 
-  // Interés lineal
   const interesTotalPct = tasaPorPeriodo * nuevasCuotas;
   const interesTotalMonto = fix2(saldoBase * (interesTotalPct / 100.0));
   const nuevoMonto = fix2(saldoBase + interesTotalMonto);
 
-  // TX refi
   const t = await Credito.sequelize.transaction();
   try {
-    // 1) Marcar crédito original como refinanciado
     await original.update({
       estado: 'refinanciado',
       opcion_refinanciamiento: opcion,
       tasa_refinanciacion: tasaMensual
     }, { transaction: t });
 
-    // 2) Preparar cuotas a afectar (pendiente/parcial/vencida)
     const cuotasAfectadas = await Cuota.findAll({
       where: {
         credito_id: creditoId,
@@ -1604,7 +1546,6 @@ export const refinanciarCredito = async ({
     });
     const idsAfectadas = cuotasAfectadas.map(c => c.id);
 
-    // Contar pagos por cuota
     const pagosPorCuota = await Pago.findAll({
       attributes: ['cuota_id'],
       where: { cuota_id: { [Op.in]: idsAfectadas } },
@@ -1615,13 +1556,11 @@ export const refinanciarCredito = async ({
     const idsConPagos = idsAfectadas.filter(id => setConPagos.has(id));
     const idsSinPagos = idsAfectadas.filter(id => !setConPagos.has(id));
 
-    // a) Cuotas SIN pagos → borrar (primero recibos, por seguridad)
     if (idsSinPagos.length > 0) {
       await Recibo.destroy({ where: { cuota_id: { [Op.in]: idsSinPagos } }, transaction: t });
       await Cuota.destroy({ where: { id: { [Op.in]: idsSinPagos } }, transaction: t });
     }
 
-    // b) Cuotas CON pagos → NO borrar, se marcan 'refinanciada' y se corta la mora
     if (idsConPagos.length > 0) {
       await Cuota.update(
         { estado: 'refinanciada', intereses_vencidos_acumulados: 0 },
@@ -1629,7 +1568,6 @@ export const refinanciarCredito = async ({
       );
     }
 
-    // 3) Crear nuevo crédito refinanciado
     const hoy = todayYMD();
 
     const nuevo = await Credito.create({
@@ -1645,7 +1583,7 @@ export const refinanciarCredito = async ({
       interes: tasaMensual,
       tipo_credito: nuevoTipo,
       cantidad_cuotas: nuevasCuotas,
-      modalidad_credito: 'comun', // 🟢 Siempre pasa a PLAN DE CUOTAS FIJAS
+      modalidad_credito: 'comun',
       descuento: 0,
 
       monto_total_devolver: nuevoMonto,
@@ -1729,7 +1667,6 @@ export const eliminarCredito = async (id) => {
 /* ===================== Cliente con créditos (con filtros) ===================== */
 export const obtenerCreditosPorCliente = async (clienteId, query = {}, { rol_id = null } = {}) => {
   try {
-    // Visualización de créditos por cliente solo para admin/superadmin cuando se pasa rol_id
     if (rol_id !== null && rol_id !== 0 && rol_id !== 1) {
       const err = new Error('No tenés permisos para ver créditos de clientes.');
       err.status = 403;
@@ -1739,8 +1676,8 @@ export const obtenerCreditosPorCliente = async (clienteId, query = {}, { rol_id 
     const estado = query.estado ? String(query.estado).toLowerCase() : null;
     const modalidad = query.modalidad ? String(query.modalidad).toLowerCase() : null;
     const tipo = query.tipo ? String(query.tipo).toLowerCase() : null;
-    const desde = query.desde || null; // YYYY-MM-DD
-    const hasta = query.hasta || null; // YYYY-MM-DD
+    const desde = query.desde || null;
+    const hasta = query.hasta || null;
     const conCuotasVencidas = query.conCuotasVencidas === true || query.conCuotasVencidas === 'true' || query.conCuotasVencidas === '1';
 
     const whereCredito = {};
@@ -1787,7 +1724,6 @@ export const obtenerCreditosPorCliente = async (clienteId, query = {}, { rol_id 
     });
     if (!cliente) return null;
 
-    // Refresco TODOS los créditos del cliente (LIBRE y no LIBRE) al día actual
     const creditosCliente = cliente.creditos || [];
     for (const cr of creditosCliente) {
       if (esLibre(cr)) {
@@ -1801,7 +1737,6 @@ export const obtenerCreditosPorCliente = async (clienteId, query = {}, { rol_id 
       }
     }
 
-    // Re-traigo actualizado
     cliente = await Cliente.findByPk(clienteId, {
       include: [
         {
@@ -1838,16 +1773,49 @@ export const obtenerCreditosPorCliente = async (clienteId, query = {}, { rol_id 
       );
     }
 
+    // ✅ Mapa: crédito original refinanciado -> crédito nuevo (más reciente)
+    let mapHijosPorOrigen = new Map();
+    try {
+      const idsOriginalesRefi = (plain.creditos || [])
+        .filter(cr => String(cr.estado || '').toLowerCase() === 'refinanciado')
+        .map(cr => cr.id);
+
+      if (idsOriginalesRefi.length > 0) {
+        const hijos = await Credito.findAll({
+          where: { id_credito_origen: { [Op.in]: idsOriginalesRefi } },
+          attributes: ['id', 'id_credito_origen'],
+          raw: true
+        });
+
+        // si hay más de uno, nos quedamos con el id más alto
+        for (const h of hijos) {
+          const origenId = h.id_credito_origen;
+          const hijoId = h.id;
+          const prev = mapHijosPorOrigen.get(origenId);
+          if (!prev || Number(hijoId) > Number(prev)) {
+            mapHijosPorOrigen.set(origenId, hijoId);
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[obtenerCreditosPorCliente] No se pudo armar map de hijos de refinanciación:', e?.message || e);
+      mapHijosPorOrigen = new Map();
+    }
+
     plain.creditos.sort((a, b) => b.id - a.id);
     plain.creditos.forEach(cr => {
       if (Array.isArray(cr.cuotas)) cr.cuotas.sort((x, y) => x.numero_cuota - y.numero_cuota);
       cr.total_actual = calcularTotalActualCreditoPlain(cr);
+
       if (esLibre(cr)) {
         const ciclos = obtenerFechasCiclosLibre(cr);
         if (ciclos) {
           cr.fechas_ciclos_libre = ciclos;
         }
       }
+
+      const hijoId = mapHijosPorOrigen.get(cr.id) ?? null;
+      anexarFlagsRefinanciacionPlain(cr, hijoId);
     });
 
     return plain;
@@ -1862,7 +1830,6 @@ export const anularCredito = async (id) => {
   const credito = await Credito.findByPk(id);
   if (!credito) throw new Error('Crédito no encontrado');
 
-  // 🚫 No permitir anular un crédito ya pagado
   if (String(credito.estado || '').toLowerCase() === 'pagado') {
     const err = new Error('No se puede anular un crédito pagado.');
     err.status = 400;
@@ -1876,7 +1843,6 @@ export const anularCredito = async (id) => {
 };
 
 export const solicitarAnulacionCredito = async ({ creditoId, motivo, userId }) => {
-  // Validamos estado del crédito antes de generar la tarea
   const credito = await Credito.findByPk(creditoId);
   if (!credito) {
     const err = new Error('Crédito no encontrado.');
@@ -1925,7 +1891,6 @@ export const imprimirFichaCredito = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Crédito no encontrado' });
     }
 
-    // Import dinámico de pdfkit
     let PDFDocument;
     try {
       ({ default: PDFDocument } = await import('pdfkit'));
@@ -1944,7 +1909,6 @@ export const imprimirFichaCredito = async (req, res) => {
 
     const ciclosLibre = esLibre(c) ? obtenerFechasCiclosLibre(c) : null;
 
-    // Vencimientos (ignorando ficticio y normalizando a YYYY-MM-DD)
     const vtosValidos = cuotas
       .map(ct => ct.fecha_vencimiento)
       .filter(f => f && f !== LIBRE_VTO_FICTICIO)
@@ -1958,13 +1922,11 @@ export const imprimirFichaCredito = async (req, res) => {
       ? vtosValidos[vtosValidos.length - 1]
       : (c.fecha_compromiso_pago ? ymd(c.fecha_compromiso_pago) : '-');
 
-    // Para LIBRE, consideramos fin de crédito el vencimiento del 3er ciclo
     if (ciclosLibre) {
       primerVto = ciclosLibre.vencimiento_ciclo_1 || primerVto;
       ultimoVto = ciclosLibre.vencimiento_ciclo_3 || ultimoVto;
     }
 
-    // Headers PDF
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="ficha-credito-${c.id}.pdf"`);
     res.setHeader('Cache-Control', 'no-store');
@@ -1978,14 +1940,12 @@ export const imprimirFichaCredito = async (req, res) => {
 
     doc.pipe(res);
 
-    // Encabezado
     doc.fontSize(16).text('Ficha de Crédito', { align: 'center' });
     doc.moveDown(0.3);
     doc.fontSize(9).fillColor('#555').text(`Emitido: ${fechaEmision}`, { align: 'center' });
     doc.moveDown(1);
     doc.fillColor('#000');
 
-    // Cliente
     doc.fontSize(12).text('Cliente', { underline: true });
     doc.moveDown(0.3);
     doc.fontSize(10)
@@ -1995,7 +1955,6 @@ export const imprimirFichaCredito = async (req, res) => {
       .text(`Dirección: ${[cli.direccion_1, cli.direccion_2, cli.direccion].filter(Boolean).join(' | ') || '-'}`);
     doc.moveDown(0.8);
 
-    // Crédito (sin tasa ni monto_acreditar)
     doc.fontSize(12).text('Crédito', { underline: true });
     doc.moveDown(0.3);
     doc.fontSize(10)
@@ -2024,7 +1983,6 @@ export const imprimirFichaCredito = async (req, res) => {
     doc.fontSize(12).text(`TOTAL ACTUAL: ${fmtARS(total_actual)}`);
     doc.moveDown(1);
 
-    // Tabla de cuotas
     doc.fontSize(12).text('Detalle de cuotas', { underline: true });
     doc.moveDown(0.4);
     doc.fontSize(9);
@@ -2032,7 +1990,6 @@ export const imprimirFichaCredito = async (req, res) => {
     const headers = ['#', 'Vencimiento', 'Importe', 'Pagado', 'Desc.', 'Mora', 'Saldo', 'Estado'];
     const colWidths = [25, 85, 70, 70, 55, 55, 70, 70];
 
-    // Header
     let x = doc.x, y = doc.y;
     headers.forEach((h, i) => {
       doc.text(h, x, y, { width: colWidths[i], align: i <= 1 ? 'left' : 'right' });
@@ -2042,7 +1999,6 @@ export const imprimirFichaCredito = async (req, res) => {
     doc.moveTo(36, doc.y).lineTo(559, doc.y).strokeColor('#ddd').stroke();
     doc.strokeColor('#000');
 
-    // Rows
     let totalPrincipalPend = 0, totalMora = 0;
     cuotas.forEach((ct) => {
       const principalPend = Math.max(
@@ -2056,7 +2012,6 @@ export const imprimirFichaCredito = async (req, res) => {
         ct.fecha_vencimiento === LIBRE_VTO_FICTICIO ? '—' :
           (ct.fecha_vencimiento ? ymd(ct.fecha_vencimiento) : '-');
 
-      // Saldo = principal pendiente + mora
       const saldoCuota = fix2(principalPend + mora);
 
       const row = [
@@ -2083,7 +2038,6 @@ export const imprimirFichaCredito = async (req, res) => {
     doc.strokeColor('#000');
     doc.moveDown(0.4);
 
-    // Totales de la tabla
     const labelX = 36 + colWidths.slice(0, 5).reduce((a, b) => a + b, 0);
     const valueX = 36 + colWidths.slice(0, 6).reduce((a, b) => a + b, 0);
 

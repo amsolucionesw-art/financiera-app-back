@@ -1,3 +1,4 @@
+// backend/src/routes/clientes.routes.js
 import { Router } from 'express';
 import multer from 'multer';
 import path from 'path';
@@ -16,6 +17,12 @@ import {
 } from '../services/cliente.service.js';
 import CobradorZona from '../models/CobradorZona.js';
 import * as XLSX from 'xlsx';
+
+// ✅ NUEVO: recalcular vencidas antes de servir data al cobrador
+import { actualizarCuotasVencidas, recalcularMoraPorCredito } from '../services/cuota.service.js';
+
+// ✅ NUEVO: para obtener ids de créditos del cobrador y recalcular “al día” antes de responder
+import Credito from '../models/Credito.js';
 
 const router = Router();
 
@@ -313,7 +320,6 @@ router.get('/', verifyToken, checkRole([0, 1, 2]), async (req, res) => {
 });
 
 // GET - Clientes básico (id, nombre, apellido, cobrador, zona) ideal para <select>
-// Soporta filtros por query: ?cobrador=ID, ?zona=ID, etc.
 router.get('/basico', verifyToken, checkRole([0, 1, 2]), async (req, res) => {
   try {
     const clientes = await obtenerClientesBasico(req.query);
@@ -327,7 +333,32 @@ router.get('/basico', verifyToken, checkRole([0, 1, 2]), async (req, res) => {
 // GET - Clientes del cobrador (solo para rol 2 - Cobrador)
 router.get('/por-cobrador/:id', verifyToken, checkRole([2]), async (req, res) => {
   try {
-    const clientes = await obtenerClientesPorCobrador(req.params.id);
+    // ✅ Seguridad opcional: si el middleware expone el id del usuario, validamos que coincida
+    const tokenUserId = req.user?.id ?? req.userId ?? req.usuario?.id ?? null;
+    if (tokenUserId != null && String(tokenUserId) !== String(req.params.id)) {
+      return res.status(403).json({ success: false, message: 'No autorizado para consultar otra cartera' });
+    }
+
+    const cobradorId = Number(req.params.id);
+
+    // ✅ 1) Marcamos vencidas “al día”
+    await actualizarCuotasVencidas();
+
+    // ✅ 2) Recalculamos mora/estado de TODA la cartera del cobrador ANTES de responder
+    //     (así lo que se incluye en clientes→créditos→cuotas llega actualizado)
+    const creditos = await Credito.findAll({
+      where: { cobrador_id: cobradorId },
+      attributes: ['id'],
+      raw: true
+    });
+
+    for (const c of creditos) {
+      // idempotente: si ya está ok, no rompe; si está viejo, lo actualiza
+      await recalcularMoraPorCredito(c.id);
+    }
+
+    // ✅ 3) Ahora sí, traemos el árbol completo (clientes + créditos + cuotas) ya actualizado
+    const clientes = await obtenerClientesPorCobrador(cobradorId);
     res.json({ success: true, data: clientes });
   } catch (error) {
     console.error('Error al obtener clientes por cobrador:', error);
@@ -353,8 +384,8 @@ router.post('/', verifyToken, checkRole([0, 1]), async (req, res) => {
     const body = req.body;
 
     if (!body.nombre || !body.apellido || !body.dni || !body.direccion || !body.provincia ||
-        !body.localidad || !body.telefono || !body.email || !body.fecha_nacimiento ||
-        !body.fecha_registro || !body.cobrador || !body.zona) {
+      !body.localidad || !body.telefono || !body.email || !body.fecha_nacimiento ||
+      !body.fecha_registro || !body.cobrador || !body.zona) {
       return res.status(400).json({ success: false, message: 'Faltan campos obligatorios' });
     }
 
@@ -387,8 +418,8 @@ router.put('/:id', verifyToken, checkRole([0]), async (req, res) => {
     const body = req.body;
 
     if (!body.nombre || !body.apellido || !body.dni || !body.fecha_nacimiento || !body.fecha_registro ||
-        !body.email || !body.telefono || !body.direccion || !body.provincia || !body.localidad ||
-        !body.cobrador || !body.zona) {
+      !body.email || !body.telefono || !body.direccion || !body.provincia || !body.localidad ||
+      !body.cobrador || !body.zona) {
       return res.status(400).json({ success: false, message: 'Faltan campos obligatorios' });
     }
 

@@ -22,6 +22,18 @@ import {
 const router = Router();
 
 /* ──────────────────────────────────────────────────────────────────────────
+ * Helpers TZ (coherencia)
+ * ────────────────────────────────────────────────────────────────────────── */
+const APP_TZ = process.env.APP_TZ || 'America/Argentina/Tucuman';
+const todayYMD = () =>
+    new Intl.DateTimeFormat('en-CA', {
+        timeZone: APP_TZ,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+    }).format(new Date());
+
+/* ──────────────────────────────────────────────────────────────────────────
  * Crear nueva cuota (Superadmin y Admin)
  * ────────────────────────────────────────────────────────────────────────── */
 router.post('/', verifyToken, checkRole([0, 1]), async (req, res) => {
@@ -64,6 +76,90 @@ router.get('/vencidas', verifyToken, checkRole([0, 1, 2]), async (req, res) => {
     } catch (error) {
         console.error('Error al obtener cuotas vencidas:', error);
         res.status(500).json({ success: false, message: 'Error al obtener cuotas vencidas' });
+    }
+});
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * NUEVO: Ruta de cobro del cobrador logueado
+ *
+ * Objetivo:
+ *  - Vencidas: todas
+ *  - Pendientes "de hoy": fecha_vencimiento == hoy (TZ APP_TZ)
+ *  - Filtrado por cobrador logueado (rol 2) automáticamente.
+ *
+ * Contrato sugerido (lo implementa el service):
+ *  {
+ *    items: [{ categoria: 'vencida'|'hoy', ...columnasTabla }],
+ *    meta: { total, total_vencidas, total_hoy, cobrador_id, hoy }
+ *  }
+ *
+ * NOTA IMPORTANTE:
+ *  - Para evitar que el backend "crashee" si todavía no existe el export en el service,
+ *    se hace import dinámico. Si falta, responde 501 con hint.
+ * ────────────────────────────────────────────────────────────────────────── */
+router.get('/ruta-cobro', verifyToken, checkRole([0, 1, 2]), async (req, res) => {
+    try {
+        const rol_id = req.user?.rol_id ?? null;
+
+        // Si es cobrador (rol 2) SIEMPRE usa su propio usuario_id
+        const cobrador_id =
+            rol_id === 2
+                ? req.user?.id
+                : (req.query?.cobradorId ? Number(req.query.cobradorId) : null);
+
+        if (!cobrador_id || !Number.isFinite(Number(cobrador_id))) {
+            return res.status(400).json({
+                success: false,
+                message:
+                    rol_id === 2
+                        ? 'No se pudo identificar el cobrador del token'
+                        : 'Debe indicar cobradorId en query (solo admin/superadmin)'
+            });
+        }
+
+        const includeVencidas = String(req.query?.includeVencidas ?? '1') !== '0';
+        const includePendientesHoy = String(req.query?.includePendientesHoy ?? '1') !== '0';
+        const hoy = todayYMD();
+
+        const cuotaService = await import('../services/cuota.service.js');
+        const fn =
+            cuotaService.obtenerRutaCobroCobrador ||
+            cuotaService.obtenerRutaCobro ||
+            null;
+
+        if (typeof fn !== 'function') {
+            return res.status(501).json({
+                success: false,
+                message:
+                    'La ruta de cobro aún no está implementada en el service (falta export).',
+                hint:
+                    'Agregá y exportá `obtenerRutaCobroCobrador` en `src/services/cuota.service.js` para usar /cuotas/ruta-cobro'
+            });
+        }
+
+        const result = await fn({
+            // seguridad / contexto
+            rol_id,
+            usuario_id: req.user?.id,
+            cobrador_id,
+
+            // negocio
+            hoy,
+            includeVencidas,
+            includePendientesHoy,
+
+            // filtros opcionales (si los querés soportar en el service)
+            zonaId: req.query?.zonaId,
+            clienteId: req.query?.clienteId,
+
+            // modo de respuesta
+            modo: req.query?.modo // 'plano' | 'separado' (si lo implementan)
+        });
+
+        res.json({ success: true, data: result });
+    } catch (error) {
+        console.error('Error al obtener ruta de cobro:', error);
+        res.status(500).json({ success: false, message: 'Error al obtener ruta de cobro' });
     }
 });
 

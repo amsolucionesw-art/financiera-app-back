@@ -12,7 +12,7 @@ import * as XLSX from 'xlsx';
 const BASE_URL = 'http://localhost:3000'; // Centralizado
 
 /* ──────────────────────────────────────────────────────────
-   LISTADOS (full y básico para selects)
+    LISTADOS (full y básico para selects)
    ────────────────────────────────────────────────────────── */
 
 // 🟢 Obtener todos los clientes con filtros opcionales (listado completo)
@@ -47,6 +47,48 @@ export const obtenerClientesBasico = async (query = {}) => {
    CRUD / CONSULTAS
    ────────────────────────────────────────────────────────── */
 
+const absolutizeDniFoto = (plain) => {
+    if (!plain) return plain;
+    if (plain.dni_foto && typeof plain.dni_foto === 'string' && !plain.dni_foto.startsWith('http')) {
+        plain.dni_foto = `${BASE_URL}/uploads/dni/${plain.dni_foto}`;
+    }
+    return plain;
+};
+
+/**
+ * Para cartera del cobrador: estado “operativo” inferido por cuotas.
+ * Prioridad: vencido > parcial > pendiente > pagado
+ * Respeta estados terminales: refinanciado / anulado
+ */
+const inferEstadoCreditoDesdeCuotas = (creditoPlain) => {
+    const estadoOriginal = String(creditoPlain?.estado || '').toLowerCase();
+
+    // estados terminales (no los tocamos)
+    if (estadoOriginal === 'refinanciado' || estadoOriginal === 'anulado') {
+        return estadoOriginal;
+    }
+
+    const cuotas = Array.isArray(creditoPlain?.cuotas) ? creditoPlain.cuotas : [];
+    if (cuotas.length === 0) return estadoOriginal || 'pendiente';
+
+    const estados = cuotas.map((c) => String(c?.estado || '').toLowerCase());
+
+    // todas pagadas => pagado
+    if (estados.every((e) => e === 'pagado')) return 'pagado';
+
+    // alguna vencida => vencido
+    if (estados.some((e) => e === 'vencido' || e === 'vencida')) return 'vencido';
+
+    // alguna parcial => parcial
+    if (estados.some((e) => e === 'parcial')) return 'parcial';
+
+    // alguna pendiente => pendiente
+    if (estados.some((e) => e === 'pendiente')) return 'pendiente';
+
+    // fallback
+    return estadoOriginal || 'pendiente';
+};
+
 // 🟢 Obtener cliente por ID (incluye cobrador y zona)
 export const obtenerClientePorId = async (id) => {
     const cliente = await Cliente.findByPk(id, {
@@ -59,9 +101,7 @@ export const obtenerClientePorId = async (id) => {
     if (!cliente) return null;
 
     const plain = cliente.toJSON();
-    if (plain.dni_foto && !plain.dni_foto.startsWith('http')) {
-        plain.dni_foto = `${BASE_URL}/uploads/dni/${plain.dni_foto}`;
-    }
+    absolutizeDniFoto(plain);
 
     return plain;
 };
@@ -88,7 +128,26 @@ export const obtenerClientesPorCobrador = async (cobradorId) => {
         ]
     });
 
-    return clientes;
+    // ✅ devolvemos plain JSON + estado coherente con cuotas (para evitar fichas “viejas”)
+    return (clientes || []).map((c) => {
+        const plain = c?.toJSON ? c.toJSON() : c;
+
+        absolutizeDniFoto(plain);
+
+        if (Array.isArray(plain.creditos)) {
+            plain.creditos = plain.creditos.map((cred) => {
+                const estadoInferido = inferEstadoCreditoDesdeCuotas(cred);
+
+                return {
+                    ...cred,
+                    // 🔥 clave: el front muestra y filtra por credito.estado
+                    estado: estadoInferido
+                };
+            });
+        }
+
+        return plain;
+    });
 };
 
 // 🟢 Crear nuevo cliente
@@ -198,8 +257,6 @@ const HEADER_MAP = {
     zona: 'zona',
     'zona_id': 'zona',
     'zona_nombre': 'zona_nombre',
-
-    // campo que mantenemos en CRUD pero no importamos: dni_foto (ignorado)
 };
 
 /** Helpers básicos */
@@ -208,10 +265,8 @@ const cleanDni = (v) => str(v).replace(/\D+/g, ''); // deja solo dígitos
 const isEmpty = (v) => v === undefined || v === null || (typeof v === 'string' && v.trim() === '');
 const toDateOrNull = (v) => {
     if (isEmpty(v)) return null;
-    // XLSX puede entregar Date, número (serial excel) o string
     if (v instanceof Date && !isNaN(v)) return v;
     if (typeof v === 'number') {
-        // serial Excel -> Date
         const d = XLSX.SSF.parse_date_code(v);
         if (!d) return null;
         const dt = new Date(Date.UTC(d.y, (d.m || 1) - 1, d.d || 1));
@@ -238,8 +293,6 @@ const normalizeRow = (raw) => {
 
 /**
  * Busca IDs de cobrador/zona a partir de id directo o por nombre.
- * - Cobrador: busca por id o por nombre_completo (case-insensitive).
- * - Zona: busca por id o por nombre (case-insensitive).
  */
 const resolveCobradorYZona = async (row) => {
     let resolvedCobrador = null;
@@ -256,10 +309,12 @@ const resolveCobradorYZona = async (row) => {
     if (!resolvedCobrador && !isEmpty(row.cobrador_nombre)) {
         const nombre = str(row.cobrador_nombre).toLowerCase();
         const u = await Usuario.findOne({
-            where: { nombre_completo: Usuario.sequelize.where(
-                Usuario.sequelize.fn('LOWER', Usuario.sequelize.col('nombre_completo')),
-                nombre
-            ) },
+            where: {
+                nombre_completo: Usuario.sequelize.where(
+                    Usuario.sequelize.fn('LOWER', Usuario.sequelize.col('nombre_completo')),
+                    nombre
+                )
+            },
             attributes: ['id']
         });
         if (u) resolvedCobrador = u.id;
@@ -276,10 +331,12 @@ const resolveCobradorYZona = async (row) => {
     if (!resolvedZona && !isEmpty(row.zona_nombre)) {
         const nombre = str(row.zona_nombre).toLowerCase();
         const z = await Zona.findOne({
-            where: { nombre: Zona.sequelize.where(
-                Zona.sequelize.fn('LOWER', Zona.sequelize.col('nombre')),
-                nombre
-            ) },
+            where: {
+                nombre: Zona.sequelize.where(
+                    Zona.sequelize.fn('LOWER', Zona.sequelize.col('nombre')),
+                    nombre
+                )
+            },
             attributes: ['id']
         });
         if (z) resolvedZona = z.id;
@@ -293,14 +350,12 @@ const resolveCobradorYZona = async (row) => {
  */
 const validateRow = (row) => {
     const errors = [];
-
-    // requeridos
     const dni = cleanDni(row.dni);
+
     if (isEmpty(row.nombre)) errors.push('El campo "nombre" es requerido.');
     if (isEmpty(row.apellido)) errors.push('El campo "apellido" es requerido.');
     if (isEmpty(dni)) errors.push('El campo "dni" es requerido o inválido.');
 
-    // opcional: otras validaciones simples
     if (!isEmpty(row.email)) {
         const ok = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(str(row.email));
         if (!ok) errors.push('El campo "email" tiene formato inválido.');
@@ -311,7 +366,6 @@ const validateRow = (row) => {
 
 /**
  * Convierte una fila normalizada al shape final compatible con crear/actualizar.
- * No incluye dni_foto (por pedido).
  */
 const toClientPayload = (row, resolved) => ({
     nombre: str(row.nombre) || null,
@@ -340,31 +394,18 @@ const toClientPayload = (row, resolved) => ({
     cobrador: resolved.cobrador ?? null,
     zona: resolved.zona ?? null,
 
-    // historial_crediticio/puntaje_crediticio: si vienen, se respetan; si no, defaults
     historial_crediticio: isEmpty(row.historial_crediticio) ? undefined : str(row.historial_crediticio),
     puntaje_crediticio: isEmpty(row.puntaje_crediticio) ? undefined : Number(row.puntaje_crediticio),
 });
 
-/**
- * Lee el buffer con XLSX y retorna un array de objetos (una por fila).
- * Soporta CSV y XLSX.
- */
 const readBufferToRows = (buffer, filename) => {
     const wb = XLSX.read(buffer, { type: 'buffer' });
     const firstSheetName = wb.SheetNames[0];
     const sheet = wb.Sheets[firstSheetName];
-    // defval: '' para no perder columnas vacías; raw: false para normalizar fechas como strings cuando no sean serial
     const rows = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
     return rows;
 };
 
-/**
- * Importador principal (CSV/XLSX) con soporte dryRun/commit.
- * @param {Buffer} fileBuffer - buffer del archivo subido
- * @param {string} filename   - nombre del archivo (solo informativo)
- * @param {{dryRun?: boolean}} options
- * @returns {{summary: object, rows: Array}}
- */
 export const importarClientesDesdePlanilla = async (fileBuffer, filename, { dryRun = true } = {}) => {
     const rawRows = readBufferToRows(fileBuffer, filename);
 
@@ -377,22 +418,16 @@ export const importarClientesDesdePlanilla = async (fileBuffer, filename, { dryR
     for (const raw of rawRows) {
         index += 1;
 
-        // 1) Normalizar headers a nuestros campos
         const norm = normalizeRow(raw);
-
-        // 2) Validar requeridos/formato
         const { errors: valErrors, dni } = validateRow(norm);
 
-        // 3) Resolver cobrador/zona (solo si no hay errores de requeridos)
         let resolved = { cobrador: null, zona: null };
         if (valErrors.length === 0) {
             resolved = await resolveCobradorYZona(norm);
         }
 
-        // 4) Armar payload final
         const payload = toClientPayload(norm, resolved);
 
-        // 5) Determinar acción (create/update) y aplicar según dryRun
         let action = null;
         let targetId = null;
 
@@ -418,7 +453,6 @@ export const importarClientesDesdePlanilla = async (fileBuffer, filename, { dryR
                 if (!dryRun) {
                     const createdClient = await Cliente.create({
                         ...payload,
-                        // si no vienen estos campos, mantener defaults del modelo
                         historial_crediticio: payload.historial_crediticio ?? 'Desaprobado',
                         puntaje_crediticio: Number.isFinite(payload.puntaje_crediticio)
                             ? payload.puntaje_crediticio
@@ -433,7 +467,6 @@ export const importarClientesDesdePlanilla = async (fileBuffer, filename, { dryR
                 action = 'update';
                 targetId = existing.id;
                 if (!dryRun) {
-                    // No pisamos id ni dni; el dni se mantiene igual
                     const { dni: _omitDni, ...rest } = payload;
                     await Cliente.update(rest, { where: { id: existing.id } });
                     updated += 1;

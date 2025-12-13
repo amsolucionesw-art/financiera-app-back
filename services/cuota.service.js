@@ -750,6 +750,419 @@ export const obtenerCuotasVencidas = async (query = {}) => {
     return filas;
 };
 
+/* ──────────────────────────────────────────────────────────────────────────
+ * NUEVO: Ruta de cobro automática para el cobrador logueado
+ *
+ * Regla:
+ *  - "vencidas": todas las cuotas NO-LIBRE en estado vencida (fv < hoy) + LIBRE por fecha_compromiso_pago < hoy
+ *  - "hoy": cuotas NO-LIBRE en pendiente/parcial con fv == hoy + LIBRE por fecha_compromiso_pago == hoy
+ *
+ * Devuelve items listos para tabla.
+ * Incluye zona_nombre si existe el modelo Zona (import dinámico robusto).
+ * ────────────────────────────────────────────────────────────────────────── */
+export const obtenerRutaCobroCobrador = async ({
+    cobrador_id,
+    hoy = todayYMD(),
+    includeVencidas = true,
+    includePendientesHoy = true,
+    zonaId = null,
+    clienteId = null,
+    modo = 'plano' // 'plano' | 'separado'
+} = {}) => {
+    const cobradorIdNum = Number(cobrador_id);
+    if (!Number.isFinite(cobradorIdNum) || cobradorIdNum <= 0) {
+        throw new Error('cobrador_id inválido');
+    }
+
+    // Normalizamos hoy
+    const hoyY = asYMD(hoy);
+    const hoyDate = ymdDate(hoyY);
+
+    // Asegura estados de vencidas al día
+    await actualizarCuotasVencidas();
+
+    /* ─────────────── Zona (opcional) ─────────────── */
+    const mapZonaNombre = new Map(); // key: String(id) -> nombre
+    const cargarZonasSiExiste = async (zonaIds = []) => {
+        const idsNum = [
+            ...new Set(
+                (zonaIds ?? [])
+                    .map((z) => Number(z))
+                    .filter((n) => Number.isFinite(n))
+            )
+        ];
+        if (idsNum.length === 0) return;
+
+        let Zona = null;
+
+        // 1) intento directo
+        try {
+            const mod = await import('../models/Zona.js');
+            Zona = mod?.default ?? null;
+        } catch {
+            // ignore
+        }
+
+        // 2) fallback por index (si existe)
+        if (!Zona) {
+            try {
+                const mod2 = await import('../models/index.js');
+                Zona = mod2?.Zona ?? mod2?.default?.Zona ?? null;
+            } catch {
+                // ignore
+            }
+        }
+
+        if (!Zona) return;
+
+        const rows = await Zona.findAll({
+            where: { id: { [Op.in]: idsNum } },
+            attributes: ['id', 'nombre'],
+            raw: true
+        });
+
+        for (const r of rows) {
+            mapZonaNombre.set(String(r.id), r.nombre ?? String(r.id));
+        }
+    };
+
+    /* ─────────────── NO-LIBRE: créditos del cobrador ─────────────── */
+    const creditosNoLibre = await Credito.findAll({
+        where: {
+            cobrador_id: cobradorIdNum,
+            modalidad_credito: { [Op.ne]: 'libre' },
+            estado: { [Op.ne]: 'refinanciado' }
+        },
+        attributes: [
+            'id',
+            'cliente_id',
+            'cobrador_id',
+            'modalidad_credito',
+            'estado',
+            'tipo_credito',
+            'interes',
+            'saldo_actual',
+            'fecha_acreditacion',
+            'fecha_compromiso_pago'
+        ]
+    });
+    const creditoIdsNoLibre = creditosNoLibre.map((cr) => cr.id);
+    const mapCreditoNoLibre = new Map(creditosNoLibre.map(cr => [cr.id, cr]));
+
+    /* ─────────────── NO-LIBRE: cuotas (filtradas por esos créditos) ─────────────── */
+    const orCuotas = [];
+    if (includeVencidas) {
+        orCuotas.push({
+            estado: 'vencida',
+            fecha_vencimiento: { [Op.lt]: hoyY, [Op.ne]: VTO_FICTICIO_LIBRE }
+        });
+    }
+    if (includePendientesHoy) {
+        orCuotas.push({
+            estado: { [Op.in]: ['pendiente', 'parcial'] },
+            fecha_vencimiento: hoyY
+        });
+    }
+
+    let cuotas = [];
+    if (creditoIdsNoLibre.length > 0 && orCuotas.length > 0) {
+        cuotas = await Cuota.findAll({
+            where: {
+                credito_id: { [Op.in]: creditoIdsNoLibre },
+                [Op.or]: orCuotas
+            },
+            attributes: [
+                'id',
+                'credito_id',
+                'numero_cuota',
+                'estado',
+                'fecha_vencimiento',
+                'importe_cuota',
+                'descuento_cuota',
+                'monto_pagado_acumulado'
+            ],
+            include: [{
+                model: Pago,
+                as: 'pagos',
+                attributes: ['monto_pagado', 'fecha_pago']
+            }],
+            order: [['fecha_vencimiento', 'ASC'], ['numero_cuota', 'ASC']]
+        });
+    }
+
+    /* ─────────────── Clientes (NO-LIBRE) ─────────────── */
+    const clienteIdsNoLibre = [...new Set(creditosNoLibre.map(cr => cr.cliente_id))];
+    const clientesNoLibre = clienteIdsNoLibre.length
+        ? await Cliente.findAll({
+            where: { id: { [Op.in]: clienteIdsNoLibre } },
+            attributes: [
+                'id',
+                'nombre',
+                'apellido',
+                'dni',
+                'telefono',
+                'telefono_secundario',
+                'direccion',
+                'zona'
+            ]
+        })
+        : [];
+    const mapCliente = new Map(clientesNoLibre.map(cl => [cl.id, cl]));
+
+    await cargarZonasSiExiste(clientesNoLibre.map(c => c.zona).filter(Boolean));
+
+    /* ─────────────── LIBRE: créditos por fecha_compromiso_pago ─────────────── */
+    const orLibre = [];
+    if (includeVencidas) {
+        orLibre.push({ fecha_compromiso_pago: { [Op.lt]: hoyY } });
+    }
+    if (includePendientesHoy) {
+        orLibre.push({ fecha_compromiso_pago: hoyY });
+    }
+
+    const creditosLibres = orLibre.length
+        ? await Credito.findAll({
+            where: {
+                cobrador_id: cobradorIdNum,
+                modalidad_credito: 'libre',
+                estado: { [Op.notIn]: ['refinanciado', 'pagado', 'anulado'] },
+                saldo_actual: { [Op.gt]: 0 },
+                fecha_compromiso_pago: { [Op.ne]: null },
+                [Op.or]: orLibre
+            },
+            attributes: [
+                'id',
+                'cliente_id',
+                'cobrador_id',
+                'modalidad_credito',
+                'estado',
+                'tipo_credito',
+                'interes',
+                'saldo_actual',
+                'fecha_acreditacion',
+                'fecha_compromiso_pago'
+            ]
+        })
+        : [];
+
+    const libreIds = creditosLibres.map(cr => cr.id);
+
+    // Mapear cuota_id “operable” para LIBRE (normalmente la primera/única)
+    const cuotasLibresAll = libreIds.length
+        ? await Cuota.findAll({
+            where: { credito_id: { [Op.in]: libreIds } },
+            attributes: ['id', 'credito_id', 'numero_cuota'],
+            order: [['credito_id', 'ASC'], ['numero_cuota', 'ASC']]
+        })
+        : [];
+    const mapCuotaLibre = new Map();
+    for (const c of cuotasLibresAll) {
+        if (!mapCuotaLibre.has(c.credito_id)) mapCuotaLibre.set(c.credito_id, c);
+    }
+
+    const clienteIdsLibre = [...new Set(creditosLibres.map(cr => cr.cliente_id))];
+    const clientesLibre = clienteIdsLibre.length
+        ? await Cliente.findAll({
+            where: { id: { [Op.in]: clienteIdsLibre } },
+            attributes: [
+                'id',
+                'nombre',
+                'apellido',
+                'dni',
+                'telefono',
+                'telefono_secundario',
+                'direccion',
+                'zona'
+            ]
+        })
+        : [];
+    for (const cl of clientesLibre) {
+        if (!mapCliente.has(cl.id)) mapCliente.set(cl.id, cl);
+    }
+
+    await cargarZonasSiExiste(clientesLibre.map(c => c.zona).filter(Boolean));
+
+    /* ─────────────── Construcción de filas ─────────────── */
+    const items = [];
+
+    // NO-LIBRE filas
+    for (const c of cuotas) {
+        const cr = mapCreditoNoLibre.get(c.credito_id);
+        if (!cr) continue; // seguridad
+
+        const cl = mapCliente.get(cr.cliente_id);
+        if (!cl) continue;
+
+        if (clienteId != null && Number(clienteId) && cl.id !== Number(clienteId)) continue;
+        if (zonaId != null && String(cl.zona ?? '') !== String(zonaId)) continue;
+
+        const fv = asYMD(c.fecha_vencimiento);
+        const categoria =
+            (String(c.estado) === 'vencida' && fv < hoyY)
+                ? 'vencida'
+                : (fv === hoyY ? 'hoy' : null);
+
+        if (!categoria) continue;
+
+        const diasVencida =
+            categoria === 'vencida'
+                ? Math.max(differenceInCalendarDays(hoyDate, ymdDate(fv)), 0)
+                : 0;
+
+        const sim = simularMoraCuotaHasta(c, c.pagos, hoyDate);
+        const mora_pendiente = fix2(sim.moraPendiente);
+        const saldo_principal_pendiente = fix2(sim.saldoPrincipalPendiente);
+        const total_a_pagar_hoy = fix2(mora_pendiente + saldo_principal_pendiente);
+
+        const zona_id = cl.zona ?? null;
+        const zona_nombre = zona_id != null
+            ? (mapZonaNombre.get(String(zona_id)) ?? String(zona_id))
+            : null;
+
+        items.push({
+            categoria, // 'vencida' | 'hoy'
+            modalidad_credito: cr.modalidad_credito,
+            tipo_credito: cr.tipo_credito,
+            credito_estado: cr.estado,
+
+            cuota_id: c.id,
+            credito_id: c.credito_id,
+            numero_cuota: c.numero_cuota,
+            estado_cuota: c.estado,
+            fecha_vencimiento: fv,
+            dias_vencida: diasVencida,
+
+            // Cliente
+            cliente_id: cl.id,
+            cliente_nombre: cl.nombre,
+            cliente_apellido: cl.apellido,
+            cliente_dni: cl.dni ?? null,
+            cliente_telefono: cl.telefono ?? null,
+            cliente_telefono_secundario: cl.telefono_secundario ?? null,
+            cliente_direccion: cl.direccion ?? null,
+            zona_id,
+            zona_nombre,
+
+            // Montos NO-LIBRE (operables por cuota)
+            importe_cuota: fix2(c.importe_cuota),
+            descuento_cuota: fix2(c.descuento_cuota),
+            monto_pagado_acumulado: fix2(c.monto_pagado_acumulado),
+
+            mora_pendiente,
+            saldo_principal_pendiente,
+            total_a_pagar_hoy
+        });
+    }
+
+    // LIBRE filas
+    let libres_sin_cuota = 0;
+    for (const cr of creditosLibres) {
+        const cl = mapCliente.get(cr.cliente_id);
+        if (!cl) continue;
+
+        if (clienteId != null && Number(clienteId) && cl.id !== Number(clienteId)) continue;
+        if (zonaId != null && String(cl.zona ?? '') !== String(zonaId)) continue;
+
+        const fcp = asYMD(cr.fecha_compromiso_pago);
+        const categoria =
+            (includeVencidas && fcp < hoyY) ? 'vencida'
+            : (includePendientesHoy && fcp === hoyY) ? 'hoy'
+            : null;
+
+        if (!categoria) continue;
+
+        const diasVencida =
+            categoria === 'vencida'
+                ? Math.max(differenceInCalendarDays(hoyDate, ymdDate(fcp)), 0)
+                : 0;
+
+        const cuotaOperable = mapCuotaLibre.get(cr.id) || null;
+        if (!cuotaOperable?.id) {
+            libres_sin_cuota += 1;
+            continue; // sin cuota_id no se puede operar el cobro
+        }
+
+        const saldo_capital = fix2(cr.saldo_actual || 0);
+        const interes_pendiente_hoy = fix2(await calcularInteresPendienteLibre({ credito: cr }));
+        const mora_pendiente_hoy = fix2(calcularMoraLibre({ credito: cr, hoy: hoyDate }));
+        const total_a_pagar_hoy = fix2(saldo_capital + interes_pendiente_hoy + mora_pendiente_hoy);
+
+        const zona_id = cl.zona ?? null;
+        const zona_nombre = zona_id != null
+            ? (mapZonaNombre.get(String(zona_id)) ?? String(zona_id))
+            : null;
+
+        items.push({
+            categoria,
+            modalidad_credito: 'libre',
+            tipo_credito: cr.tipo_credito,
+            credito_estado: cr.estado,
+
+            // Para operar pagos LIBRE necesitamos cuota_id
+            cuota_id: cuotaOperable.id,
+            credito_id: cr.id,
+            numero_cuota: cuotaOperable.numero_cuota ?? null,
+
+            // En LIBRE usamos fecha_compromiso_pago como “vencimiento operativo”
+            fecha_vencimiento: fcp,
+            dias_vencida: diasVencida,
+
+            // Cliente
+            cliente_id: cl.id,
+            cliente_nombre: cl.nombre,
+            cliente_apellido: cl.apellido,
+            cliente_dni: cl.dni ?? null,
+            cliente_telefono: cl.telefono ?? null,
+            cliente_telefono_secundario: cl.telefono_secundario ?? null,
+            cliente_direccion: cl.direccion ?? null,
+            zona_id,
+            zona_nombre,
+
+            // Montos LIBRE (liquidación)
+            saldo_capital,
+            interes_pendiente_hoy,
+            mora_pendiente_hoy,
+            total_a_pagar_hoy
+        });
+    }
+
+    // Orden sugerido: vencidas primero, luego hoy; y dentro por fecha y cliente
+    items.sort((a, b) => {
+        const prA = a.categoria === 'vencida' ? 0 : 1;
+        const prB = b.categoria === 'vencida' ? 0 : 1;
+        if (prA !== prB) return prA - prB;
+
+        if (a.fecha_vencimiento !== b.fecha_vencimiento) {
+            return a.fecha_vencimiento < b.fecha_vencimiento ? -1 : 1;
+        }
+
+        const an = `${a.cliente_apellido ?? ''} ${a.cliente_nombre ?? ''}`.trim().toLowerCase();
+        const bn = `${b.cliente_apellido ?? ''} ${b.cliente_nombre ?? ''}`.trim().toLowerCase();
+        if (an !== bn) return an < bn ? -1 : 1;
+
+        return (a.credito_id ?? 0) - (b.credito_id ?? 0);
+    });
+
+    const meta = {
+        cobrador_id: cobradorIdNum,
+        hoy: hoyY,
+        total: items.length,
+        total_vencidas: items.filter(i => i.categoria === 'vencida').length,
+        total_hoy: items.filter(i => i.categoria === 'hoy').length,
+        libres_sin_cuota
+    };
+
+    if (modo === 'separado') {
+        return {
+            vencidas: items.filter(i => i.categoria === 'vencida'),
+            hoy: items.filter(i => i.categoria === 'hoy'),
+            meta
+        };
+    }
+
+    return { items, meta };
+};
+
 /* ───────────────── Recibos ───────────────── */
 /** Devuelve el nombre legible de la modalidad de crédito para usar en el concepto del recibo */
 const nombreModalidadCredito = (modalidadRaw) => {

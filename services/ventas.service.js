@@ -21,7 +21,7 @@ const asYMD = (s) => {
         if (Number.isNaN(d.getTime())) return null;
         const yyyy = d.getUTCFullYear();
         const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-        const dd = String(d.getUTCDate()).padStart(2, '0');
+        const dd = String(d.getUTCDate() + 0).padStart(2, '0');
         return `${yyyy}-${mm}-${dd}`;
     } catch {
         return null;
@@ -81,13 +81,6 @@ const TIPOS_VALIDOS = new Set(['mensual', 'semanal', 'quincenal']);
 const normalizarTipoCredito = (v) => {
     const s = String(v || '').toLowerCase().trim();
     return TIPOS_VALIDOS.has(s) ? s : 'mensual';
-};
-
-// Detecta si la venta es "financiada" (regla acordada: capital>0 y cuotas>1)
-const esFinanciada = (src) => {
-    const capital = toNumber(src?.capital ?? 0);
-    const cuotas = Number(src?.cuotas ?? 1);
-    return capital > 0 && cuotas > 1;
 };
 
 /* ───────────── N° comprobante automático (FA-0001-00001234) ───────────── */
@@ -171,7 +164,7 @@ const intentarCrearCreditoDesdeVenta = async (venta, rawData, t) => {
     return { creditoId: Number(creditoId) };
 };
 
-/* ───────────────── CRUD con impacto en Caja (condicional) ───────────────── */
+/* ───────────────── CRUD con impacto en Caja ───────────────── */
 
 export const crearVentaManual = async (req, res) => {
     const t = await sequelize.transaction();
@@ -266,25 +259,17 @@ export const crearVentaManual = async (req, res) => {
 
         const usuario_id = data.usuario_id ?? req.user?.id ?? null;
 
-        // 2) Movimiento de CAJA (solo si NO es financiada)
-        if (!esFinanciada(data)) {
-            const mov = await registrarIngresoDesdeVentaManual({
-                venta_id: nueva.id,
-                total: nueva.total,
-                fecha_imputacion: nueva.fecha_imputacion,
-                forma_pago_id: nueva.forma_pago_id ?? null,
-                usuario_id,
-                concepto: conceptoVenta(nueva)
-            }, { transaction: t });
+        // 2) Movimiento de CAJA: siempre registramos un ingreso por la venta
+        const mov = await registrarIngresoDesdeVentaManual({
+            venta_id: nueva.id,
+            total: nueva.total,
+            fecha_imputacion: nueva.fecha_imputacion,
+            forma_pago_id: nueva.forma_pago_id ?? null,
+            usuario_id,
+            concepto: conceptoVenta(nueva)
+        }, { transaction: t });
 
-            await nueva.update({ caja_movimiento_id: mov.id }, { transaction: t });
-        } else {
-            // Aseguramos no dejar rastro de caja si vino algo previo
-            if (nueva.caja_movimiento_id) {
-                await eliminarMovimientoDesdeVentaManual(nueva.id, { transaction: t });
-                await nueva.update({ caja_movimiento_id: null }, { transaction: t });
-            }
-        }
+        await nueva.update({ caja_movimiento_id: mov.id }, { transaction: t });
 
         // 3) Intentar crear CRÉDITO si corresponde (venta financiada a cliente existente)
         try {
@@ -471,36 +456,28 @@ export const actualizarVentaManual = async (req, res) => {
         const usuario_id = data.usuario_id ?? req.user?.id ?? null;
 
         // Movimiento de CAJA:
-        // - Si NO es financiada -> actualizar/crear ingreso
-        // - Si es financiada -> NO tocar caja; si existiera un enlace previo, no lo recreamos
-        if (!esFinanciada({ ...row.get(), ...data })) {
-            const updatedMov = await actualizarMovimientoDesdeVentaManual({
+        // Siempre mantenemos un ingreso por la venta (normal o financiada)
+        const updatedMov = await actualizarMovimientoDesdeVentaManual({
+            venta_id: row.id,
+            total: row.total,
+            fecha_imputacion: row.fecha_imputacion,
+            forma_pago_id: row.forma_pago_id ?? null,
+            concepto: conceptoVenta(row)
+        }, { transaction: t });
+
+        if (!updatedMov) {
+            const createdMov = await registrarIngresoDesdeVentaManual({
                 venta_id: row.id,
                 total: row.total,
                 fecha_imputacion: row.fecha_imputacion,
                 forma_pago_id: row.forma_pago_id ?? null,
+                usuario_id,
                 concepto: conceptoVenta(row)
             }, { transaction: t });
 
-            if (!updatedMov) {
-                const createdMov = await registrarIngresoDesdeVentaManual({
-                    venta_id: row.id,
-                    total: row.total,
-                    fecha_imputacion: row.fecha_imputacion,
-                    forma_pago_id: row.forma_pago_id ?? null,
-                    usuario_id,
-                    concepto: conceptoVenta(row)
-                }, { transaction: t });
-                await row.update({ caja_movimiento_id: createdMov.id }, { transaction: t });
-            } else if (!row.caja_movimiento_id) {
-                await row.update({ caja_movimiento_id: updatedMov.id }, { transaction: t });
-            }
-        } else {
-            // Financiada: aseguramos no tener movimiento asociado
-            if (row.caja_movimiento_id) {
-                await eliminarMovimientoDesdeVentaManual(row.id, { transaction: t });
-                await row.update({ caja_movimiento_id: null }, { transaction: t });
-            }
+            await row.update({ caja_movimiento_id: createdMov.id }, { transaction: t });
+        } else if (!row.caja_movimiento_id) {
+            await row.update({ caja_movimiento_id: updatedMov.id }, { transaction: t });
         }
 
         await t.commit();
