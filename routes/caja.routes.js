@@ -8,7 +8,8 @@ import {
     resumenDiario,
     resumenSemanal,   // ⬅️ nuevo
     resumenMensual,
-    exportarExcel     // ⬅️ nuevo
+    exportarExcel,    // ⬅️ nuevo
+    exportarMovimientosExcel, // ✅ Export historial de movimientos
 } from '../services/caja.service.js';
 
 const router = Router();
@@ -18,16 +19,32 @@ const router = Router();
  * Accesos:
  *  - Crear movimiento: admin o superadmin (roles 1 y 0)
  *  - Consultas: cualquier usuario autenticado
- *  - Exportación Excel: admin/superadmin (ajustable)
+ *  - Exportación Excel (4 hojas): admin/superadmin (ajustable)
+ *  - Exportación Excel (historial movimientos): cualquier usuario autenticado (solo lectura)
  */
 router.post('/movimientos', verifyToken, checkRole([0, 1]), crearMovimiento);
 router.get('/movimientos', verifyToken, obtenerMovimientos);
 
 router.get('/resumen-diario', verifyToken, resumenDiario);
-router.get('/resumen-semanal', verifyToken, resumenSemanal);   // ⬅️ nuevo
+router.get('/resumen-semanal', verifyToken, resumenSemanal);
 router.get('/resumen-mensual', verifyToken, resumenMensual);
 
-// Export XLSX (4 hojas): restringido a admin/superadmin (podés abrirlo si querés)
-router.get('/export-excel', verifyToken, checkRole([0, 1]), exportarExcel); // ⬅️ nuevo
+// Export XLSX (4 hojas): restringido a admin/superadmin
+router.get('/export-excel', verifyToken, checkRole([0, 1]), exportarExcel);
+
+// ✅ Export XLSX del HISTORIAL (misma data que /movimientos con sus filtros)
+// - Mantengo la ruta actual por compatibilidad
+router.get(
+    '/movimientos/export-excel',
+    verifyToken,
+    exportarMovimientosExcel
+);
+
+// - Alias “más estándar” por si el front lo prefiere
+router.get(
+    '/movimientos/export/excel',
+    verifyToken,
+    exportarMovimientosExcel
+);
 
 export default router;

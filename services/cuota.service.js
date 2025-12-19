@@ -75,6 +75,8 @@ const toNumber = (v) => {
 };
 const fix2 = (n) => Math.round(toNumber(n) * 100) / 100;
 
+const clamp = (n, min, max) => Math.min(Math.max(n, min), max);
+
 /** Normaliza tasa: admite 60 ó 0.60 → devuelve decimal 0.60 */
 const normalizeRate = (r) => {
     const n = toNumber(r);
@@ -87,6 +89,25 @@ const getPeriodDays = (tipo) =>
 
 const esCreditoLibre = (credito) =>
     String(credito?.modalidad_credito ?? '') === 'libre';
+
+/** ✅ Bloqueo duro: no permitir pagos si el crédito/cuota ya están refinanciados */
+const assertNoPagoSiRefinanciado = ({ credito, cuota = null }) => {
+    const creditoEstado = String(credito?.estado ?? '').toLowerCase();
+    const cuotaEstado = String(cuota?.estado ?? '').toLowerCase();
+
+    const creditoRefi = creditoEstado === 'refinanciado';
+    // Por robustez: si en algún flujo marcan cuota como refinanciada/refinanciado
+    const cuotaRefi = cuotaEstado === 'refinanciada' || cuotaEstado === 'refinanciado';
+
+    if (creditoRefi || cuotaRefi) {
+        const err = new Error(
+            'No se puede registrar un pago: el crédito ya fue refinanciado (o la cuota pertenece a un crédito refinanciado).'
+        );
+        err.status = 409; // Conflict
+        err.code = 'CREDITO_REFINANCIADO_NO_PAGO';
+        throw err;
+    }
+};
 
 /** Ciclo LIBRE actual (mensual, máx. 3): 1, 2 o 3 */
 const cicloLibreActual = (credito, refDate = ymdDate(todayYMD())) => {
@@ -745,7 +766,7 @@ export const obtenerCuotasVencidas = async (query = {}) => {
 
     filas.sort((a, b) =>
         (a.fecha_vencimiento < b.fecha_vencimiento ? -1 :
-         a.fecha_vencimiento > b.fecha_vencimiento ? 1 : 0));
+            a.fecha_vencimiento > b.fecha_vencimiento ? 1 : 0));
 
     return filas;
 };
@@ -1066,8 +1087,8 @@ export const obtenerRutaCobroCobrador = async ({
         const fcp = asYMD(cr.fecha_compromiso_pago);
         const categoria =
             (includeVencidas && fcp < hoyY) ? 'vencida'
-            : (includePendientesHoy && fcp === hoyY) ? 'hoy'
-            : null;
+                : (includePendientesHoy && fcp === hoyY) ? 'hoy'
+                    : null;
 
         if (!categoria) continue;
 
@@ -1262,9 +1283,12 @@ export const pagarCuota = async (...args) => {
 const pagarCuotaTotal = async ({
     cuota_id,
     forma_pago_id,
-    descuento = 0, // En LIBRE: descuento aplica SOLO sobre la MORA
+    descuento = 0,
+    descuento_scope = null,   // 'mora' | 'total' | null
+    descuento_mora = null,    // para 'mora' (en LIBRE se interpreta como %; en NO-LIBRE como MONTO)
     observacion = null,
-    usuario_id = null
+    usuario_id = null,
+    rol_id = null
 }) => {
     const t = await sequelize.transaction();
     try {
@@ -1275,11 +1299,16 @@ const pagarCuotaTotal = async ({
         const credito = await Credito.findByPk(cuota.credito_id, { transaction: t, lock: t.LOCK.UPDATE });
         if (!credito) throw new Error('Crédito asociado no encontrado');
 
+        // ✅ BLOQUEO: si está refinanciado, NO se paga
+        assertNoPagoSiRefinanciado({ credito, cuota });
+
         const cliente = await Cliente.findByPk(credito.cliente_id, { transaction: t });
         const cobrador = await Usuario.findByPk(credito.cobrador_id, { transaction: t });
         const medioPago = await FormaPago.findByPk(forma_pago_id, { transaction: t });
 
-        // —— LIBRE → Total = CAPITAL + INTERÉS + MORA (descuento% solo sobre MORA) —— 
+        const isAdmin = Number(rol_id) === 1;
+
+        // —— LIBRE → Total = CAPITAL + INTERÉS + MORA (descuento solo sobre MORA) —— 
         if (esCreditoLibre(credito)) {
             const hoyYMD_TZ = todayYMD();
 
@@ -1287,7 +1316,16 @@ const pagarCuotaTotal = async ({
             const interesPendiente = await calcularInteresPendienteLibre({ credito });
             const moraLibre = fix2(calcularMoraLibre({ credito, hoy: ymdDate(hoyYMD_TZ) }));
 
-            const pct = Math.min(Math.max(fix2(descuento), 0), 100);
+            // ✅ Regla: descuento permitido SOLO sobre mora
+            // - En LIBRE lo interpretamos como % (0..100)
+            //   * Si viene descuento_scope='mora' y descuento_mora: usamos descuento_mora (%)
+            //   * Si no, usamos descuento (% legacy)
+            const scope = isAdmin ? 'mora' : (String(descuento_scope || '').toLowerCase() || null);
+            const pctRaw = scope === 'mora'
+                ? (descuento_mora != null ? toNumber(descuento_mora) : toNumber(descuento))
+                : toNumber(descuento);
+
+            const pct = clamp(fix2(pctRaw), 0, 100);
             const descuentoMora = fix2(moraLibre * (pct / 100));
             const moraNeta = fix2(Math.max(moraLibre - descuentoMora, 0));
 
@@ -1311,7 +1349,7 @@ const pagarCuotaTotal = async ({
             await credito.update({
                 saldo_actual: 0,
                 estado: 'pagado',
-                // acumulamos interés + mora neta
+                // acumulamos interés + mora neta cobrada (no incluye descuento “perdonado”)
                 interes_acumulado: fix2(toNumber(credito.interes_acumulado) + interesPendiente + moraNeta)
             }, { transaction: t });
 
@@ -1367,8 +1405,16 @@ const pagarCuotaTotal = async ({
         const descuentoPrevio = fix2(cuota.descuento_cuota);
         const principalPagadoPrevio = fix2(cuota.monto_pagado_acumulado);
 
-        // ❗️AHORA el descuento recibido se aplica SOLO sobre la MORA:
-        const descuentoMora = Math.min(Math.max(fix2(descuento), 0), fix2(moraActual));
+        // ✅ Regla: descuento permitido SOLO sobre la mora
+        // - En NO-LIBRE lo interpretamos como MONTO
+        //   * Si viene descuento_scope='mora' y descuento_mora: usamos descuento_mora (MONTO)
+        //   * Si no, usamos descuento (legacy, MONTO)
+        const scope = isAdmin ? 'mora' : (String(descuento_scope || '').toLowerCase() || null);
+        const descuentoMoraBruto = scope === 'mora'
+            ? (descuento_mora != null ? fix2(toNumber(descuento_mora)) : fix2(toNumber(descuento)))
+            : fix2(toNumber(descuento));
+
+        const descuentoMora = Math.min(Math.max(descuentoMoraBruto, 0), fix2(moraActual));
         const moraNeta = fix2(Math.max(moraActual - descuentoMora, 0));
 
         // El principal NO recibe nuevo descuento acá
@@ -1452,7 +1498,10 @@ export const registrarPagoParcial = async ({
     forma_pago_id,
     observacion = null,
     descuento = 0,
-    usuario_id = null
+    descuento_scope = null,   // 'mora' | null
+    descuento_mora = null,    // en LIBRE se interpreta como %; en NO-LIBRE como MONTO
+    usuario_id = null,
+    rol_id = null
 }) => {
     const t = await sequelize.transaction();
     try {
@@ -1465,11 +1514,15 @@ export const registrarPagoParcial = async ({
         const credito = await Credito.findByPk(cuota.credito_id, { transaction: t, lock: t.LOCK.UPDATE });
         if (!credito) throw new Error('Crédito asociado no encontrado');
 
+        // ✅ BLOQUEO: si está refinanciado, NO se paga
+        assertNoPagoSiRefinanciado({ credito, cuota });
+
         const cliente = await Cliente.findByPk(credito.cliente_id, { transaction: t });
         const cobrador = await Usuario.findByPk(credito.cobrador_id, { transaction: t });
         const medioPago = await FormaPago.findByPk(forma_pago_id, { transaction: t });
 
         const hoyYMD_TZ = todayYMD();
+        const isAdmin = Number(rol_id) === 1;
 
         // —— LIBRE → parcial: INTERÉS → MORA → CAPITAL —— 
         if (esCreditoLibre(credito)) {
@@ -1484,13 +1537,23 @@ export const registrarPagoParcial = async ({
             const interesPendiente = await calcularInteresPendienteLibre({ credito });
             const moraLibre = fix2(calcularMoraLibre({ credito, hoy: ymdDate(hoyYMD_TZ) }));
 
+            // ✅ Descuento (solo sobre mora) en LIBRE = % (0..100)
+            const scope = isAdmin ? 'mora' : (String(descuento_scope || '').toLowerCase() || null);
+            const pctRaw = scope === 'mora'
+                ? (descuento_mora != null ? toNumber(descuento_mora) : toNumber(descuento))
+                : toNumber(descuento);
+
+            const pct = clamp(fix2(pctRaw), 0, 100);
+            const descuentoMora = fix2(moraLibre * (pct / 100));
+            const moraNeta = fix2(Math.max(moraLibre - descuentoMora, 0));
+
             const aInteres = Math.min(pagado, interesPendiente);
             const restoTrasInteres = fix2(pagado - aInteres);
-            const aMora = Math.min(restoTrasInteres, moraLibre);
+            const aMora = Math.min(restoTrasInteres, moraNeta);
             const aCapital = Math.min(Math.max(restoTrasInteres - aMora, 0), saldoAntes);
 
             const nuevoSaldo = fix2(Math.max(saldoAntes - aCapital, 0));
-            const moraRestante = fix2(Math.max(moraLibre - aMora, 0));
+            const moraRestante = fix2(Math.max(moraNeta - aMora, 0));
             const interesRestante = fix2(Math.max(interesPendiente - aInteres, 0));
 
             const pago = await Pago.create(
@@ -1513,6 +1576,8 @@ export const registrarPagoParcial = async ({
             }, { transaction: t });
 
             // 🔵 TOTALES del ciclo ANTES/DESPUÉS
+            // "Antes": con mora bruta (descuento visible como campo aparte)
+            // "Después": con mora neta restante
             const totalAntes = fix2(saldoAntes + interesPendiente + moraLibre);
             const totalDespues = fix2(nuevoSaldo + interesRestante + moraRestante);
 
@@ -1524,7 +1589,7 @@ export const registrarPagoParcial = async ({
                 credito,
                 medioPagoNombre: medioPago?.nombre ?? 'N/D',
                 importeOriginalCuota: cuota.importe_cuota,
-                descuentoAplicado: 0,
+                descuentoAplicado: descuentoMora,
                 moraCobrada: aMora,
                 principalPagado: aCapital,
                 saldoPrincipalAntes: saldoAntes,          // (fallback)
@@ -1533,8 +1598,8 @@ export const registrarPagoParcial = async ({
                 saldoCreditoDespues: nuevoSaldo,
                 conceptoExtra: `Pago parcial LIBRE #${credito.id}`,
                 interesCicloCobrado: aInteres,
-                saldoCuotaAnterior: totalAntes,           // ✅ total (cap + int + mora)
-                saldoCuotaActual: totalDespues,           // ✅ total
+                saldoCuotaAnterior: totalAntes,           // ✅ total (cap + int + mora bruta)
+                saldoCuotaActual: totalDespues,           // ✅ total (cap + int + mora neta restante)
                 // 🟦 NUEVO: saldo de mora restante informado
                 saldoMoraRestante: moraRestante
             }), { transaction: t });
@@ -1566,8 +1631,14 @@ export const registrarPagoParcial = async ({
         const saldoPrincipalAntes = Math.max(importeCuota - descuentoPrevio - principalPagadoPrevio, 0);
         const saldoCreditoAntes = fix2(credito.saldo_actual);
 
-        // ❗️El descuento recibido aplica SOLO a la mora vigente:
-        const descuentoMora = Math.min(Math.max(fix2(descuento), 0), fix2(moraActual));
+        // ✅ Descuento permitido SOLO sobre mora
+        // - NO-LIBRE: MONTO
+        const scope = isAdmin ? 'mora' : (String(descuento_scope || '').toLowerCase() || null);
+        const descMoraRaw = scope === 'mora'
+            ? (descuento_mora != null ? fix2(toNumber(descuento_mora)) : fix2(toNumber(descuento)))
+            : fix2(toNumber(descuento));
+
+        const descuentoMora = Math.min(Math.max(descMoraRaw, 0), fix2(moraActual));
         const moraNeta = fix2(Math.max(moraActual - descuentoMora, 0));
 
         // No alteramos descuentos sobre principal aquí
@@ -1609,7 +1680,7 @@ export const registrarPagoParcial = async ({
             const base = dateFromYMD(cuota.fecha_vencimiento);
             const delta =
                 credito.tipo_credito === 'semanal' ? 7 :
-                credito.tipo_credito === 'quincenal' ? 15 : 30;
+                    credito.tipo_credito === 'quincenal' ? 15 : 30;
             const nuevoVto = addDays(base, delta);
             cuota.fecha_vencimiento = asYMD(nuevoVto);
             if (cuota.estado === 'vencida') cuota.estado = 'pendiente';
@@ -1717,7 +1788,7 @@ export const eliminarCuota = async (id) => {
         return true;
     } catch (e) {
         if (t.finished !== 'commit') {
-            try { await t.rollback(); } catch (_) {}
+            try { await t.rollback(); } catch (_) { }
         }
         throw e;
     }

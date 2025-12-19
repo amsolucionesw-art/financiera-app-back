@@ -91,6 +91,54 @@ const addGenericSearchForCliente = (q, clienteAlias = 'cliente') => {
 };
 
 /* ──────────────────────────────────────────────────────────────
+ * Selector de rango por fecha (solo Créditos)
+ * ──────────────────────────────────────────────────────────────
+ * IMPORTANTE: basado en el modelo Credito real:
+ * - fecha_solicitud
+ * - fecha_acreditacion
+ * - fecha_compromiso_pago
+ * (no existen fecha_otorgamiento / fecha_ultima_actualizacion)
+ * ────────────────────────────────────────────────────────────── */
+
+const CREDITOS_RANGO_MAP = {
+    // valor UI -> campos BD (reales)
+    solicitud: ['fecha_solicitud'],
+    acreditacion: ['fecha_acreditacion'],
+    compromiso: ['fecha_compromiso_pago'],
+    acreditacion_compromiso: ['fecha_acreditacion', 'fecha_compromiso_pago']
+};
+
+/** Normaliza el valor del selector del front */
+const normalizeRangoFechaCredito = (v) => {
+    if (!v) return 'acreditacion_compromiso';
+    const s = String(v).trim().toLowerCase();
+
+    // permitimos algunas variantes “humanas”
+    if (s === 'solicitud' || s === 'fecha_solicitud') return 'solicitud';
+    if (s === 'acreditacion' || s === 'fecha_acreditacion') return 'acreditacion';
+    if (s === 'compromiso' || s === 'fecha_compromiso_pago') return 'compromiso';
+
+    if (s === 'acreditacion_compromiso' || s === 'acreditacion-o-compromiso' || s === 'acreditacion_compromiso_pago') {
+        return 'acreditacion_compromiso';
+    }
+
+    // Compat: si llega algo viejo que ya no existe (otorgamiento/actualizacion),
+    // caemos al comportamiento por defecto sin romper.
+    if (
+        s === 'otorgamiento' ||
+        s === 'fecha_otorgamiento' ||
+        s === 'actualizacion' ||
+        s === 'ultima_actualizacion' ||
+        s === 'fecha_ultima_actualizacion'
+    ) {
+        return 'acreditacion_compromiso';
+    }
+
+    // fallback seguro
+    return 'acreditacion_compromiso';
+};
+
+/* ──────────────────────────────────────────────────────────────
  * Servicio principal de informes
  * ────────────────────────────────────────────────────────────── */
 
@@ -154,7 +202,6 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
                 const dto = c.get({ plain: true });
                 const { creditos, cobradorUsuario, clienteZona, ...rest } = dto;
 
-                // Si onlyPend => el include ya trae filtrados. Si no, contamos todos.
                 const numeroCreditos = Array.isArray(creditos) ? creditos.length : 0;
 
                 return {
@@ -170,15 +217,19 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
         case 'creditos': {
             const onlyPend = asBool(query.conCreditosPendientes);
 
+            // Evitar que buildFilters "vea" claves no mapeadas (por si algún día itera)
+            const queryForFilters = { ...query };
+            delete queryForFilters.rangoFechaCredito;
+
             // Mapeo de filtros al esquema real
             const whereCreditoBase = {
-                ...buildFilters(query, {
-                    cobradorId:     { field: 'cobrador_id', type: 'eq' },
-                    clienteId:      { field: 'cliente_id', type: 'eq' },
-                    zonaId:         { field: '$cliente.zona$', type: 'eq' }, // via include
-                    estadoCredito:  { field: 'estado', type: 'in' },
-                    modalidad:      { field: 'modalidad_credito', type: 'in' },
-                    tipoCredito:    { field: 'tipo_credito', type: 'in' }
+                ...buildFilters(queryForFilters, {
+                    cobradorId: { field: 'cobrador_id', type: 'eq' },
+                    clienteId: { field: 'cliente_id', type: 'eq' },
+                    zonaId: { field: '$cliente.zona$', type: 'eq' }, // via include
+                    estadoCredito: { field: 'estado', type: 'in' },
+                    modalidad: { field: 'modalidad_credito', type: 'in' },
+                    tipoCredito: { field: 'tipo_credito', type: 'in' }
                 })
             };
 
@@ -187,11 +238,12 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
                 whereCreditoBase.estado = { [Op.notIn]: ['pagado', 'anulado', 'refinanciado'] };
             }
 
-            // Rango de fechas aplicado a (fecha_acreditacion OR fecha_compromiso_pago)
-            const whereRango = dateRangeWhereOr(
-                ['fecha_acreditacion', 'fecha_compromiso_pago'],
-                query
-            );
+            // ✅ Rango de fechas configurable por el usuario
+            // Default: (fecha_acreditacion OR fecha_compromiso_pago)
+            const rangoKey = normalizeRangoFechaCredito(query.rangoFechaCredito);
+            const camposRango = CREDITOS_RANGO_MAP[rangoKey] || CREDITOS_RANGO_MAP.acreditacion_compromiso;
+
+            const whereRango = dateRangeWhereOr(camposRango, query);
 
             const whereCredito = whereRango
                 ? { [Op.and]: [whereCreditoBase, whereRango] }
@@ -251,7 +303,7 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
                 ...buildFilters(query, {
                     estadoCuota: { field: 'estado', type: 'in' },
                     // si tu buildFilters soporta 'today' para YMD en TZ, se usa. Si no, quitar.
-                    hoy:         { field: 'fecha_vencimiento', type: 'today' }
+                    hoy: { field: 'fecha_vencimiento', type: 'today' }
                 }),
                 // rango por fecha de vencimiento
                 ...dateRangeWhere('fecha_vencimiento', query)

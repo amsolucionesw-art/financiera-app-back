@@ -34,6 +34,49 @@ const todayYMD = () =>
     }).format(new Date());
 
 /* ──────────────────────────────────────────────────────────────────────────
+ * Helpers descuento / modalidad
+ * ────────────────────────────────────────────────────────────────────────── */
+const toNumber = (v) => {
+    if (v === null || v === undefined) return 0;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : 0;
+};
+
+const normalizePct = (v) => {
+    const n = toNumber(v);
+    if (n <= 0) return 0;
+    // descuento en %: clamp 0..100 por seguridad
+    if (n > 100) return 100;
+    return n;
+};
+
+const getModalidadFromCuota = (cuota) => {
+    // Intentamos cubrir distintas formas de retorno del service
+    const m =
+        cuota?.Credito?.modalidad ??
+        cuota?.Credito?.modalidad_credito ??
+        cuota?.credito?.modalidad ??
+        cuota?.credito?.modalidad_credito ??
+        cuota?.credito?.tipo ??
+        null;
+
+    return m ? String(m).toLowerCase() : null;
+};
+
+const resolveModalidadByCreditoId = async (creditoId) => {
+    if (!creditoId) return null;
+    try {
+        const { default: Credito } = await import('../models/Credito.js');
+        const c = await Credito.findByPk(creditoId, { attributes: ['id', 'modalidad'] });
+        const m = c?.modalidad ? String(c.modalidad).toLowerCase() : null;
+        return m;
+    } catch {
+        // si el modelo no está en esa ruta o falla, devolvemos null
+        return null;
+    }
+};
+
+/* ──────────────────────────────────────────────────────────────────────────
  * Crear nueva cuota (Superadmin y Admin)
  * ────────────────────────────────────────────────────────────────────────── */
 router.post('/', verifyToken, checkRole([0, 1]), async (req, res) => {
@@ -65,9 +108,6 @@ router.get('/', verifyToken, checkRole([0, 1, 2]), async (_req, res) => {
 
 /* ──────────────────────────────────────────────────────────────────────────
  * NUEVO: Listar solo cuotas vencidas (para la notificación)
- * - Soporta filtros por querystring:
- *   ?clienteId=&cobradorId=&zonaId=&desde=YYYY-MM-DD&hasta=YYYY-MM-DD&minDiasVencida=#
- * - Respuesta preparada para tabla (cliente, monto, linkable por cuota_id)
  * ────────────────────────────────────────────────────────────────────────── */
 router.get('/vencidas', verifyToken, checkRole([0, 1, 2]), async (req, res) => {
     try {
@@ -81,21 +121,6 @@ router.get('/vencidas', verifyToken, checkRole([0, 1, 2]), async (req, res) => {
 
 /* ──────────────────────────────────────────────────────────────────────────
  * NUEVO: Ruta de cobro del cobrador logueado
- *
- * Objetivo:
- *  - Vencidas: todas
- *  - Pendientes "de hoy": fecha_vencimiento == hoy (TZ APP_TZ)
- *  - Filtrado por cobrador logueado (rol 2) automáticamente.
- *
- * Contrato sugerido (lo implementa el service):
- *  {
- *    items: [{ categoria: 'vencida'|'hoy', ...columnasTabla }],
- *    meta: { total, total_vencidas, total_hoy, cobrador_id, hoy }
- *  }
- *
- * NOTA IMPORTANTE:
- *  - Para evitar que el backend "crashee" si todavía no existe el export en el service,
- *    se hace import dinámico. Si falta, responde 501 con hint.
  * ────────────────────────────────────────────────────────────────────────── */
 router.get('/ruta-cobro', verifyToken, checkRole([0, 1, 2]), async (req, res) => {
     try {
@@ -217,17 +242,21 @@ router.delete('/:id', verifyToken, checkRole([0, 1]), async (req, res) => {
 
 /* ──────────────────────────────────────────────────────────────────────────
  * Pagar cuota (acepta descuento opcional)
- * - Créditos comunes/progresivos: el service cobra primero MORA del día y luego principal.
- * - Crédito "libre": el service hace LIQUIDACIÓN TOTAL (interés del/los ciclo/s SIN mora + capital),
- *   pudiendo aplicar descuento opcional (%) sobre el total si lo enviás en el body como "descuento".
- * RESPUESTA: { cuota, recibo } + campos legacy para compatibilidad
  *
- * ⚠️ Impactar pago: solo Admin (1) y Superadmin (0).
- * ⚠️ Descuento: se validará en el service para que solo rol 0 pueda aplicarlo.
+ * REGLA NUEVA:
+ * - Superadmin (0): puede aplicar descuento normal (según reglas del service)
+ * - Admin (1): SOLO puede aplicar descuento SOBRE MORA
+ *   - En créditos "libre" NO hay mora => si admin manda descuento, se rechaza (403)
+ *
+ * Nota: enviamos `descuento_scope: 'mora'` para que el service aplique el descuento
+ * únicamente a mora (blindaje definitivo en el próximo paso).
  * ────────────────────────────────────────────────────────────────────────── */
 router.put('/pagar/:id', verifyToken, checkRole([0, 1]), async (req, res) => {
     try {
-        const { forma_pago_id, descuento = 0, observacion = null } = req.body || {};
+        const rol_id = req.user?.rol_id ?? null;
+        const usuario_id = req.user?.id ?? null;
+
+        const { forma_pago_id, descuento_mora = null, descuento = 0, observacion = null } = req.body || {};
         if (!forma_pago_id) {
             return res.status(400).json({
                 success: false,
@@ -235,13 +264,37 @@ router.put('/pagar/:id', verifyToken, checkRole([0, 1]), async (req, res) => {
             });
         }
 
+        // Admin: si manda descuento, es descuento solo mora
+        let descuentoToSend = normalizePct(descuento);
+        if (rol_id === 1) {
+            descuentoToSend = normalizePct(descuento_mora !== null ? descuento_mora : descuento);
+
+            if (descuentoToSend > 0) {
+                // Bloqueo fuerte: admin no puede "descontar" en Libre (sería capital/interés)
+                const cuotaInfo = await obtenerCuotaPorId(req.params.id);
+                if (!cuotaInfo) {
+                    return res.status(404).json({ success: false, message: 'Cuota no encontrada' });
+                }
+                const modalidad = getModalidadFromCuota(cuotaInfo);
+                if (modalidad === 'libre') {
+                    return res.status(403).json({
+                        success: false,
+                        message: 'Permiso denegado: el admin solo puede aplicar descuentos sobre la mora. En créditos LIBRE no hay mora para descontar.'
+                    });
+                }
+            }
+        }
+
         const result = await pagarCuota({
             cuota_id: req.params.id,
             forma_pago_id,
-            descuento,
+            descuento: descuentoToSend,
             observacion,
-            rol_id: req.user.rol_id,      // para reglas de descuento en el service
-            usuario_id: req.user.id       // 🆕 para registrar el usuario en CajaMovimiento
+            rol_id,
+            usuario_id,
+
+            // bandera para que el service aplique el descuento SOLO a mora (admin)
+            descuento_scope: rol_id === 1 ? 'mora' : 'total'
         });
 
         // Nuevo service retorna { cuota, recibo }
@@ -276,7 +329,6 @@ router.put('/pagar/:id', verifyToken, checkRole([0, 1]), async (req, res) => {
 
 /* ──────────────────────────────────────────────────────────────────────────
  * Actualizar cuotas vencidas automáticamente
- * (El service excluye créditos "libre" y fecha ficticia 2099-12-31)
  * ────────────────────────────────────────────────────────────────────────── */
 router.put('/actualizar-vencidas', verifyToken, checkRole([0, 1, 2]), async (_req, res) => {
     try {
@@ -290,7 +342,6 @@ router.put('/actualizar-vencidas', verifyToken, checkRole([0, 1, 2]), async (_re
 
 /* ──────────────────────────────────────────────────────────────────────────
  * Recalcular mora de UNA cuota (idempotente)
- * (Para "libre" siempre queda en 0)
  * ────────────────────────────────────────────────────────────────────────── */
 router.put('/:id/recalcular-mora', verifyToken, checkRole([0, 1]), async (req, res) => {
     try {
@@ -308,11 +359,6 @@ router.put('/:id/recalcular-mora', verifyToken, checkRole([0, 1]), async (req, r
 
 /* ──────────────────────────────────────────────────────────────────────────
  * Recalcular mora por lote (idempotente)
- * Body admite:
- *   - { credito_id }
- *   - { cuota_ids: [..] }
- *   - { todas_vencidas: true }
- * (En "libre" la mora es 0)
  * ────────────────────────────────────────────────────────────────────────── */
 router.post('/recalcular-mora', verifyToken, checkRole([0, 1]), async (req, res) => {
     try {
@@ -382,19 +428,57 @@ router.get('/credito/:creditoId', verifyToken, checkRole([0, 1, 2]), async (req,
 
 /* ──────────────────────────────────────────────────────────────────────────
  * Registrar pago parcial (acepta descuento opcional en body)
- * - En "libre": primero interés del/los ciclo/s transcurridos, luego capital.
- * - En común/progresivo: primero mora, luego principal.
  *
- * ⚠️ Impactar pago: solo Admin (1) y Superadmin (0).
- * ⚠️ Descuento: se validará en el service para que solo rol 0 pueda aplicarlo.
+ * REGLA NUEVA:
+ * - Superadmin (0): descuento normal
+ * - Admin (1): SOLO descuento sobre mora
+ *   - Si podemos determinar que es crédito LIBRE y admin manda descuento => 403
+ *
+ * Enviamos `descuento_scope` para que el service aplique el descuento únicamente a mora.
  * ────────────────────────────────────────────────────────────────────────── */
 router.post('/pago-parcial', verifyToken, checkRole([0, 1]), async (req, res) => {
     try {
+        const rol_id = req.user?.rol_id ?? null;
+        const usuario_id = req.user?.id ?? null;
+
+        // Permitimos nuevo campo descuento_mora, manteniendo compatibilidad con descuento
+        const descuentoIncoming = (req.body?.descuento_mora !== undefined && req.body?.descuento_mora !== null)
+            ? req.body.descuento_mora
+            : req.body?.descuento;
+
+        const descuentoToSend = normalizePct(descuentoIncoming);
+
+        if (rol_id === 1 && descuentoToSend > 0) {
+            // Best-effort: intentar detectar libre para bloquear
+            const cuotaId = req.body?.cuota_id ?? req.body?.cuotaId ?? null;
+            const creditoId = req.body?.credito_id ?? req.body?.creditoId ?? null;
+
+            let modalidad = null;
+
+            if (cuotaId) {
+                const cuotaInfo = await obtenerCuotaPorId(cuotaId);
+                modalidad = cuotaInfo ? getModalidadFromCuota(cuotaInfo) : null;
+            } else if (creditoId) {
+                modalidad = await resolveModalidadByCreditoId(creditoId);
+            }
+
+            if (modalidad === 'libre') {
+                return res.status(403).json({
+                    success: false,
+                    message: 'Permiso denegado: el admin solo puede aplicar descuentos sobre la mora. En créditos LIBRE no hay mora para descontar.'
+                });
+            }
+        }
+
         const data = await registrarPagoParcial({
             ...req.body,
-            rol_id: req.user.rol_id,   // reglas de descuento en el service
-            usuario_id: req.user.id    // 🆕 registrar usuario en CajaMovimiento
+            // sobreescribimos descuento con el normalizado (por compatibilidad)
+            descuento: descuentoToSend,
+            rol_id,
+            usuario_id,
+            descuento_scope: rol_id === 1 ? 'mora' : 'total'
         });
+
         res.status(200).json({
             success: true,
             message: 'Pago parcial registrado exitosamente',

@@ -25,8 +25,8 @@ const mapErrorToStatus = (err) => {
     return 500;                                          // desconocido
 };
 
-// GET - Todas las zonas
-router.get('/', verifyToken, async (_req, res) => {
+// GET - Todas las zonas (solo superadmin/admin -> lectura)
+router.get('/', verifyToken, checkRole([0, 1]), async (_req, res) => {
     try {
         const zonas = await obtenerZonas();
         res.json({ success: true, data: zonas });
@@ -36,8 +36,8 @@ router.get('/', verifyToken, async (_req, res) => {
     }
 });
 
-// GET - Zona por ID
-router.get('/:id', verifyToken, async (req, res) => {
+// GET - Zona por ID (solo superadmin/admin -> lectura)
+router.get('/:id', verifyToken, checkRole([0, 1]), async (req, res) => {
     try {
         const id = parseId(req.params.id);
         if (!id) {
@@ -56,8 +56,8 @@ router.get('/:id', verifyToken, async (req, res) => {
     }
 });
 
-// POST - Crear zona
-router.post('/', verifyToken, checkRole([0, 1]), async (req, res) => {
+// POST - Crear zona (solo superadmin)
+router.post('/', verifyToken, checkRole([0]), async (req, res) => {
     try {
         const id = await crearZona(req.body);
         res.status(201).json({ success: true, message: 'Zona creada exitosamente', data: { id } });
@@ -68,8 +68,8 @@ router.post('/', verifyToken, checkRole([0, 1]), async (req, res) => {
     }
 });
 
-// PUT - Actualizar zona
-router.put('/:id', verifyToken, checkRole([0, 1]), async (req, res) => {
+// PUT - Actualizar zona (solo superadmin)
+router.put('/:id', verifyToken, checkRole([0]), async (req, res) => {
     try {
         const id = parseId(req.params.id);
         if (!id) {
@@ -91,7 +91,7 @@ router.put('/:id', verifyToken, checkRole([0, 1]), async (req, res) => {
     }
 });
 
-// DELETE - Eliminar zona (solo si no tiene clientes)
+// DELETE - Eliminar zona (solo si no tiene clientes) (solo superadmin)
 router.delete('/:id', verifyToken, checkRole([0]), async (req, res) => {
     try {
         const id = parseId(req.params.id);

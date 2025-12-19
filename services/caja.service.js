@@ -134,6 +134,15 @@ const addDays = (ymd, days) => {
     return asYMD(date.toISOString());
 };
 
+const diffDaysInclusive = (desde, hasta) => {
+    if (!desde || !hasta) return 0;
+    const a = new Date(`${desde}T00:00:00Z`);
+    const b = new Date(`${hasta}T00:00:00Z`);
+    if (Number.isNaN(a.getTime()) || Number.isNaN(b.getTime())) return 0;
+    const ms = b.getTime() - a.getTime();
+    return Math.floor(ms / (24 * 60 * 60 * 1000)) + 1;
+};
+
 const TIPOS_VALIDOS = new Set(['ingreso', 'egreso', 'ajuste', 'apertura', 'cierre']);
 
 /** Si el rango está invertido, lo corrige */
@@ -144,6 +153,197 @@ const ensureRange = (desde, hasta) => {
         if (a > b) return [hasta, desde];
     }
     return [desde, hasta];
+};
+
+/**
+ * Construye WHERE para movimientos con los mismos filtros que usa el historial.
+ * Mantiene el default "últimos 3 días" si no mandan fechas (comportamiento actual).
+ */
+const buildWhereMovimientos = (query = {}, { defaultLastDays = true } = {}) => {
+    const {
+        desde,
+        hasta,
+        tipo,
+        forma_pago_id,
+        referencia_tipo,
+        referencia_id,
+        q,
+    } = query || {};
+
+    const where = {};
+
+    // Rango de fechas
+    let d = asYMD(desde);
+    let h = asYMD(hasta);
+
+    // 🔧 DEFAULT: últimos 3 días (solo si no se enviaron filtros de fecha)
+    if (!d && !h && defaultLastDays) {
+        h = nowYMD();
+        d = addDays(h, -2);
+    }
+
+    [d, h] = ensureRange(d, h);
+
+    if (d && h) where.fecha = { [Op.between]: [d, h] };
+    else if (d) where.fecha = { [Op.gte]: d };
+    else if (h) where.fecha = { [Op.lte]: h };
+
+    // Tipos
+    if (tipo) {
+        const tipos = Array.isArray(tipo)
+            ? tipo.map((s) => String(s).trim().toLowerCase())
+            : String(tipo)
+                  .split(',')
+                  .map((s) => s.trim().toLowerCase());
+        const validos = tipos.filter((t) => TIPOS_VALIDOS.has(t));
+        if (validos.length) where.tipo = { [Op.in]: validos };
+    }
+
+    // Forma de pago
+    if (typeof forma_pago_id !== 'undefined') {
+        const val = String(forma_pago_id).toLowerCase();
+        if (val === 'null' || val === 'none') {
+            where.forma_pago_id = { [Op.is]: null };
+        } else {
+            const num = Number(forma_pago_id);
+            if (Number.isFinite(num)) where.forma_pago_id = num;
+        }
+    }
+
+    // referencia_tipo
+    if (typeof referencia_tipo !== 'undefined') {
+        if (Array.isArray(referencia_tipo)) {
+            const vals = referencia_tipo
+                .map((s) => String(s).trim().toLowerCase())
+                .filter(Boolean);
+            if (vals.length === 1 && (vals[0] === 'null' || vals[0] === 'none')) {
+                where.referencia_tipo = { [Op.is]: null };
+            } else if (vals.length) {
+                const hasNull = vals.includes('null') || vals.includes('none');
+                where[Op.and] = where[Op.and] || [];
+                if (hasNull) {
+                    const onlyVals = vals.filter((v) => v !== 'null' && v !== 'none');
+                    const or = [];
+                    if (onlyVals.length) or.push({ referencia_tipo: { [Op.in]: onlyVals } });
+                    or.push({ referencia_tipo: { [Op.is]: null } });
+                    where[Op.and].push({ [Op.or]: or });
+                } else {
+                    where.referencia_tipo = { [Op.in]: vals };
+                }
+            }
+        } else if (typeof referencia_tipo === 'string') {
+            const raw = referencia_tipo.trim().toLowerCase();
+            if (raw === 'null' || raw === 'none') {
+                where.referencia_tipo = { [Op.is]: null };
+            } else {
+                const vals = raw
+                    .split(',')
+                    .map((s) => s.trim())
+                    .filter(Boolean);
+                if (vals.length) where.referencia_tipo = { [Op.in]: vals };
+            }
+        }
+    }
+
+    // referencia_id
+    if (typeof referencia_id !== 'undefined') {
+        if (Array.isArray(referencia_id)) {
+            const nums = referencia_id.map((n) => Number(n)).filter(Number.isFinite);
+            if (nums.length) where.referencia_id = { [Op.in]: nums };
+        } else {
+            const num = Number(referencia_id);
+            if (Number.isFinite(num)) where.referencia_id = num;
+        }
+    }
+
+    // concepto
+    if (q && String(q).trim() !== '') {
+        where.concepto = { [Op.iLike]: `%${String(q).trim()}%` };
+    }
+
+    return { where, desde: d, hasta: h };
+};
+
+/* ───────────────── Helpers (Venta financiada) ───────────────── */
+const isVentaFinanciada = (venta) => {
+    const capital = sanitizeNumber(venta?.capital);
+    const cuotas = Number(venta?.cuotas || 1);
+    return capital > 0 && cuotas > 1;
+};
+
+const buildConceptoFinanciacion = (conceptoVenta, venta_id) => {
+    const base = String(conceptoVenta || `Venta #${venta_id}`).trim() || `Venta #${venta_id}`;
+    return String(`Financiación - ${base}`).slice(0, 255);
+};
+
+const syncEgresoFinanciacionVenta = async (
+    {
+        venta_id,
+        fecha_imputacion = null,
+        usuario_id = null,
+        conceptoVenta = null,
+    },
+    options = {},
+) => {
+    const { transaction } = options;
+
+    if (!venta_id) return;
+
+    const venta = await VentaManual.findByPk(venta_id, { transaction });
+    if (!venta) return;
+
+    const financiada = isVentaFinanciada(venta);
+    const capital = fix2(sanitizeNumber(venta.capital));
+    const fechaFinal = asYMD(fecha_imputacion || venta.fecha_imputacion) || nowYMD();
+    const conceptoFinal = buildConceptoFinanciacion(conceptoVenta, venta_id);
+
+    const movEgreso = await CajaMovimiento.findOne({
+        where: {
+            tipo: 'egreso',
+            referencia_tipo: 'venta',
+            referencia_id: venta_id,
+        },
+        transaction,
+    });
+
+    if (!financiada || !(capital > 0)) {
+        // Si dejó de ser financiada, limpiamos cualquier egreso previo (idempotente)
+        if (movEgreso) {
+            await movEgreso.destroy({ transaction });
+        }
+        return;
+    }
+
+    if (movEgreso) {
+        await movEgreso.update(
+            {
+                fecha: fechaFinal,
+                // dejamos la hora tal cual (histórico) salvo que esté vacía
+                hora: movEgreso.hora || nowHMS(),
+                monto: capital,
+                forma_pago_id: null, // egreso de financiación (no es una forma de cobro)
+                concepto: conceptoFinal,
+                usuario_id: movEgreso.usuario_id ?? usuario_id ?? null,
+            },
+            { transaction },
+        );
+        return;
+    }
+
+    await CajaMovimiento.create(
+        {
+            fecha: fechaFinal,
+            hora: nowHMS(),
+            tipo: 'egreso',
+            monto: capital,
+            forma_pago_id: null,
+            concepto: conceptoFinal,
+            referencia_tipo: 'venta',
+            referencia_id: venta_id,
+            usuario_id: usuario_id ?? null,
+        },
+        { transaction },
+    );
 };
 
 /* ───────────────── CRUD ───────────────── */
@@ -227,6 +427,16 @@ export const crearMovimiento = async (req, res) => {
             });
         }
 
+        // ✅ NUEVO: Admin SOLO puede APERTURA y CIERRE en movimientos manuales
+        if (esAdmin && !esSuperadmin) {
+            if (tipoNorm !== 'apertura' && tipoNorm !== 'cierre') {
+                return res.status(403).json({
+                    success: false,
+                    message: 'Como ADMIN solo puede registrar movimientos manuales de APERTURA y CIERRE de caja.',
+                });
+            }
+        }
+
         const registro = await CajaMovimiento.create({
             fecha: asYMD(fecha) || nowYMD(),
             hora: hora || nowHMS(),
@@ -254,107 +464,11 @@ export const crearMovimiento = async (req, res) => {
 export const obtenerMovimientos = async (req, res) => {
     try {
         const {
-            desde,
-            hasta,
-            tipo,
-            forma_pago_id,
-            referencia_tipo,
-            referencia_id,
-            q,
             page = 1,
             limit = 50,
         } = req.query || {};
 
-        const where = {};
-
-        // Rango de fechas
-        let d = asYMD(desde);
-        let h = asYMD(hasta);
-
-        // 🔧 DEFAULT: últimos 3 días (solo si no se enviaron filtros de fecha)
-        if (!d && !h) {
-            h = nowYMD();
-            d = addDays(h, -2);
-        }
-
-        [d, h] = ensureRange(d, h);
-        if (d && h) where.fecha = { [Op.between]: [d, h] };
-        else if (d) where.fecha = { [Op.gte]: d };
-        else if (h) where.fecha = { [Op.lte]: h };
-
-        // Tipos
-        if (tipo) {
-            const tipos = Array.isArray(tipo)
-                ? tipo.map((s) => String(s).trim().toLowerCase())
-                : String(tipo)
-                    .split(',')
-                    .map((s) => s.trim().toLowerCase());
-            const validos = tipos.filter((t) => TIPOS_VALIDOS.has(t));
-            if (validos.length) where.tipo = { [Op.in]: validos };
-        }
-
-        // Forma de pago
-        if (typeof forma_pago_id !== 'undefined') {
-            const val = String(forma_pago_id).toLowerCase();
-            if (val === 'null' || val === 'none') {
-                where.forma_pago_id = { [Op.is]: null };
-            } else {
-                const num = Number(forma_pago_id);
-                if (Number.isFinite(num)) where.forma_pago_id = num;
-            }
-        }
-
-        // referencia_tipo
-        if (typeof referencia_tipo !== 'undefined') {
-            if (Array.isArray(referencia_tipo)) {
-                const vals = referencia_tipo
-                    .map((s) => String(s).trim().toLowerCase())
-                    .filter(Boolean);
-                if (vals.length === 1 && (vals[0] === 'null' || vals[0] === 'none')) {
-                    where.referencia_tipo = { [Op.is]: null };
-                } else if (vals.length) {
-                    const hasNull = vals.includes('null') || vals.includes('none');
-                    where[Op.and] = where[Op.and] || [];
-                    if (hasNull) {
-                        const onlyVals = vals.filter((v) => v !== 'null' && v !== 'none');
-                        const or = [];
-                        if (onlyVals.length)
-                            or.push({ referencia_tipo: { [Op.in]: onlyVals } });
-                        or.push({ referencia_tipo: { [Op.is]: null } });
-                        where[Op.and].push({ [Op.or]: or });
-                    } else {
-                        where.referencia_tipo = { [Op.in]: vals };
-                    }
-                }
-            } else if (typeof referencia_tipo === 'string') {
-                const raw = referencia_tipo.trim().toLowerCase();
-                if (raw === 'null' || raw === 'none') {
-                    where.referencia_tipo = { [Op.is]: null };
-                } else {
-                    const vals = raw
-                        .split(',')
-                        .map((s) => s.trim())
-                        .filter(Boolean);
-                    if (vals.length) where.referencia_tipo = { [Op.in]: vals };
-                }
-            }
-        }
-
-        // referencia_id
-        if (typeof referencia_id !== 'undefined') {
-            if (Array.isArray(referencia_id)) {
-                const nums = referencia_id.map((n) => Number(n)).filter(Number.isFinite);
-                if (nums.length) where.referencia_id = { [Op.in]: nums };
-            } else {
-                const num = Number(referencia_id);
-                if (Number.isFinite(num)) where.referencia_id = num;
-            }
-        }
-
-        // concepto
-        if (q && String(q).trim() !== '') {
-            where.concepto = { [Op.iLike]: `%${String(q).trim()}%` };
-        }
+        const { where } = buildWhereMovimientos(req.query, { defaultLastDays: true });
 
         const pageNum = Math.max(1, Number(page) || 1);
         const limitNum = Math.min(200, Math.max(1, Number(limit) || 50));
@@ -453,6 +567,127 @@ export const obtenerMovimientos = async (req, res) => {
         res.status(500).json({
             success: false,
             message: 'Error al listar movimientos',
+            error: err?.message,
+        });
+    }
+};
+
+/* ───────────────── Exportación XLSX (MOVIMIENTOS / Historial) ───────────────── */
+/**
+ * Exporta exactamente el historial (movimientos) aplicando los mismos filtros que /caja/movimientos.
+ * Sugerido: GET /caja/movimientos/export/excel?desde=YYYY-MM-DD&hasta=YYYY-MM-DD&tipo=...&q=...
+ */
+export const exportarMovimientosExcel = async (req, res) => {
+    try {
+        const { where, desde, hasta } = buildWhereMovimientos(req.query, { defaultLastDays: true });
+
+        // Guardrail anti “me exporté 10 años y se cayó el server”
+        if (desde && hasta) {
+            const dias = diffDaysInclusive(desde, hasta);
+            if (dias > 370) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'El rango es demasiado grande para exportar. Reduzca el período (máx. 370 días).',
+                });
+            }
+        }
+
+        const rows = await CajaMovimiento.findAll({
+            where,
+            include: [
+                { model: FormaPago, as: 'formaPago', attributes: ['id', 'nombre'] },
+                { model: Usuario, as: 'usuario', attributes: ['id', 'nombre_completo', 'nombre_usuario'] },
+            ],
+            order: [
+                ['fecha', 'DESC'],
+                ['hora', 'DESC'],
+                ['id', 'DESC'],
+            ],
+        });
+
+        const plainRows = rows.map((r) => {
+            const p = r.get({ plain: true });
+            p.monto = fix2(p.monto);
+            return p;
+        });
+
+        // Venta financiada (misma lógica que listado)
+        const ventaIds = [
+            ...new Set(
+                plainRows
+                    .filter((p) => p.referencia_tipo === 'venta' && p.referencia_id != null)
+                    .map((p) => p.referencia_id)
+            ),
+        ];
+
+        let mapVentaFinanciada = new Map();
+        if (ventaIds.length > 0) {
+            const ventas = await VentaManual.findAll({
+                where: { id: { [Op.in]: ventaIds } },
+                attributes: ['id', 'capital', 'cuotas'],
+                raw: true,
+            });
+
+            mapVentaFinanciada = new Map(
+                ventas.map((v) => {
+                    const capital = sanitizeNumber(v.capital);
+                    const cuotas = Number(v.cuotas || 1);
+                    const esFinanciada = capital > 0 && cuotas > 1;
+                    return [v.id, esFinanciada];
+                })
+            );
+        }
+
+        const sheet = plainRows.map((p) => {
+            const esVentaFinanciada =
+                p.referencia_tipo === 'venta' && mapVentaFinanciada.get(p.referencia_id) === true;
+
+            const fpNombre = esVentaFinanciada
+                ? 'FINANCIADA'
+                : (p.formaPago?.nombre ?? (p.forma_pago_id == null ? 'Sin especificar' : `FP #${p.forma_pago_id}`));
+
+            const usuarioNombre =
+                p.usuario?.nombre_completo ||
+                p.usuario?.nombre_usuario ||
+                (p.usuario_id != null ? `Usuario #${p.usuario_id}` : '');
+
+            return {
+                ID: p.id,
+                FECHA: p.fecha,
+                HORA: p.hora || '',
+                TIPO: p.tipo || '',
+                MONTO: Number(p.monto || 0),
+                'FORMA DE PAGO': fpNombre,
+                CONCEPTO: p.concepto || '',
+                'REF TIPO': p.referencia_tipo ?? '',
+                'REF ID': p.referencia_id ?? '',
+                USUARIO: usuarioNombre,
+                'VENTA FINANCIADA': esVentaFinanciada ? 'SI' : 'NO',
+            };
+        });
+
+        const wb = XLSX.utils.book_new();
+        const ws = XLSX.utils.json_to_sheet(sheet);
+        XLSX.utils.book_append_sheet(wb, ws, 'MOVIMIENTOS');
+
+        const buffer = XLSX.write(wb, { bookType: 'xlsx', type: 'buffer' });
+
+        const d = desde || asYMD(req.query?.desde) || '';
+        const h = hasta || asYMD(req.query?.hasta) || '';
+        const rangoTxt = d && h ? `${d}_a_${h}` : (d || h || 'rango');
+        const fname = `historial_caja_${rangoTxt}.xlsx`;
+
+        res.setHeader(
+            'Content-Type',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        );
+        res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
+        res.send(buffer);
+    } catch (err) {
+        console.error('[exportarMovimientosExcel]', err);
+        res.status(500).json({
+            success: false,
+            message: 'Error al exportar historial de movimientos a Excel',
             error: err?.message,
         });
     }
@@ -1103,8 +1338,17 @@ export const registrarIngresoDesdeVentaManual = async (
         },
         transaction,
     });
-    if (exists)
+    if (exists) {
+        // 🔄 Asegura egreso por financiación si corresponde (idempotente)
+        try {
+            await syncEgresoFinanciacionVenta(
+                { venta_id, fecha_imputacion: fechaFinal, usuario_id, conceptoVenta: conceptoFinal },
+                { transaction },
+            );
+        } catch (_) { /* no romper flujo por sync */ }
+
         return { ...exists.get({ plain: true }), monto: fix2(exists.monto) };
+    }
 
     const creado = await CajaMovimiento.create(
         {
@@ -1120,6 +1364,14 @@ export const registrarIngresoDesdeVentaManual = async (
         },
         { transaction },
     );
+
+    // ✅ NUEVO: egreso por financiación (si venta financiada)
+    try {
+        await syncEgresoFinanciacionVenta(
+            { venta_id, fecha_imputacion: fechaFinal, usuario_id, conceptoVenta: conceptoFinal },
+            { transaction },
+        );
+    } catch (_) { /* no romper flujo por sync */ }
 
     return { ...creado.get({ plain: true }), monto: fix2(creado.monto) };
 };
@@ -1148,7 +1400,22 @@ export const actualizarMovimientoDesdeVentaManual = async (
     if (concepto) updates.concepto = String(concepto).slice(0, 255);
 
     await mov.update(updates, { transaction });
+
     const plain = mov.get({ plain: true });
+
+    // ✅ NUEVO: sincroniza egreso de financiación según estado actual de la venta (capital/cuotas)
+    try {
+        await syncEgresoFinanciacionVenta(
+            {
+                venta_id,
+                fecha_imputacion: updates.fecha || plain.fecha,
+                usuario_id: plain.usuario_id ?? null,
+                conceptoVenta: updates.concepto || plain.concepto,
+            },
+            { transaction },
+        );
+    } catch (_) { /* no romper flujo por sync */ }
+
     return { ...plain, monto: fix2(plain.monto) };
 };
 
@@ -1183,14 +1450,17 @@ export const eliminarMovimientoDesdeVentaManual = async (
     options = {},
 ) => {
     const { transaction } = options;
+
+    // ✅ NUEVO: elimina ingreso y egreso de financiación si existiera (idempotente)
     const deleted = await CajaMovimiento.destroy({
         where: {
-            tipo: 'ingreso',
             referencia_tipo: 'venta',
             referencia_id: venta_id,
+            tipo: { [Op.in]: ['ingreso', 'egreso'] },
         },
         transaction,
     });
+
     return deleted;
 };
 

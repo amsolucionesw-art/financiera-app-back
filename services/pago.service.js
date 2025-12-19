@@ -15,9 +15,17 @@ import { differenceInCalendarMonths } from 'date-fns';
     - pagarCuota(...)  (pago total)
   Este archivo no duplica ese asiento para evitar doble contabilización.
 
-  ⚠️ IMPORTANTE: desde aquí AHORA también pasamos:
-    - usuario_id  (tomado de req.user)
-    - rol_id      (para control de descuentos en el service de cuotas)
+  ✅ DESCUENTOS (regla del negocio):
+  - Admin (rol 1): SOLO puede aplicar descuentos sobre la MORA.
+  - Superadmin (rol 0): idem, pero con permisos completos en el sistema.
+  - Importante: el "blindaje real" está en cuota.service.js, donde el descuento
+    se aplica únicamente contra la mora (NO toca capital).
+
+  ⚠️ OJO:
+  - cuota.service.js actualmente consume el campo "descuento".
+  - Por eso, si queremos que el admin pueda descontar mora, debemos pasar
+    el descuento por "descuento" (no por descuento_mora), pero garantizando
+    que su uso sea mora-only (lo hace cuota.service.js).
 */
 
 /* ───────────────── Constantes ───────────────── */
@@ -89,17 +97,12 @@ const esReciboLibre = (recibo = {}) => {
 
 /**
  * Mapea el modelo Recibo (numérico) a un objeto de presentación para UI.
- * Reglas principales:
- *  - SIEMPRE: saldo_anterior, pago, saldo_actual, mora_cobrada, descuento_aplicado (e importe_cuota_original si viene).
- *  - SOLO LIBRE: principal_pagado, interes_ciclo_cobrado, saldo_credito_anterior/actual.
- *  - Formateo ARS en todo, con excepción visual ya contemplada por el formateo ($0,00 cuando corresponde).
  */
 const buildReciboUI = (recibo) => {
     if (!recibo) return null;
 
     const libre = esReciboLibre(recibo);
 
-    // Campos numéricos (según armarDatosRecibo en cuota.service.js)
     const {
         numero_recibo,
         fecha,
@@ -108,7 +111,7 @@ const buildReciboUI = (recibo) => {
         concepto,
         medio_pago,
         nombre_cobrador,
-        modalidad_credito, // si viene, lo reenviamos tal cual
+        modalidad_credito,
 
         // desglose
         importe_cuota_original,
@@ -123,12 +126,11 @@ const buildReciboUI = (recibo) => {
         saldo_anterior,
         saldo_actual,
 
-        // Saldos de capital del crédito (solo tienen sentido en LIBRE)
+        // Saldos de capital del crédito (solo LIBRE)
         saldo_credito_anterior,
         saldo_credito_actual
     } = recibo;
 
-    // Armado base (común a todas las modalidades)
     const uiBase = {
         numero_recibo: numero_recibo ?? null,
         fecha: formatYMDToDMY(fecha),
@@ -137,17 +139,14 @@ const buildReciboUI = (recibo) => {
         cobrador: nombre_cobrador || '',
         medio_pago: medio_pago || '',
         concepto: concepto || '',
-        modalidad_credito: modalidad_credito || undefined, // display opcional
+        modalidad_credito: modalidad_credito || undefined,
 
-        // Totales/montos (mostramos ambos para evitar ambigüedad)
         monto_pagado: formatARS(monto_pagado ?? pago_a_cuenta ?? 0),
         pago_a_cuenta: formatARS(pago_a_cuenta ?? monto_pagado ?? 0),
 
-        // Saldos (monetarios siempre)
         saldo_anterior: formatARS(saldo_anterior),
         saldo_actual: formatARS(saldo_actual),
 
-        // Desglose base SIEMPRE visible
         importe_cuota_original:
             importe_cuota_original !== undefined ? formatARS(importe_cuota_original) : undefined,
         descuento_aplicado:
@@ -157,15 +156,9 @@ const buildReciboUI = (recibo) => {
     };
 
     if (!libre) {
-        // ── NO LIBRE → ocultamos capital/interés de ciclo y saldos de capital del crédito
-        return {
-            ...uiBase
-            // explícitamente NO incluimos:
-            // principal_pagado, interes_ciclo_cobrado, saldo_credito_anterior, saldo_credito_actual
-        };
+        return { ...uiBase };
     }
 
-    // ── LIBRE → agregamos lo específico del ciclo y saldos de capital (si llegaron)
     return {
         ...uiBase,
         principal_pagado: principal_pagado !== undefined ? formatARS(principal_pagado) : undefined,
@@ -179,10 +172,7 @@ const buildReciboUI = (recibo) => {
 };
 
 /**
- * Determina el ciclo actual del crédito LIBRE:
- *  - ciclo 1: mes 0 desde fecha_acreditacion
- *  - ciclo 2: mes 1
- *  - ciclo 3: mes 2
+ * Determina el ciclo actual del crédito LIBRE
  */
 const cicloLibreActual = (fechaAcreditacion) => {
     if (!fechaAcreditacion) return 1;
@@ -192,34 +182,92 @@ const cicloLibreActual = (fechaAcreditacion) => {
     return Math.min(LIBRE_MAX_CICLOS, diffMeses + 1);
 };
 
+const getModalidadCredito = (credito) => {
+    const m =
+        credito?.modalidad_credito ??
+        credito?.modalidad ??
+        credito?.tipo ??
+        '';
+    return String(m).toLowerCase();
+};
+
+/* ───────────────── Helpers permisos/discount ───────────────── */
+
+/**
+ * Devuelve el descuento "final" a enviar al cuota.service.js.
+ * Regla:
+ * - rol 1 (admin): descuento SOLO sobre mora.
+ *   -> usamos descuento_mora si viene, sino descuento legacy.
+ * - otros: usamos descuento legacy (y si viene descuento_mora, se puede priorizar si querés).
+ *
+ * IMPORTANTE:
+ * - cuota.service.js ya aplica el descuento únicamente contra la mora.
+ * - En LIBRE, cuota.service interpreta descuento como PORCENTAJE (0-100) sobre la mora.
+ * - En NO-LIBRE, cuota.service interpreta descuento como MONTO sobre la mora.
+ */
+const resolveDescuentoParaCuotaService = ({ rolId, descuentoLegacy, descuentoMora }) => {
+    const dl = sanitizeNumber(descuentoLegacy);
+    const dm = sanitizeNumber(descuentoMora);
+
+    if (dl < 0 || dm < 0) {
+        const err = new Error('descuento no puede ser negativo.');
+        err.status = 400;
+        throw err;
+    }
+
+    if (rolId === 1) {
+        // Admin: solo mora -> priorizo descuento_mora si existe, sino descuento legacy
+        return dm > 0 ? dm : dl;
+    }
+
+    // Superadmin/otros: por compatibilidad, dejo legacy como principal
+    // (si el front manda descuento_mora específicamente, también lo acepto)
+    return dl > 0 ? dl : dm;
+};
+
 /* ───────────────── Registrar PAGO PARCIAL ───────────────── */
 /**
  * Registrar PAGO PARCIAL de una cuota.
- * Body: { cuota_id, monto_pagado, forma_pago_id, observacion?, descuento?, modo? }
- *  - modo (sólo LIBRE):
- *      - "solo_interes": mes 1 o 2 permite pagar sólo INTERÉS del ciclo (mes 3 → RECHAZA).
- *      - "interes_y_capital" (o ausente): primero interés del ciclo, sobrante a capital.
+ * Body: { cuota_id, monto_pagado, forma_pago_id, observacion?, descuento?, descuento_mora?, modo? }
  *
- *  - común/progresivo: sin cambios (primero mora, luego principal; descuento = MONTO sobre principal).
- *
- * Respuesta: { success, message, cuota, recibo, recibo_ui }
+ * REGLA:
+ * - Admin (rol 1): puede aplicar descuento SOLO sobre mora (en cualquier modalidad).
+ *   * En LIBRE: si no hay mora (no está vencido), el descuento simplemente no tendrá efecto.
+ * - Superadmin: igual, pero sin limitaciones extra de UI.
  */
 export const registrarPago = async (req, res) => {
     try {
-        let { cuota_id, monto_pagado, forma_pago_id, observacion, descuento = 0, modo } = req.body ?? {};
+        let {
+            cuota_id,
+            monto_pagado,
+            forma_pago_id,
+            observacion,
+            descuento = 0,
+            descuento_mora = null,
+            modo
+        } = req.body ?? {};
 
-        // 🔐 Tomamos usuario y rol desde el token (para Caja y control de descuentos)
+        // 🔐 usuario y rol desde token
         const usuarioId =
             req.user?.id ??
             req.user?.usuario_id ??
             req.user?.userId ??
             null;
+
         const rolIdRaw = req.user?.rol_id ?? req.user?.rol ?? null;
         const rolId = typeof rolIdRaw === 'number' ? rolIdRaw : toIntOrNull(rolIdRaw);
 
-        // Validaciones mínimas
+        // Defensa: si alguna ruta quedara abierta por error
+        if (rolId === 2) {
+            return res.status(403).json({
+                success: false,
+                error: 'Permiso denegado: un cobrador no puede registrar pagos desde este endpoint.'
+            });
+        }
+
         const cuotaIdInt = toIntOrNull(cuota_id);
         const formaPagoIdInt = toIntOrNull(forma_pago_id);
+
         if (!cuotaIdInt || !formaPagoIdInt || monto_pagado == null) {
             return res.status(400).json({
                 success: false,
@@ -227,24 +275,15 @@ export const registrarPago = async (req, res) => {
             });
         }
 
-        // Sanitizo numéricos (admite "1.234,56")
         monto_pagado = sanitizeNumber(monto_pagado);
-        descuento = sanitizeNumber(descuento);
-
         if (!(monto_pagado > 0)) {
             return res.status(400).json({
                 success: false,
                 error: 'monto_pagado debe ser un número mayor a 0.'
             });
         }
-        if (descuento < 0) {
-            return res.status(400).json({
-                success: false,
-                error: 'descuento no puede ser negativo.'
-            });
-        }
 
-        // Traigo cuota + crédito (para detectar modalidad y ciclo en LIBRE)
+        // Traigo cuota + crédito (para reglas de LIBRE)
         const cuota = await Cuota.findByPk(cuotaIdInt, {
             include: [{ model: Credito, as: 'credito' }]
         });
@@ -253,11 +292,12 @@ export const registrarPago = async (req, res) => {
         }
 
         const credito = cuota.credito;
-        const esLibre = String(credito.modalidad_credito) === 'libre';
+        const modalidad = getModalidadCredito(credito);
+        const esLibre = modalidad === 'libre';
 
+        // Reglas de LIBRE (pago parcial permitido solo en ciclo 1-2)
         if (esLibre) {
             const ciclo = cicloLibreActual(credito.fecha_acreditacion || credito.fecha_compromiso_pago);
-            // En mes 3 NO se admite pago parcial → debe usarse pago total (cancelación)
             if (ciclo >= 3) {
                 return res.status(400).json({
                     success: false,
@@ -265,38 +305,39 @@ export const registrarPago = async (req, res) => {
                 });
             }
 
-            // Si el usuario pide "solo_interes": recorto el pago al interés pendiente del ciclo
             if (modo === 'solo_interes') {
                 let interesPendienteHoy = null;
 
-                // Intento obtener el resumen de libre desde cuota.service (si no existe, fallback)
                 try {
                     const resumen = await obtenerResumenLibrePorCredito(credito.id, new Date());
-                    // Se espera algo como { interes_pendiente_hoy, ... }
                     interesPendienteHoy = sanitizeNumber(resumen?.interes_pendiente_hoy);
                 } catch (_) {
-                    // Fallback: interés aprox = saldo_actual * tasa_mes
                     const tasaPct = normalizePercent(credito.interes, 60);
                     interesPendienteHoy = sanitizeNumber(credito.saldo_actual) * percentToDecimal(tasaPct);
                 }
 
                 if (Number.isFinite(interesPendienteHoy) && interesPendienteHoy > 0) {
-                    // Pago solo por interés del ciclo (capo el monto al interés)
                     monto_pagado = Math.min(monto_pagado, interesPendienteHoy);
                 }
-                // Si no se pudo calcular, dejamos que cuota.service asigne el reparto.
             }
-            // modo "interes_y_capital" (o ausente) → sin cambios: cuota.service prioriza interés del ciclo y luego capital.
         }
 
-        // Ahora retorna { cuota, recibo }
+        // ✅ Descuento final (admin: solo mora)
+        const descuentoFinal = resolveDescuentoParaCuotaService({
+            rolId,
+            descuentoLegacy: descuento,
+            descuentoMora: descuento_mora
+        });
+
+        // registrarPagoParcial usa "descuento" (en cuota.service.js aplica solo a mora)
         const { cuota: cuotaRes, recibo } = await registrarPagoParcial({
             cuota_id: cuotaIdInt,
             monto_pagado,
             forma_pago_id: formaPagoIdInt,
             observacion,
-            descuento,
-            // 🔐 pasamos al service para que impacte Caja con usuario y limite descuentos
+            descuento: descuentoFinal,
+
+            // contexto para caja/auditoría (aunque cuota.service hoy no lo use siempre)
             usuario_id: usuarioId ?? undefined,
             rol_id: rolId ?? undefined
         });
@@ -312,7 +353,8 @@ export const registrarPago = async (req, res) => {
         });
     } catch (error) {
         console.error('[registrarPago]', error);
-        res.status(500).json({
+        const status = error?.status && Number.isInteger(error.status) ? error.status : 500;
+        res.status(status).json({
             success: false,
             error: error?.message || 'Error al registrar el pago'
         });
@@ -323,28 +365,37 @@ export const registrarPago = async (req, res) => {
 /**
  * Registrar PAGO TOTAL de una cuota.
  *
- * - LIBRE:
- *      Liquida el crédito completo (interés del ciclo vigente + capital). Permite descuento opcional
- *      en % sobre el total (usar body.descuento como porcentaje). El monto se calcula internamente.
- *
- * - común/progresivo:
- *      Paga la cuota completa (mora + principal tras descuento opcional como MONTO).
- *
- * Body: { cuota_id, forma_pago_id, observacion?, descuento? }
- * Respuesta: { success, message, cuota, recibo, recibo_ui }
+ * REGLA:
+ * - Admin (rol 1): puede aplicar descuento SOLO sobre mora (también en pago total).
+ *   * En LIBRE: cuota.service interpreta descuento como % sobre mora.
+ *   * En NO-LIBRE: cuota.service interpreta descuento como monto sobre mora.
  */
 export const registrarPagoTotal = async (req, res) => {
     try {
-        let { cuota_id, forma_pago_id, observacion, descuento = 0 } = req.body ?? {};
+        let {
+            cuota_id,
+            forma_pago_id,
+            observacion,
+            descuento = 0,
+            descuento_mora = null
+        } = req.body ?? {};
 
-        // 🔐 Tomamos usuario y rol desde el token (para Caja y control de descuentos)
         const usuarioId =
             req.user?.id ??
             req.user?.usuario_id ??
             req.user?.userId ??
             null;
+
         const rolIdRaw = req.user?.rol_id ?? req.user?.rol ?? null;
         const rolId = typeof rolIdRaw === 'number' ? rolIdRaw : toIntOrNull(rolIdRaw);
+
+        // Defensa: si alguna ruta quedara abierta por error
+        if (rolId === 2) {
+            return res.status(403).json({
+                success: false,
+                error: 'Permiso denegado: un cobrador no puede registrar pagos totales desde este endpoint.'
+            });
+        }
 
         const cuotaIdInt = toIntOrNull(cuota_id);
         const formaPagoIdInt = toIntOrNull(forma_pago_id);
@@ -356,21 +407,21 @@ export const registrarPagoTotal = async (req, res) => {
             });
         }
 
-        descuento = sanitizeNumber(descuento);
-        if (descuento < 0) {
-            return res.status(400).json({
-                success: false,
-                error: 'descuento no puede ser negativo.'
-            });
-        }
+        // ✅ Descuento final (admin: solo mora)
+        const descuentoFinal = resolveDescuentoParaCuotaService({
+            rolId,
+            descuentoLegacy: descuento,
+            descuentoMora: descuento_mora
+        });
 
         // pagarCuota decide internamente modalidad y cálculo
         const { cuota, recibo } = await pagarCuota({
             cuota_id: cuotaIdInt,
             forma_pago_id: formaPagoIdInt,
-            descuento,
+            descuento: descuentoFinal,
             observacion,
-            // 🔐 pasamos al service para que impacte Caja con usuario y limite descuentos
+
+            // contexto para caja/auditoría (aunque cuota.service hoy no lo use siempre)
             usuario_id: usuarioId ?? undefined,
             rol_id: rolId ?? undefined
         });
@@ -386,7 +437,8 @@ export const registrarPagoTotal = async (req, res) => {
         });
     } catch (error) {
         console.error('[registrarPagoTotal]', error);
-        res.status(500).json({
+        const status = error?.status && Number.isInteger(error.status) ? error.status : 500;
+        res.status(status).json({
             success: false,
             error: error?.message || 'Error al registrar el pago total'
         });
