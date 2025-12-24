@@ -12,6 +12,47 @@ import * as XLSX from 'xlsx';
 const BASE_URL = 'http://localhost:3000'; // Centralizado
 
 /* ──────────────────────────────────────────────────────────
+   Helpers DNI / Errores
+   ────────────────────────────────────────────────────────── */
+
+const str = (v) => (v ?? '').toString().trim();
+const cleanDni = (v) => str(v).replace(/\D+/g, ''); // deja solo dígitos
+
+const isUniqueConstraintError = (e) =>
+    e &&
+    (e.name === 'SequelizeUniqueConstraintError' ||
+        e.name === 'SequelizeValidationError' ||
+        (Array.isArray(e?.errors) && e.errors.some((x) => x?.type === 'unique violation')));
+
+const throwDniDuplicado = (dni) => {
+    const msg = `Ya existe un cliente con ese documento (DNI: ${dni}).`;
+    const err = new Error(msg);
+    err.code = 'DNI_DUPLICADO';
+    err.status = 409; // ideal para el controller
+    throw err;
+};
+
+const throwDniInvalido = () => {
+    const err = new Error('El documento (DNI) es requerido o inválido.');
+    err.code = 'DNI_INVALIDO';
+    err.status = 400;
+    throw err;
+};
+
+const assertDniDisponible = async (dni, { excludeId = null } = {}) => {
+    if (!dni) throwDniInvalido();
+
+    const where = excludeId ? { dni, id: { [Cliente.sequelize.Op.ne]: excludeId } } : { dni };
+
+    const existing = await Cliente.findOne({
+        where,
+        attributes: ['id', 'dni']
+    });
+
+    if (existing) throwDniDuplicado(dni);
+};
+
+/* ──────────────────────────────────────────────────────────
     LISTADOS (full y básico para selects)
    ────────────────────────────────────────────────────────── */
 
@@ -150,32 +191,46 @@ export const obtenerClientesPorCobrador = async (cobradorId) => {
     });
 };
 
-// 🟢 Crear nuevo cliente
+// 🟢 Crear nuevo cliente (NO permite DNI duplicado)
 export const crearCliente = async (data) => {
-    const nuevoCliente = await Cliente.create({
-        nombre: data.nombre,
-        apellido: data.apellido,
-        dni: data.dni,
-        fecha_nacimiento: data.fecha_nacimiento,
-        fecha_registro: data.fecha_registro,
-        email: data.email,
-        telefono: data.telefono,
-        telefono_secundario: data.telefono_secundario || null,
-        direccion: data.direccion,
-        direccion_secundaria: data.direccion_secundaria || null,
-        referencia_direccion: data.referencia_direccion || null,
-        referencia_secundaria: data.referencia_secundaria || null,
-        observaciones: data.observaciones || null,
-        provincia: data.provincia,
-        localidad: data.localidad,
-        cobrador: data.cobrador,
-        zona: data.zona,
-        // dni_foto: data.dni_foto || null, // ⛔️ Por ahora fuera de la importación (se mantiene el campo en el modelo)
-        historial_crediticio: data.historial_crediticio || 'Desaprobado',
-        puntaje_crediticio: data.puntaje_crediticio ?? 0
-    });
+    const dniNormalizado = cleanDni(data?.dni);
+    if (!dniNormalizado) throwDniInvalido();
 
-    return nuevoCliente.id;
+    // ✅ Chequeo preventivo (UX) + evita duplicados por diferencias de formato
+    await assertDniDisponible(dniNormalizado);
+
+    try {
+        const nuevoCliente = await Cliente.create({
+            nombre: data.nombre,
+            apellido: data.apellido,
+            dni: dniNormalizado,
+            fecha_nacimiento: data.fecha_nacimiento,
+            fecha_registro: data.fecha_registro,
+            email: data.email,
+            telefono: data.telefono,
+            telefono_secundario: data.telefono_secundario || null,
+            direccion: data.direccion,
+            direccion_secundaria: data.direccion_secundaria || null,
+            referencia_direccion: data.referencia_direccion || null,
+            referencia_secundaria: data.referencia_secundaria || null,
+            observaciones: data.observaciones || null,
+            provincia: data.provincia,
+            localidad: data.localidad,
+            cobrador: data.cobrador,
+            zona: data.zona,
+            // dni_foto: data.dni_foto || null, // ⛔️ Por ahora fuera de la importación (se mantiene el campo en el modelo)
+            historial_crediticio: data.historial_crediticio || 'Desaprobado',
+            puntaje_crediticio: data.puntaje_crediticio ?? 0
+        });
+
+        return nuevoCliente.id;
+    } catch (e) {
+        // ✅ Backstop por si existe UNIQUE en DB (o carreras concurrentes)
+        if (isUniqueConstraintError(e)) {
+            throwDniDuplicado(dniNormalizado);
+        }
+        throw e;
+    }
 };
 
 // 🟢 Actualizar cliente manteniendo imagen anterior si no se manda nueva
@@ -185,6 +240,20 @@ export const actualizarCliente = async (id, data) => {
 
     const clientePrevio = clienteActual.toJSON();
 
+    // ✅ Si intentan cambiar el DNI, validar contra duplicados
+    if (data && Object.prototype.hasOwnProperty.call(data, 'dni')) {
+        const dniNuevo = cleanDni(data.dni);
+        if (!dniNuevo) throwDniInvalido();
+
+        const dniPrevio = cleanDni(clientePrevio.dni);
+        if (dniNuevo !== dniPrevio) {
+            await assertDniDisponible(dniNuevo, { excludeId: id });
+        }
+
+        // normalizamos lo que se guarda
+        data.dni = dniNuevo;
+    }
+
     const datosActualizados = {
         ...clientePrevio,
         ...data,
@@ -193,7 +262,15 @@ export const actualizarCliente = async (id, data) => {
 
     delete datosActualizados.id;
 
-    await Cliente.update(datosActualizados, { where: { id } });
+    try {
+        await Cliente.update(datosActualizados, { where: { id } });
+    } catch (e) {
+        if (isUniqueConstraintError(e)) {
+            const dniToReport = cleanDni(datosActualizados.dni);
+            throwDniDuplicado(dniToReport);
+        }
+        throw e;
+    }
 };
 
 // 🟢 Eliminar cliente por ID
@@ -260,8 +337,6 @@ const HEADER_MAP = {
 };
 
 /** Helpers básicos */
-const str = (v) => (v ?? '').toString().trim();
-const cleanDni = (v) => str(v).replace(/\D+/g, ''); // deja solo dígitos
 const isEmpty = (v) => v === undefined || v === null || (typeof v === 'string' && v.trim() === '');
 const toDateOrNull = (v) => {
     if (isEmpty(v)) return null;
@@ -486,13 +561,20 @@ export const importarClientesDesdePlanilla = async (fileBuffer, filename, { dryR
             });
         } catch (e) {
             errorsCount += 1;
+
+            // Si ya existe UNIQUE a nivel DB, esto mejora el mensaje
+            let msg = e.message || 'Error inesperado al procesar la fila.';
+            if (isUniqueConstraintError(e)) {
+                msg = `DNI duplicado en base de datos (DNI: ${dni}).`;
+            }
+
             results.push({
                 index,
                 status: 'error',
                 action,
                 dni,
                 id: targetId,
-                errors: [e.message || 'Error inesperado al procesar la fila.'],
+                errors: [msg],
                 dataApplied: payload
             });
         }

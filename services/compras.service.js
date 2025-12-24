@@ -119,6 +119,8 @@ const trimStr = (obj, keys) => {
     return out;
 };
 
+const isBlank = (v) => v === null || v === undefined || String(v).trim() === '';
+
 /* ───────────────── CRUD con impacto en Caja ───────────────── */
 
 /** POST /compras */
@@ -127,9 +129,20 @@ export const crearCompra = async (req, res) => {
     try {
         const data = req.body || {};
 
-        // Requeridos mínimos
-        if (!data.fecha_imputacion || !data.tipo_comprobante || !data.numero_comprobante || !data.proveedor_nombre) {
-            // proveedor_nombre puede derivarse si viene proveedor_id.
+        // ✅ Validación real de requeridos (antes estaba “de adorno”)
+        const missing = [];
+        if (isBlank(data.fecha_imputacion)) missing.push('fecha_imputacion');
+        if (isBlank(data.tipo_comprobante)) missing.push('tipo_comprobante');
+        if (isBlank(data.numero_comprobante)) missing.push('numero_comprobante');
+
+        // proveedor_nombre puede derivarse si viene proveedor_id, lo validamos luego
+        if (missing.length) {
+            await t.rollback();
+            return res.status(400).json({
+                success: false,
+                message: 'Faltan campos requeridos',
+                missing
+            });
         }
 
         const fechaImp = asYMD(data.fecha_imputacion);
@@ -227,14 +240,17 @@ export const crearCompra = async (req, res) => {
         const usuario_id = data.usuario_id ?? req.user?.id ?? null;
 
         // Crear movimiento de caja (EGRESO) y linkear
-        const mov = await registrarEgresoDesdeCompra({
-            compra_id: nueva.id,
-            total: nueva.total,
-            fecha_imputacion: nueva.fecha_imputacion,
-            forma_pago_id: nueva.forma_pago_id ?? null,
-            usuario_id,
-            concepto: conceptoCompra(nueva)
-        }, { transaction: t });
+        const mov = await registrarEgresoDesdeCompra(
+            {
+                compra_id: nueva.id,
+                total: nueva.total,
+                fecha_imputacion: nueva.fecha_imputacion,
+                forma_pago_id: nueva.forma_pago_id ?? null,
+                usuario_id,
+                concepto: conceptoCompra(nueva)
+            },
+            { transaction: t }
+        );
 
         await nueva.update({ caja_movimiento_id: mov.id }, { transaction: t });
 
@@ -245,7 +261,11 @@ export const crearCompra = async (req, res) => {
             include: [{ model: Proveedor, as: 'proveedor', attributes: ['id', 'nombre_razon_social', 'cuil_cuit'] }]
         });
 
-        res.status(201).json({ success: true, data: withInclude || nueva });
+        res.status(201).json({
+            success: true,
+            message: 'Compra creada correctamente',
+            data: withInclude || nueva
+        });
     } catch (err) {
         console.error('[crearCompra]', err);
         try { await t.rollback(); } catch (_) { }
@@ -518,7 +538,11 @@ export const actualizarCompra = async (req, res) => {
             include: [{ model: Proveedor, as: 'proveedor', attributes: ['id', 'nombre_razon_social', 'cuil_cuit'] }]
         });
 
-        res.json({ success: true, data: withInclude || row });
+        res.json({
+            success: true,
+            message: 'Compra actualizada correctamente',
+            data: withInclude || row
+        });
     } catch (err) {
         console.error('[actualizarCompra]', err);
         try { await t.rollback(); } catch (_) { }
@@ -542,7 +566,7 @@ export const eliminarCompra = async (req, res) => {
         await Compra.destroy({ where: { id: row.id }, transaction: t });
 
         await t.commit();
-        res.json({ success: true, deleted: true });
+        res.json({ success: true, message: 'Compra eliminada correctamente', deleted: true });
     } catch (err) {
         console.error('[eliminarCompra]', err);
         try { await t.rollback(); } catch (_) { }

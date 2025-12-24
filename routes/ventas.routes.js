@@ -6,7 +6,6 @@ import {
   crearVentaManual,
   listarVentasManuales,
   obtenerVentaManual,
-  actualizarVentaManual,
   eliminarVentaManual
 } from '../services/ventas.service.js';
 
@@ -14,7 +13,8 @@ const router = Router();
 
 /**
  * Lectura: autenticado
- * Altas/Ediciones/Bajas: admin/superadmin (roles [0,1])
+ * Altas/Bajas: admin/superadmin (roles [0,1])
+ * Edición: ❌ DESHABILITADA
  *
  * Rutas principales:    /api/ventas/manuales
  * Alias de compat:      /api/ventas
@@ -28,14 +28,14 @@ const router = Router();
 router.get('/manuales', verifyToken, listarVentasManuales);
 router.get('/manuales/:id', verifyToken, obtenerVentaManual);
 router.post('/manuales', verifyToken, checkRole([0, 1]), crearVentaManual);
-router.put('/manuales/:id', verifyToken, checkRole([0, 1]), actualizarVentaManual);
+// ❌ Sin PUT/PATCH: edición deshabilitada
 router.delete('/manuales/:id', verifyToken, checkRole([0, 1]), eliminarVentaManual);
 
 /* ===== Alias en raíz (/api/ventas) ===== */
 router.get('/', verifyToken, listarVentasManuales);
 router.get('/:id', verifyToken, obtenerVentaManual);
 router.post('/', verifyToken, checkRole([0, 1]), crearVentaManual);
-router.put('/:id', verifyToken, checkRole([0, 1]), actualizarVentaManual);
+// ❌ Sin PUT/PATCH: edición deshabilitada
 router.delete('/:id', verifyToken, checkRole([0, 1]), eliminarVentaManual);
 
 export default router;

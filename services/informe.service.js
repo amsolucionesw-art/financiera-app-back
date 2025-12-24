@@ -58,7 +58,6 @@ const dateRangeWhere = (campo, query = {}) => {
 const dateRangeWhereOr = (campos = [], query = {}) => {
     const { desde, hasta } = query || {};
 
-    // Validaciones básicas
     if (!Array.isArray(campos) || campos.length === 0) return undefined;
     if (!desde && !hasta) return undefined;
 
@@ -92,16 +91,9 @@ const addGenericSearchForCliente = (q, clienteAlias = 'cliente') => {
 
 /* ──────────────────────────────────────────────────────────────
  * Selector de rango por fecha (solo Créditos)
- * ──────────────────────────────────────────────────────────────
- * IMPORTANTE: basado en el modelo Credito real:
- * - fecha_solicitud
- * - fecha_acreditacion
- * - fecha_compromiso_pago
- * (no existen fecha_otorgamiento / fecha_ultima_actualizacion)
  * ────────────────────────────────────────────────────────────── */
 
 const CREDITOS_RANGO_MAP = {
-    // valor UI -> campos BD (reales)
     solicitud: ['fecha_solicitud'],
     acreditacion: ['fecha_acreditacion'],
     compromiso: ['fecha_compromiso_pago'],
@@ -113,7 +105,6 @@ const normalizeRangoFechaCredito = (v) => {
     if (!v) return 'acreditacion_compromiso';
     const s = String(v).trim().toLowerCase();
 
-    // permitimos algunas variantes “humanas”
     if (s === 'solicitud' || s === 'fecha_solicitud') return 'solicitud';
     if (s === 'acreditacion' || s === 'fecha_acreditacion') return 'acreditacion';
     if (s === 'compromiso' || s === 'fecha_compromiso_pago') return 'compromiso';
@@ -122,8 +113,6 @@ const normalizeRangoFechaCredito = (v) => {
         return 'acreditacion_compromiso';
     }
 
-    // Compat: si llega algo viejo que ya no existe (otorgamiento/actualizacion),
-    // caemos al comportamiento por defecto sin romper.
     if (
         s === 'otorgamiento' ||
         s === 'fecha_otorgamiento' ||
@@ -134,8 +123,135 @@ const normalizeRangoFechaCredito = (v) => {
         return 'acreditacion_compromiso';
     }
 
-    // fallback seguro
     return 'acreditacion_compromiso';
+};
+
+/* ──────────────────────────────────────────────────────────────
+ * Helpers: Mora diaria + días atraso (cuotas)
+ * ────────────────────────────────────────────────────────────── */
+
+const MORA_DIARIA_PCT = 2.5;
+const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+
+const toNumberMaybe = (v) => {
+    if (v === null || v === undefined || v === '') return null;
+    if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+    const s = String(v).trim();
+    if (!s) return null;
+    const normalized = s
+        .replace(/\s/g, '')
+        .replace(/\./g, '')
+        .replace(/,/g, '.');
+    const n = Number(normalized);
+    return Number.isFinite(n) ? n : null;
+};
+
+const toYMD = (v) => {
+    if (!v) return null;
+    const s = String(v).slice(0, 10);
+    return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+};
+
+const ymdToUtcMidnightMs = (ymd) => {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd || ''));
+    if (!m) return NaN;
+    const y = Number(m[1]);
+    const mo = Number(m[2]) - 1;
+    const d = Number(m[3]);
+    return Date.UTC(y, mo, d);
+};
+
+const daysDiffYMD = (fromYMD, toYMDStr) => {
+    const a = ymdToUtcMidnightMs(fromYMD);
+    const b = ymdToUtcMidnightMs(toYMDStr);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
+    const diff = Math.floor((b - a) / 86400000);
+    return diff > 0 ? diff : 0;
+};
+
+const isOverdueByDate = (fechaVenc) => {
+    const fv = toYMD(fechaVenc);
+    if (!fv) return false;
+    return fv < todayYMD();
+};
+
+const unpaidAmount = (importeCuota, montoPagadoAcum) => {
+    const imp = Number(importeCuota || 0);
+    const pag = Number(montoPagadoAcum || 0);
+    const diff = imp - pag;
+    return diff > 0.00001 ? diff : 0;
+};
+
+/**
+ * Mora por día (unitaria):
+ * - 2,5% sobre importe_cuota
+ * - Solo si está vencida por fecha y aún hay deuda
+ */
+const computeMoraPorDiaMonto = (dtoPlain, montoPagadoAcumulado) => {
+    if (!dtoPlain) return null;
+
+    // Si el modelo ya trae “mora por día”, lo respetamos
+    const candidates = [
+        'mora_por_dia_monto',
+        'mora_por_dia',
+        'mora_dia',
+        'moraDiariaMonto',
+        'moraDiaria',
+        'moraPorDia',
+        'moraDia'
+    ];
+
+    for (const k of candidates) {
+        if (Object.prototype.hasOwnProperty.call(dtoPlain, k)) {
+            const n = toNumberMaybe(dtoPlain[k]);
+            if (n !== null) return round2(n);
+        }
+    }
+
+    const overdue = isOverdueByDate(dtoPlain.fecha_vencimiento);
+    if (!overdue) return null;
+
+    const imp = Number(dtoPlain.importe_cuota || 0);
+    if (!Number.isFinite(imp) || imp <= 0) return null;
+
+    const pendiente = unpaidAmount(imp, montoPagadoAcumulado);
+    if (pendiente <= 0) return null;
+
+    return round2(imp * (MORA_DIARIA_PCT / 100));
+};
+
+/**
+ * Días de atraso (TZ Tucumán):
+ * - Solo si está vencida por fecha y tiene deuda pendiente.
+ * - Caso contrario: 0
+ */
+const computeDiasAtraso = (dtoPlain, montoPagadoAcumulado) => {
+    if (!dtoPlain) return 0;
+
+    const overdue = isOverdueByDate(dtoPlain.fecha_vencimiento);
+    if (!overdue) return 0;
+
+    const imp = Number(dtoPlain.importe_cuota || 0);
+    const pendiente = unpaidAmount(imp, montoPagadoAcumulado);
+    if (pendiente <= 0) return 0;
+
+    const fv = toYMD(dtoPlain.fecha_vencimiento);
+    if (!fv) return 0;
+
+    return daysDiffYMD(fv, todayYMD());
+};
+
+/**
+ * ✅ Mora acumulada a hoy:
+ * - mora_por_dia_monto * dias_atraso
+ * - Si días_atraso=0 => null
+ */
+const computeMoraAcumuladaMonto = (moraPorDiaMonto, diasAtraso) => {
+    const d = Number(diasAtraso || 0);
+    const m = Number(moraPorDiaMonto || 0);
+    if (!Number.isFinite(d) || d <= 0) return null;
+    if (!Number.isFinite(m) || m <= 0) return null;
+    return round2(m * d);
 };
 
 /* ──────────────────────────────────────────────────────────────
@@ -148,7 +264,6 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
         case 'clientes': {
             const onlyPend = asBool(query.conCreditosPendientes);
 
-            // Filtros de cliente por zona / cobrador (guardados en campos del cliente)
             const whereCliente = {
                 ...buildFilters(query, {
                     zonaId: { field: 'zona', type: 'eq' },
@@ -156,7 +271,6 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
                 })
             };
 
-            // Búsqueda libre q por nombre/apellido
             if (query.q) {
                 const like = { [Op.iLike]: `%${query.q}%` };
                 whereCliente[Op.or] = [
@@ -165,7 +279,6 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
                 ];
             }
 
-            // Include: si piden “solo con créditos pendientes”, incluimos solo los NO pagados/anulados/refinanciados.
             const includeArr = [
                 {
                     model: Credito,
@@ -217,16 +330,14 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
         case 'creditos': {
             const onlyPend = asBool(query.conCreditosPendientes);
 
-            // Evitar que buildFilters "vea" claves no mapeadas (por si algún día itera)
             const queryForFilters = { ...query };
             delete queryForFilters.rangoFechaCredito;
 
-            // Mapeo de filtros al esquema real
             const whereCreditoBase = {
                 ...buildFilters(queryForFilters, {
                     cobradorId: { field: 'cobrador_id', type: 'eq' },
                     clienteId: { field: 'cliente_id', type: 'eq' },
-                    zonaId: { field: '$cliente.zona$', type: 'eq' }, // via include
+                    zonaId: { field: '$cliente.zona$', type: 'eq' },
                     estadoCredito: { field: 'estado', type: 'in' },
                     modalidad: { field: 'modalidad_credito', type: 'in' },
                     tipoCredito: { field: 'tipo_credito', type: 'in' }
@@ -234,12 +345,9 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
             };
 
             if (onlyPend === true) {
-                // Consideramos “pendientes” todo lo no pagado/anulado/refinanciado
                 whereCreditoBase.estado = { [Op.notIn]: ['pagado', 'anulado', 'refinanciado'] };
             }
 
-            // ✅ Rango de fechas configurable por el usuario
-            // Default: (fecha_acreditacion OR fecha_compromiso_pago)
             const rangoKey = normalizeRangoFechaCredito(query.rangoFechaCredito);
             const camposRango = CREDITOS_RANGO_MAP[rangoKey] || CREDITOS_RANGO_MAP.acreditacion_compromiso;
 
@@ -249,7 +357,6 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
                 ? { [Op.and]: [whereCreditoBase, whereRango] }
                 : whereCreditoBase;
 
-            // Búsqueda libre por cliente
             const whereSearch = addGenericSearchForCliente(query.q, 'cliente');
 
             const whereFinal = whereSearch
@@ -296,25 +403,20 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
 
         /* ──────────── CUOTAS ──────────── */
         case 'cuotas': {
-            // Antes de calcular, aseguramos que las cuotas estén actualizadas (vencidas)
             await actualizarCuotasVencidas();
 
             const whereCuotaBase = {
                 ...buildFilters(query, {
                     estadoCuota: { field: 'estado', type: 'in' },
-                    // si tu buildFilters soporta 'today' para YMD en TZ, se usa. Si no, quitar.
                     hoy: { field: 'fecha_vencimiento', type: 'today' }
                 }),
-                // rango por fecha de vencimiento
                 ...dateRangeWhere('fecha_vencimiento', query)
             };
 
-            // Filtro por forma de pago (en pagos asociados a la cuota)
             if (query.formaPagoId) {
                 whereCuotaBase['$pagos.forma_pago_id$'] = Number(query.formaPagoId);
             }
 
-            // Relacionales desde el crédito/cliente
             const whereRel = [];
             if (query.cobradorId) {
                 whereRel.push({ '$credito.cobrador_id$': Number(query.cobradorId) });
@@ -330,7 +432,6 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
                 ? { [Op.and]: [whereCuotaBase, ...whereRel] }
                 : whereCuotaBase;
 
-            // Búsqueda libre por cliente (alias anidado)
             const whereSearch = addGenericSearchForCliente(query.q, 'credito->cliente');
 
             const whereFinal = whereSearch
@@ -387,6 +488,14 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
                 const montoPagadoAcumulado = (dto.pagos || [])
                     .reduce((acc, p) => acc + Number(p.monto_pagado || 0), 0);
 
+                const diasAtraso = computeDiasAtraso(dto, montoPagadoAcumulado);
+
+                // ✅ mora por día (unitaria)
+                const moraPorDiaMonto = computeMoraPorDiaMonto(dto, montoPagadoAcumulado);
+
+                // ✅ mora acumulada hasta hoy (lo que ustedes esperan ver en la tabla)
+                const moraAcumuladaMonto = computeMoraAcumuladaMonto(moraPorDiaMonto, diasAtraso);
+
                 return {
                     id: dto.id,
                     numero_cuota: dto.numero_cuota,
@@ -399,7 +508,16 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
                     zona: dto.credito?.cliente?.clienteZona?.nombre ?? '',
                     cobrador: dto.credito?.cobradorCredito?.nombre_completo ?? '',
                     formasPago: formasPagoUnicas,
-                    monto_pagado_acumulado: Number(montoPagadoAcumulado.toFixed(2))
+                    monto_pagado_acumulado: Number(montoPagadoAcumulado.toFixed(2)),
+
+                    // 👇 En tu tabla actual “Mora diaria” ya está usando esta key,
+                    // así que la llenamos con la mora ACUMULADA.
+                    mora_diaria_monto: moraAcumuladaMonto,
+
+                    // 👇 Extra opcional por si luego quieren mostrar “por día”
+                    mora_por_dia_monto: moraPorDiaMonto,
+
+                    dias_atraso: diasAtraso
                 };
             });
         }

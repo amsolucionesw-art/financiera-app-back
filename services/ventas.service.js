@@ -3,7 +3,6 @@ import sequelize from '../models/sequelize.js';
 import VentaManual from '../models/VentaManual.js';
 import {
     registrarIngresoDesdeVentaManual,
-    actualizarMovimientoDesdeVentaManual,
     eliminarMovimientoDesdeVentaManual
 } from './caja.service.js';
 
@@ -142,9 +141,9 @@ const intentarCrearCreditoDesdeVenta = async (venta, rawData, t) => {
 
         tipo_credito,
         cantidad_cuotas: cuotas,
-        modalidad_credito: 'comun', // mantenemos modalidad, pero forzamos interés abajo
+        modalidad_credito: 'comun', // mantenemos modalidad
         origen_venta_manual_financiada: true, // hint no disruptivo
-        detalle_producto: detalle_producto || null, // opcional, para mostrar luego en la ficha
+        detalle_producto: detalle_producto || null, // opcional
     };
 
     // ✅ Interés MANUAL si vino en la venta
@@ -240,7 +239,7 @@ export const crearVentaManual = async (req, res) => {
             'doc_cliente',
             'vendedor',
             'observacion',
-            'detalle_producto', // ✅ nuevo: detalle del producto vendido
+            'detalle_producto',
         ]);
 
         if (!(payload.total > 0)) {
@@ -271,11 +270,13 @@ export const crearVentaManual = async (req, res) => {
 
         await nueva.update({ caja_movimiento_id: mov.id }, { transaction: t });
 
-        // 3) Intentar crear CRÉDITO si corresponde (venta financiada a cliente existente)
+        // 3) Intentar crear CRÉDITO si corresponde (venta financiada)
+        let creditoCreadoId = null;
         try {
             const creditoInfo = await intentarCrearCreditoDesdeVenta(nueva, data, t);
             if (creditoInfo?.creditoId) {
-                await nueva.update({ credito_id: creditoInfo.creditoId }, { transaction: t });
+                creditoCreadoId = creditoInfo.creditoId;
+                await nueva.update({ credito_id: creditoCreadoId }, { transaction: t });
             }
         } catch (creErr) {
             await t.rollback();
@@ -287,7 +288,15 @@ export const crearVentaManual = async (req, res) => {
 
         // 4) Confirmar
         await t.commit();
-        res.status(201).json({ success: true, data: nueva });
+
+        // ✅ message para el alert del front (incluye comprobante + crédito si aplica)
+        const comp = (nueva?.numero_comprobante || '').toString().trim();
+        const msgBase = comp ? `Venta ${comp} registrada correctamente.` : 'Venta registrada correctamente.';
+        const msg = creditoCreadoId
+            ? `${msgBase} Se creó el crédito #${creditoCreadoId}.`
+            : msgBase;
+
+        res.status(201).json({ success: true, message: msg, data: nueva });
     } catch (err) {
         console.error('[crearVentaManual]', err);
         try { await t.rollback(); } catch (_) { }
@@ -374,119 +383,17 @@ export const obtenerVentaManual = async (req, res) => {
     }
 };
 
+/**
+ * ❌ EDICIÓN DESHABILITADA
+ * Se deja el handler para evitar que el front "rompa" si todavía llama al endpoint.
+ * Responde 405 Method Not Allowed con un mensaje claro.
+ */
 export const actualizarVentaManual = async (req, res) => {
-    const t = await sequelize.transaction();
-    try {
-        const row = await VentaManual.findByPk(req.params.id, { transaction: t, lock: t.LOCK.UPDATE });
-        if (!row) {
-            await t.rollback();
-            return res.status(404).json({ success: false, message: 'Venta no encontrada' });
-        }
-
-        const data = req.body || {};
-
-        // Fechas y m/a
-        if (data.fecha_imputacion) {
-            const f = asYMD(data.fecha_imputacion);
-            if (!f) {
-                await t.rollback();
-                return res.status(400).json({ success: false, message: 'fecha_imputacion inválida' });
-            }
-            data.fecha_imputacion = f;
-            const parsed = new Date(`${f}T00:00:00Z`);
-            const m = Number(data.mes ?? (parsed.getUTCMonth() + 1));
-            const y = Number(data.anio ?? parsed.getUTCFullYear());
-            if (!isMonth(m) || !isYear(y)) {
-                await t.rollback();
-                return res.status(400).json({ success: false, message: 'Mes o año inválidos' });
-            }
-            data.mes = m;
-            data.anio = y;
-        } else {
-            if (data.mes !== undefined && !isMonth(Number(data.mes))) {
-                await t.rollback();
-                return res.status(400).json({ success: false, message: 'mes inválido' });
-            }
-            if (data.anio !== undefined && !isYear(Number(data.anio))) {
-                await t.rollback();
-                return res.status(400).json({ success: false, message: 'anio inválido' });
-            }
-        }
-
-        // 🔄 Normalizar tipo_credito si viene en la actualización
-        if ('tipo_credito' in data) {
-            data.tipo_credito = normalizarTipoCredito(data.tipo_credito);
-        }
-
-        // Números
-        const nums = ['neto', 'iva', 'ret_gan', 'ret_iva', 'ret_iibb_tuc', 'capital', 'interes', 'total'];
-        for (const k of nums) if (k in data) data[k] = fix2(data[k]);
-        if ('cuotas' in data) data.cuotas = Math.max(1, Number.isFinite(Number(data.cuotas)) ? Number(data.cuotas) : 1);
-        if ('forma_pago_id' in data) data.forma_pago_id = normalizeFormaPagoId(data.forma_pago_id);
-        if ('bonificacion' in data) data.bonificacion = Boolean(data.bonificacion);
-        if ('cliente_id' in data) data.cliente_id = Number(data.cliente_id) || row.cliente_id; // mantener valor válido
-
-        // Strings
-        Object.assign(
-            data,
-            trimStr(data, [
-                'numero_comprobante',
-                'cliente_nombre',
-                'doc_cliente',
-                'vendedor',
-                'observacion',
-                'detalle_producto', // ✅ nuevo: detalle editable
-            ])
-        );
-
-        // Validación total
-        const totalFinal = ('total' in data) ? data.total : row.total;
-        if (!(fix2(totalFinal) > 0)) {
-            await t.rollback();
-            return res.status(400).json({ success: false, message: 'El total debe ser mayor a 0' });
-        }
-
-        // Aseguramos no romper NOT NULL de comprobante
-        if (('numero_comprobante' in data) && (!data.numero_comprobante || data.numero_comprobante.trim() === '')) {
-            data.numero_comprobante = row.numero_comprobante || buildNumeroComprobante({ id: row.id });
-        }
-
-        await row.update(data, { transaction: t });
-
-        const usuario_id = data.usuario_id ?? req.user?.id ?? null;
-
-        // Movimiento de CAJA:
-        // Siempre mantenemos un ingreso por la venta (normal o financiada)
-        const updatedMov = await actualizarMovimientoDesdeVentaManual({
-            venta_id: row.id,
-            total: row.total,
-            fecha_imputacion: row.fecha_imputacion,
-            forma_pago_id: row.forma_pago_id ?? null,
-            concepto: conceptoVenta(row)
-        }, { transaction: t });
-
-        if (!updatedMov) {
-            const createdMov = await registrarIngresoDesdeVentaManual({
-                venta_id: row.id,
-                total: row.total,
-                fecha_imputacion: row.fecha_imputacion,
-                forma_pago_id: row.forma_pago_id ?? null,
-                usuario_id,
-                concepto: conceptoVenta(row)
-            }, { transaction: t });
-
-            await row.update({ caja_movimiento_id: createdMov.id }, { transaction: t });
-        } else if (!row.caja_movimiento_id) {
-            await row.update({ caja_movimiento_id: updatedMov.id }, { transaction: t });
-        }
-
-        await t.commit();
-        res.json({ success: true, data: row });
-    } catch (err) {
-        console.error('[actualizarVentaManual]', err);
-        try { await t.rollback(); } catch (_) { }
-        res.status(500).json({ success: false, message: 'Error al actualizar venta', error: err?.message });
-    }
+    res.set('Allow', 'GET,POST,DELETE');
+    return res.status(405).json({
+        success: false,
+        message: 'Edición de ventas deshabilitada. Solo se permite crear y eliminar.'
+    });
 };
 
 export const eliminarVentaManual = async (req, res) => {
@@ -498,13 +405,18 @@ export const eliminarVentaManual = async (req, res) => {
             return res.status(404).json({ success: false, message: 'Venta no encontrada' });
         }
 
+        const comp = (row?.numero_comprobante || '').toString().trim();
+
         // Eliminar movimiento asociado (idempotente)
         await eliminarMovimientoDesdeVentaManual(row.id, { transaction: t });
 
         await VentaManual.destroy({ where: { id: row.id }, transaction: t });
 
         await t.commit();
-        res.json({ success: true, deleted: true });
+
+        const msg = comp ? `Venta ${comp} eliminada correctamente.` : 'Venta eliminada correctamente';
+
+        res.json({ success: true, message: msg, deleted: true });
     } catch (err) {
         console.error('[eliminarVentaManual]', err);
         try { await t.rollback(); } catch (_) { }
