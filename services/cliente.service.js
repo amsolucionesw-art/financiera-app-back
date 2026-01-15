@@ -1,15 +1,22 @@
 import Cliente from '../models/Cliente.js';
 import Usuario from '../models/Usuario.js';
 import Zona from '../models/Zona.js';
-import Credito from '../models/Credito.js';
 import Cuota from '../models/Cuota.js';
 import FormaPago from '../models/FormaPago.js';
 import { buildFilters } from '../utils/buildFilters.js';
+import { Op } from 'sequelize';
 
 /* ⬇️ NUEVO: lectura de CSV/XLSX */
 import * as XLSX from 'xlsx';
 
-const BASE_URL = 'http://localhost:3000'; // Centralizado
+/**
+ * BASE_URL para absolutizar links (dni_foto).
+ * Producción: seteá APP_BASE_URL o BASE_URL (ej: https://tudominio.com)
+ * Dev: fallback al puerto local.
+ */
+const BASE_URL =
+    (process.env.APP_BASE_URL || process.env.BASE_URL || '').replace(/\/+$/, '') ||
+    `http://localhost:${process.env.PORT || 3000}`;
 
 /* ──────────────────────────────────────────────────────────
    Helpers DNI / Errores
@@ -39,14 +46,21 @@ const throwDniInvalido = () => {
     throw err;
 };
 
+const throwForbidden = (message = 'No autorizado') => {
+    const err = new Error(message);
+    err.status = 403;
+    err.code = 'FORBIDDEN';
+    throw err;
+};
+
 const assertDniDisponible = async (dni, { excludeId = null } = {}) => {
     if (!dni) throwDniInvalido();
 
-    const where = excludeId ? { dni, id: { [Cliente.sequelize.Op.ne]: excludeId } } : { dni };
+    const where = excludeId ? { dni, id: { [Op.ne]: excludeId } } : { dni };
 
     const existing = await Cliente.findOne({
         where,
-        attributes: ['id', 'dni']
+        attributes: ['id', 'dni'],
     });
 
     if (existing) throwDniDuplicado(dni);
@@ -64,8 +78,8 @@ export const obtenerClientes = async (query) => {
         where,
         include: [
             { model: Usuario, as: 'cobradorUsuario', attributes: ['id', 'nombre_completo'] },
-            { model: Zona, as: 'clienteZona', attributes: ['id', 'nombre'] }
-        ]
+            { model: Zona, as: 'clienteZona', attributes: ['id', 'nombre'] },
+        ],
     });
 };
 
@@ -79,8 +93,8 @@ export const obtenerClientesBasico = async (query = {}) => {
         attributes: ['id', 'nombre', 'apellido', 'dni', 'cobrador', 'zona'],
         order: [
             ['apellido', 'ASC'],
-            ['nombre', 'ASC']
-        ]
+            ['nombre', 'ASC'],
+        ],
     });
 };
 
@@ -90,9 +104,17 @@ export const obtenerClientesBasico = async (query = {}) => {
 
 const absolutizeDniFoto = (plain) => {
     if (!plain) return plain;
-    if (plain.dni_foto && typeof plain.dni_foto === 'string' && !plain.dni_foto.startsWith('http')) {
-        plain.dni_foto = `${BASE_URL}/uploads/dni/${plain.dni_foto}`;
+
+    if (plain.dni_foto && typeof plain.dni_foto === 'string') {
+        const s = plain.dni_foto.trim();
+        // si ya viene absoluta, no tocamos
+        if (/^https?:\/\//i.test(s)) return plain;
+
+        // si viene como filename o path relativo, lo absolutizamos
+        const filename = s.includes('/') ? s.split('/').filter(Boolean).pop() : s;
+        plain.dni_foto = `${BASE_URL}/uploads/dni/${filename}`;
     }
+
     return plain;
 };
 
@@ -135,8 +157,8 @@ export const obtenerClientePorId = async (id) => {
     const cliente = await Cliente.findByPk(id, {
         include: [
             { model: Usuario, as: 'cobradorUsuario', attributes: ['id', 'nombre_completo'] },
-            { model: Zona, as: 'clienteZona', attributes: ['id', 'nombre'] }
-        ]
+            { model: Zona, as: 'clienteZona', attributes: ['id', 'nombre'] },
+        ],
     });
 
     if (!cliente) return null;
@@ -160,13 +182,11 @@ export const obtenerClientesPorCobrador = async (cobradorId) => {
                     {
                         model: Cuota,
                         as: 'cuotas',
-                        include: [
-                            { model: FormaPago, as: 'formaPago', attributes: ['id', 'nombre'] }
-                        ]
-                    }
-                ]
-            }
-        ]
+                        include: [{ model: FormaPago, as: 'formaPago', attributes: ['id', 'nombre'] }],
+                    },
+                ],
+            },
+        ],
     });
 
     // ✅ devolvemos plain JSON + estado coherente con cuotas (para evitar fichas “viejas”)
@@ -182,7 +202,7 @@ export const obtenerClientesPorCobrador = async (cobradorId) => {
                 return {
                     ...cred,
                     // 🔥 clave: el front muestra y filtra por credito.estado
-                    estado: estadoInferido
+                    estado: estadoInferido,
                 };
             });
         }
@@ -220,7 +240,7 @@ export const crearCliente = async (data) => {
             zona: data.zona,
             // dni_foto: data.dni_foto || null, // ⛔️ Por ahora fuera de la importación (se mantiene el campo en el modelo)
             historial_crediticio: data.historial_crediticio || 'Desaprobado',
-            puntaje_crediticio: data.puntaje_crediticio ?? 0
+            puntaje_crediticio: data.puntaje_crediticio ?? 0,
         });
 
         return nuevoCliente.id;
@@ -233,16 +253,50 @@ export const crearCliente = async (data) => {
     }
 };
 
-// 🟢 Actualizar cliente manteniendo imagen anterior si no se manda nueva
-export const actualizarCliente = async (id, data) => {
+/**
+ * 🟢 Actualizar cliente
+ * Reglas:
+ * - Superadmin (rol 0): puede editar DNI (validando duplicados) y resto de campos.
+ * - Admin (rol 1): puede editar cliente PERO NO puede modificar DNI ni dni_foto (ni por PUT).
+ *
+ * Firma:
+ *   actualizarCliente(id, data, { actorRoleId }?)
+ */
+export const actualizarCliente = async (id, data, { actorRoleId = null } = {}) => {
     const clienteActual = await Cliente.findByPk(id);
     if (!clienteActual) throw new Error('Cliente no encontrado');
 
     const clientePrevio = clienteActual.toJSON();
 
-    // ✅ Si intentan cambiar el DNI, validar contra duplicados
-    if (data && Object.prototype.hasOwnProperty.call(data, 'dni')) {
-        const dniNuevo = cleanDni(data.dni);
+    // Normalizamos role
+    const rol = actorRoleId != null ? Number(actorRoleId) : null;
+    const esAdmin = rol === 1;
+
+    // Clon defensivo (evita mutar referencia externa)
+    const payload = data ? { ...data } : {};
+
+    // ✅ Admin: no permitir cambios en dni_foto por PUT
+    if (esAdmin && Object.prototype.hasOwnProperty.call(payload, 'dni_foto')) {
+        delete payload.dni_foto;
+    }
+
+    // ✅ Admin: NO puede modificar DNI
+    if (esAdmin && Object.prototype.hasOwnProperty.call(payload, 'dni')) {
+        const dniNuevo = cleanDni(payload.dni);
+        const dniPrevio = cleanDni(clientePrevio.dni);
+
+        // si viene vacío o distinto => bloquear
+        if (!dniNuevo || dniNuevo !== dniPrevio) {
+            throwForbidden('Sin permisos: el rol admin no puede modificar el DNI del cliente.');
+        }
+
+        // Si vino igual, lo normalizamos (no cambia nada)
+        payload.dni = dniPrevio;
+    }
+
+    // ✅ Superadmin (o sin actorRoleId): si intentan cambiar el DNI, validar contra duplicados
+    if (!esAdmin && Object.prototype.hasOwnProperty.call(payload, 'dni')) {
+        const dniNuevo = cleanDni(payload.dni);
         if (!dniNuevo) throwDniInvalido();
 
         const dniPrevio = cleanDni(clientePrevio.dni);
@@ -251,13 +305,13 @@ export const actualizarCliente = async (id, data) => {
         }
 
         // normalizamos lo que se guarda
-        data.dni = dniNuevo;
+        payload.dni = dniNuevo;
     }
 
     const datosActualizados = {
         ...clientePrevio,
-        ...data,
-        dni_foto: data.dni_foto ?? clientePrevio.dni_foto
+        ...payload,
+        dni_foto: payload.dni_foto ?? clientePrevio.dni_foto,
     };
 
     delete datosActualizados.id;
@@ -274,8 +328,7 @@ export const actualizarCliente = async (id, data) => {
 };
 
 // 🟢 Eliminar cliente por ID
-export const eliminarCliente = (id) =>
-    Cliente.destroy({ where: { id } });
+export const eliminarCliente = (id) => Cliente.destroy({ where: { id } });
 
 /* ──────────────────────────────────────────────────────────
    IMPORTACIÓN POR PLANILLA (CSV/XLSX)
@@ -292,34 +345,34 @@ const HEADER_MAP = {
     dni: 'dni',
 
     // opcionales
-    'fecha_nacimiento': 'fecha_nacimiento',
+    fecha_nacimiento: 'fecha_nacimiento',
     'fecha nacimiento': 'fecha_nacimiento',
 
-    'fecha_registro': 'fecha_registro',
+    fecha_registro: 'fecha_registro',
     'fecha registro': 'fecha_registro',
 
     email: 'email',
     correo: 'email',
 
     telefono: 'telefono',
-    'telefono_1': 'telefono',
-    'teléfono': 'telefono',
+    telefono_1: 'telefono',
+    teléfono: 'telefono',
 
     telefono_secundario: 'telefono_secundario',
-    'telefono_2': 'telefono_secundario',
+    telefono_2: 'telefono_secundario',
 
     direccion: 'direccion',
-    'direccion_1': 'direccion',
+    direccion_1: 'direccion',
     domicilio: 'direccion',
 
     direccion_secundaria: 'direccion_secundaria',
-    'direccion_2': 'direccion_secundaria',
+    direccion_2: 'direccion_secundaria',
 
     referencia_direccion: 'referencia_direccion',
-    'referencia_direccion_1': 'referencia_direccion',
+    referencia_direccion_1: 'referencia_direccion',
 
     referencia_secundaria: 'referencia_secundaria',
-    'referencia_direccion_2': 'referencia_secundaria',
+    referencia_direccion_2: 'referencia_secundaria',
 
     observaciones: 'observaciones',
 
@@ -328,12 +381,16 @@ const HEADER_MAP = {
 
     // cobrador / zona (por id o por nombre)
     cobrador: 'cobrador',
-    'cobrador_id': 'cobrador',
-    'cobrador_nombre': 'cobrador_nombre',
+    cobrador_id: 'cobrador',
+    cobrador_nombre: 'cobrador_nombre',
 
     zona: 'zona',
-    'zona_id': 'zona',
-    'zona_nombre': 'zona_nombre',
+    zona_id: 'zona',
+    zona_nombre: 'zona_nombre',
+
+    // (si más adelante lo agregan en template)
+    historial_crediticio: 'historial_crediticio',
+    puntaje_crediticio: 'puntaje_crediticio',
 };
 
 /** Helpers básicos */
@@ -341,12 +398,15 @@ const isEmpty = (v) => v === undefined || v === null || (typeof v === 'string' &
 const toDateOrNull = (v) => {
     if (isEmpty(v)) return null;
     if (v instanceof Date && !isNaN(v)) return v;
+
+    // Excel numeric date
     if (typeof v === 'number') {
         const d = XLSX.SSF.parse_date_code(v);
         if (!d) return null;
         const dt = new Date(Date.UTC(d.y, (d.m || 1) - 1, d.d || 1));
         return isNaN(dt) ? null : dt;
     }
+
     const t = str(v);
     const dt = new Date(t);
     return isNaN(dt) ? null : dt;
@@ -373,7 +433,7 @@ const resolveCobradorYZona = async (row) => {
     let resolvedCobrador = null;
     let resolvedZona = null;
 
-    // COBRADOR
+    // COBRADOR por ID
     if (!isEmpty(row.cobrador)) {
         const id = Number(row.cobrador);
         if (!Number.isNaN(id)) {
@@ -381,21 +441,21 @@ const resolveCobradorYZona = async (row) => {
             if (u) resolvedCobrador = u.id;
         }
     }
+
+    // COBRADOR por nombre (case-insensitive)
     if (!resolvedCobrador && !isEmpty(row.cobrador_nombre)) {
         const nombre = str(row.cobrador_nombre).toLowerCase();
         const u = await Usuario.findOne({
-            where: {
-                nombre_completo: Usuario.sequelize.where(
-                    Usuario.sequelize.fn('LOWER', Usuario.sequelize.col('nombre_completo')),
-                    nombre
-                )
-            },
-            attributes: ['id']
+            where: Usuario.sequelize.where(
+                Usuario.sequelize.fn('LOWER', Usuario.sequelize.col('nombre_completo')),
+                nombre
+            ),
+            attributes: ['id'],
         });
         if (u) resolvedCobrador = u.id;
     }
 
-    // ZONA
+    // ZONA por ID
     if (!isEmpty(row.zona)) {
         const id = Number(row.zona);
         if (!Number.isNaN(id)) {
@@ -403,16 +463,16 @@ const resolveCobradorYZona = async (row) => {
             if (z) resolvedZona = z.id;
         }
     }
+
+    // ZONA por nombre (case-insensitive)
     if (!resolvedZona && !isEmpty(row.zona_nombre)) {
         const nombre = str(row.zona_nombre).toLowerCase();
         const z = await Zona.findOne({
-            where: {
-                nombre: Zona.sequelize.where(
-                    Zona.sequelize.fn('LOWER', Zona.sequelize.col('nombre')),
-                    nombre
-                )
-            },
-            attributes: ['id']
+            where: Zona.sequelize.where(
+                Zona.sequelize.fn('LOWER', Zona.sequelize.col('nombre')),
+                nombre
+            ),
+            attributes: ['id'],
         });
         if (z) resolvedZona = z.id;
     }
@@ -473,12 +533,11 @@ const toClientPayload = (row, resolved) => ({
     puntaje_crediticio: isEmpty(row.puntaje_crediticio) ? undefined : Number(row.puntaje_crediticio),
 });
 
-const readBufferToRows = (buffer, filename) => {
+const readBufferToRows = (buffer) => {
     const wb = XLSX.read(buffer, { type: 'buffer' });
     const firstSheetName = wb.SheetNames[0];
     const sheet = wb.Sheets[firstSheetName];
-    const rows = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
-    return rows;
+    return XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
 };
 
 export const importarClientesDesdePlanilla = async (fileBuffer, filename, { dryRun = true } = {}) => {
@@ -516,7 +575,7 @@ export const importarClientesDesdePlanilla = async (fileBuffer, filename, { dryR
                     dni,
                     id: null,
                     errors: valErrors,
-                    dataApplied: null
+                    dataApplied: null,
                 });
                 continue;
             }
@@ -529,9 +588,7 @@ export const importarClientesDesdePlanilla = async (fileBuffer, filename, { dryR
                     const createdClient = await Cliente.create({
                         ...payload,
                         historial_crediticio: payload.historial_crediticio ?? 'Desaprobado',
-                        puntaje_crediticio: Number.isFinite(payload.puntaje_crediticio)
-                            ? payload.puntaje_crediticio
-                            : 0
+                        puntaje_crediticio: Number.isFinite(payload.puntaje_crediticio) ? payload.puntaje_crediticio : 0,
                     });
                     targetId = createdClient.id;
                     created += 1;
@@ -557,12 +614,11 @@ export const importarClientesDesdePlanilla = async (fileBuffer, filename, { dryR
                 dni,
                 id: targetId,
                 errors: [],
-                dataApplied: payload
+                dataApplied: payload,
             });
         } catch (e) {
             errorsCount += 1;
 
-            // Si ya existe UNIQUE a nivel DB, esto mejora el mensaje
             let msg = e.message || 'Error inesperado al procesar la fila.';
             if (isUniqueConstraintError(e)) {
                 msg = `DNI duplicado en base de datos (DNI: ${dni}).`;
@@ -575,7 +631,7 @@ export const importarClientesDesdePlanilla = async (fileBuffer, filename, { dryR
                 dni,
                 id: targetId,
                 errors: [msg],
-                dataApplied: payload
+                dataApplied: payload,
             });
         }
     }
@@ -585,7 +641,7 @@ export const importarClientesDesdePlanilla = async (fileBuffer, filename, { dryR
         created,
         updated,
         errors: errorsCount,
-        dryRun
+        dryRun,
     };
 
     return { summary, rows: results };

@@ -1,10 +1,16 @@
 // services/usuario.service.js
 import Usuario from '../models/Usuario.js';
 import Role from '../models/Role.js';
-import bcrypt from 'bcrypt';
+import bcrypt from 'bcryptjs';
 import Zona from '../models/Zona.js';
 import Cliente from '../models/Cliente.js';
 import sequelize from '../models/sequelize.js';
+
+/* ───────────────── Helpers ───────────────── */
+const asInt = (v) => {
+    const n = Number.parseInt(String(v ?? ''), 10);
+    return Number.isFinite(n) ? n : null;
+};
 
 // Obtener todos los usuarios
 export const obtenerUsuarios = () =>
@@ -38,7 +44,7 @@ export const obtenerUsuarioPorId = (id) =>
 
 // Crear un nuevo usuario (con múltiples zonas si es cobrador)
 export const crearUsuario = async (data) => {
-    const hashedPassword = await bcrypt.hash(data.password, 10);
+    const hashedPassword = await bcrypt.hash(String(data.password ?? ''), 10);
     const { zona_ids, ...datos } = data;
 
     const nuevoUsuario = await Usuario.create({
@@ -47,7 +53,8 @@ export const crearUsuario = async (data) => {
     });
 
     // Si es cobrador y se pasaron zonas
-    if (datos.rol_id === 2 && Array.isArray(zona_ids)) {
+    const rolId = asInt(datos.rol_id);
+    if (rolId === 2 && Array.isArray(zona_ids)) {
         await nuevoUsuario.setZonas(zona_ids);
     }
 
@@ -63,16 +70,19 @@ export const crearUsuario = async (data) => {
 export const actualizarUsuario = async (id, data) => {
     const t = await sequelize.transaction();
     try {
-        // Desestructuramos lo que puede venir del formulario
         const {
-            zona_ids,        // array opcional para cobradores
-            password,        // string opcional; si viene no vacía, se actualiza
+            zona_ids, // array opcional para cobradores
+            password, // string opcional; si viene no vacía, se actualiza
             ...camposActualizables
         } = { ...data };
 
-        // Nunca persistimos password en plano dentro de "camposActualizables"
-        // (se maneja aparte si corresponde)
         delete camposActualizables.password;
+
+        // Traemos usuario actual (por rol actual y para operar zonas)
+        const usuarioActual = await Usuario.findByPk(id, { transaction: t });
+        if (!usuarioActual) {
+            throw new Error('Usuario no encontrado');
+        }
 
         // 1) Actualizamos los campos "normales"
         await Usuario.update(camposActualizables, {
@@ -83,18 +93,21 @@ export const actualizarUsuario = async (id, data) => {
         // 2) Si vino una nueva password NO vacía, la hasheamos y actualizamos
         if (typeof password === 'string' && password.trim().length > 0) {
             const hashed = await bcrypt.hash(password.trim(), 10);
-            await Usuario.update(
-                { password: hashed },
-                { where: { id }, transaction: t }
-            );
+            await Usuario.update({ password: hashed }, { where: { id }, transaction: t });
         }
 
-        // 3) Zonas (solo si el rol es cobrador = 2 y se envió zona_ids como array)
-        if (camposActualizables.rol_id === 2 && Array.isArray(zona_ids)) {
-            const usuario = await Usuario.findByPk(id, { transaction: t });
-            if (usuario) {
-                await usuario.setZonas(zona_ids, { transaction: t });
+        // 3) Zonas: se decide en base al rol "final" (nuevo si vino, sino el actual)
+        const rolFinal = asInt(camposActualizables.rol_id ?? usuarioActual.rol_id);
+
+        if (rolFinal === 2) {
+            // Si es cobrador y nos mandaron zonas, las seteamos (atómico)
+            if (Array.isArray(zona_ids)) {
+                await usuarioActual.setZonas(zona_ids, { transaction: t });
             }
+        } else {
+            // Si deja de ser cobrador, limpiamos zonas para evitar basura histórica
+            // (no rompe nada aunque no tuviera)
+            await usuarioActual.setZonas([], { transaction: t });
         }
 
         await t.commit();
@@ -106,7 +119,7 @@ export const actualizarUsuario = async (id, data) => {
 
 // Cambiar contraseña (endpoint dedicado)
 export const cambiarPassword = async (id, nuevaPassword) => {
-    const hashed = await bcrypt.hash(nuevaPassword, 10);
+    const hashed = await bcrypt.hash(String(nuevaPassword ?? ''), 10);
     await Usuario.update({ password: hashed }, { where: { id } });
 };
 
@@ -118,7 +131,7 @@ export const eliminarUsuario = async (id) => {
     }
 
     // Si es cobrador (rol_id === 2), verificamos si tiene clientes asignados
-    if (usuario.rol_id === 2) {
+    if (asInt(usuario.rol_id) === 2) {
         // Se usa la columna 'cobrador' según tu modelo Cliente
         const clientesAsignados = await Cliente.count({ where: { cobrador: id } });
         if (clientesAsignados > 0) {
@@ -129,12 +142,30 @@ export const eliminarUsuario = async (id) => {
     await Usuario.destroy({ where: { id } });
 };
 
-// Login
+// Login (devuelve un usuario "limpio" si es válido)
 export const loginUsuario = async (nombre_usuario, password) => {
-    const usuario = await Usuario.findOne({ where: { nombre_usuario } });
+    const userName = typeof nombre_usuario === 'string' ? nombre_usuario.trim() : '';
+    const pass = typeof password === 'string' ? password : '';
+
+    if (!userName || !pass) return null;
+
+    const usuario = await Usuario.findOne({
+        where: { nombre_usuario: userName },
+        // Traemos password solo para comparar; no lo devolvemos
+        attributes: ['id', 'rol_id', 'nombre_completo', 'nombre_usuario', 'password']
+    });
+
     if (!usuario) return null;
-    const valid = await bcrypt.compare(password, usuario.password);
-    return valid ? usuario : null;
+
+    const valid = await bcrypt.compare(pass, usuario.password);
+    if (!valid) return null;
+
+    // devolvemos solo lo necesario (sin password)
+    return {
+        id: usuario.id,
+        rol_id: usuario.rol_id,
+        nombre_completo: usuario.nombre_completo
+    };
 };
 
 /* ──────────────────────────────────────────────────────────
@@ -184,4 +215,3 @@ export const obtenerCobradores = async (options = {}) => {
     const { conZonas = false } = options;
     return conZonas ? obtenerCobradoresConZonas() : obtenerCobradoresBasico();
 };
-

@@ -1,36 +1,52 @@
-import bcrypt from 'bcrypt';
+// financiera-backend/auth/controller.js
+
 import jwt from 'jsonwebtoken';
-import pool from '../db.js'; // ajustá la ruta si tu archivo de conexión a la BD está en otro lado
-import { SECRET_KEY } from '../config.js'; // donde tengas la clave secreta
+import dotenv from 'dotenv';
+import { loginUsuario } from '../services/usuario.service.js';
+
+dotenv.config();
 
 export const login = async (req, res) => {
-  const { username, password } = req.body;
-  
+  // Compatibilidad: algunos clientes envían "username", otros "nombre_usuario"
+  const usernameRaw = req.body?.username ?? req.body?.nombre_usuario;
+  const passwordRaw = req.body?.password;
+
+  const nombre_usuario =
+    typeof usernameRaw === 'string' ? usernameRaw.trim() : '';
+  const password = typeof passwordRaw === 'string' ? passwordRaw : '';
+
+  if (!nombre_usuario || !password) {
+    return res.status(400).json({ message: 'Faltan credenciales' });
+  }
+
+  const JWT_SECRET = process.env.JWT_SECRET;
+  if (!JWT_SECRET) {
+    return res
+      .status(500)
+      .json({ message: 'Configuración inválida: falta JWT_SECRET' });
+  }
+
+  const expiresIn = process.env.JWT_EXPIRES_IN || '8h';
+
   try {
-    const [rows] = await pool.query('SELECT * FROM usuarios WHERE username = ?', [username]);
+    const usuario = await loginUsuario(nombre_usuario, password);
 
-    if (rows.length === 0) {
-      return res.status(404).json({ message: 'Usuario no encontrado' });
-    }
-
-    const user = rows[0];
-
-    const passwordMatch = await bcrypt.compare(password, user.password);
-
-    if (!passwordMatch) {
-      return res.status(401).json({ message: 'Contraseña incorrecta' });
+    if (!usuario) {
+      // Mantengo el estilo del controlador viejo
+      return res
+        .status(401)
+        .json({ message: 'Usuario o contraseña inválidos' });
     }
 
     const token = jwt.sign(
-      { id: user.id, rol_id: user.rol_id },
-      SECRET_KEY,
-      { expiresIn: '8h' }
+      { id: usuario.id, rol_id: usuario.rol_id },
+      JWT_SECRET,
+      { expiresIn }
     );
 
-    res.json({ token });
-    
+    return res.json({ token });
   } catch (error) {
     console.error('Error en login:', error);
-    res.status(500).json({ message: 'Error del servidor' });
+    return res.status(500).json({ message: 'Error del servidor' });
   }
 };

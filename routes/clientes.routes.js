@@ -27,6 +27,48 @@ import Credito from '../models/Credito.js';
 const router = Router();
 
 /* ──────────────────────────────────────────────────────────
+   Helpers
+   ────────────────────────────────────────────────────────── */
+const getRoleIdFromReq = (req) => {
+  // Intentamos varios formatos posibles sin asumir cómo está implementado verifyToken/checkRole
+  return (
+    req.user?.rol_id ??
+    req.user?.rolId ??
+    req.user?.role_id ??
+    req.user?.roleId ??
+    req.user?.rol ??
+    req.user?.role ??
+    req.rol_id ??
+    req.role_id ??
+    req.rolId ??
+    req.roleId ??
+    null
+  );
+};
+
+/**
+ * Extrae el filename de dni_foto sin depender del host (sirve en localhost y producción).
+ * Acepta:
+ * - "archivo.jpg"
+ * - "/uploads/dni/archivo.jpg"
+ * - "https://dominio.com/uploads/dni/archivo.jpg"
+ */
+const extractDniFotoFilename = (value) => {
+  if (!value) return null;
+  const s = String(value).trim();
+  if (!s) return null;
+
+  const marker = '/uploads/dni/';
+  const idx = s.lastIndexOf(marker);
+  if (idx !== -1) return s.slice(idx + marker.length);
+
+  // Si es un path/URL genérico, me quedo con el último segmento
+  if (s.includes('/')) return s.split('/').filter(Boolean).pop();
+
+  return s;
+};
+
+/* ──────────────────────────────────────────────────────────
    MULTER: Subida de imagen de DNI (disco)
    ────────────────────────────────────────────────────────── */
 const storage = multer.diskStorage({
@@ -295,7 +337,9 @@ router.post('/:id/dni-foto', verifyToken, checkRole([0]), upload.single('imagen'
       return res.status(400).json({ success: false, message: 'No se recibió ninguna imagen' });
     }
 
-    await actualizarCliente(id, { dni_foto });
+    // ✅ pasamos rol explícito para que el service pueda aplicar reglas si lo necesita
+    const roleId = getRoleIdFromReq(req);
+    await actualizarCliente(id, { dni_foto }, { actorRoleId: roleId });
 
     res.json({
       success: true,
@@ -304,7 +348,7 @@ router.post('/:id/dni-foto', verifyToken, checkRole([0]), upload.single('imagen'
     });
   } catch (error) {
     console.error('Error al subir foto del DNI:', error);
-    res.status(500).json({ success: false, message: 'Error al subir la imagen' });
+    res.status(500).json({ success: false, message: error?.message || 'Error al subir la imagen' });
   }
 });
 
@@ -345,7 +389,6 @@ router.get('/por-cobrador/:id', verifyToken, checkRole([2]), async (req, res) =>
     await actualizarCuotasVencidas();
 
     // ✅ 2) Recalculamos mora/estado de TODA la cartera del cobrador ANTES de responder
-    //     (así lo que se incluye en clientes→créditos→cuotas llega actualizado)
     const creditos = await Credito.findAll({
       where: { cobrador_id: cobradorId },
       attributes: ['id'],
@@ -353,7 +396,6 @@ router.get('/por-cobrador/:id', verifyToken, checkRole([2]), async (req, res) =>
     });
 
     for (const c of creditos) {
-      // idempotente: si ya está ok, no rompe; si está viejo, lo actualiza
       await recalcularMoraPorCredito(c.id);
     }
 
@@ -383,9 +425,11 @@ router.post('/', verifyToken, checkRole([0, 1]), async (req, res) => {
   try {
     const body = req.body;
 
-    if (!body.nombre || !body.apellido || !body.dni || !body.direccion || !body.provincia ||
+    if (
+      !body.nombre || !body.apellido || !body.dni || !body.direccion || !body.provincia ||
       !body.localidad || !body.telefono || !body.email || !body.fecha_nacimiento ||
-      !body.fecha_registro || !body.cobrador || !body.zona) {
+      !body.fecha_registro || !body.cobrador || !body.zona
+    ) {
       return res.status(400).json({ success: false, message: 'Faltan campos obligatorios' });
     }
 
@@ -407,48 +451,85 @@ router.post('/', verifyToken, checkRole([0, 1]), async (req, res) => {
     });
   } catch (error) {
     console.error('Error al crear cliente:', error);
-    res.status(500).json({ success: false, message: 'Error interno' });
+    res.status(500).json({ success: false, message: error?.message || 'Error interno' });
   }
 });
 
-// PUT - Actualizar cliente (solo superadmin)
-router.put('/:id', verifyToken, checkRole([0]), async (req, res) => {
+// PUT - Actualizar cliente (superadmin y admin; admin NO puede cambiar DNI)
+router.put('/:id', verifyToken, checkRole([0, 1]), async (req, res) => {
   try {
     const { id } = req.params;
     const body = req.body;
 
-    if (!body.nombre || !body.apellido || !body.dni || !body.fecha_nacimiento || !body.fecha_registro ||
-      !body.email || !body.telefono || !body.direccion || !body.provincia || !body.localidad ||
-      !body.cobrador || !body.zona) {
-      return res.status(400).json({ success: false, message: 'Faltan campos obligatorios' });
-    }
+    const roleId = getRoleIdFromReq(req);
 
     const clienteActual = await obtenerClientePorId(id);
     if (!clienteActual) {
       return res.status(404).json({ success: false, message: 'Cliente no encontrado' });
     }
 
+    // ✅ Admin (1) NO puede modificar DNI
+    // - Si lo manda distinto: 403
+    // - Si no lo manda: usamos el DNI actual (para no obligar al front a enviar el campo)
+    const dniActual = String(clienteActual.dni ?? '');
+    const dniEnBody = body?.dni != null && String(body.dni) !== '' ? String(body.dni) : null;
+
+    if (Number(roleId) === 1) {
+      if (dniEnBody != null && dniEnBody !== dniActual) {
+        return res.status(403).json({
+          success: false,
+          message: 'No autorizado: el rol admin no puede modificar el DNI del cliente'
+        });
+      }
+    }
+
+    // ✅ dni_foto: si viene URL/absolute/path, la bajamos a filename; si no viene, preservamos.
+    const dniFotoActualFilename = extractDniFotoFilename(clienteActual?.dni_foto);
+    const dniFotoBodyFilename = body?.dni_foto != null ? extractDniFotoFilename(body.dni_foto) : null;
+
     const bodyFinal = {
       ...body,
-      dni_foto: body.dni_foto ?? clienteActual.dni_foto?.replace('http://localhost:3000/uploads/dni/', '') ?? null
+
+      // DNI resuelto (admin no lo cambia; superadmin sí puede)
+      dni: dniEnBody ?? clienteActual.dni,
+
+      // foto DNI resuelta a filename para DB
+      dni_foto: dniFotoBodyFilename ?? dniFotoActualFilename ?? null
     };
 
-    await actualizarCliente(id, bodyFinal);
+    // Validación de obligatorios (con dni ya resuelto)
+    if (
+      !bodyFinal.nombre || !bodyFinal.apellido || !bodyFinal.dni || !bodyFinal.fecha_nacimiento || !bodyFinal.fecha_registro ||
+      !bodyFinal.email || !bodyFinal.telefono || !bodyFinal.direccion || !bodyFinal.provincia || !bodyFinal.localidad ||
+      !bodyFinal.cobrador || !bodyFinal.zona
+    ) {
+      return res.status(400).json({ success: false, message: 'Faltan campos obligatorios' });
+    }
+
+    // ✅ CLAVE: pasamos el rol al service para que aplique la regla por backend
+    await actualizarCliente(id, bodyFinal, { actorRoleId: roleId });
+
     res.json({ success: true, message: 'Cliente actualizado exitosamente' });
   } catch (error) {
     console.error('Error al actualizar cliente:', error);
-    res.status(500).json({ success: false, message: 'Error interno' });
+
+    const status = Number(error?.status || 500);
+    if (status === 403) {
+      return res.status(403).json({ success: false, message: error?.message || 'No autorizado' });
+    }
+
+    res.status(500).json({ success: false, message: error?.message || 'Error interno' });
   }
 });
 
-// DELETE - Eliminar cliente (superadmin y admin)
-router.delete('/:id', verifyToken, checkRole([0, 1]), async (req, res) => {
+// DELETE - Eliminar cliente (SOLO superadmin)
+router.delete('/:id', verifyToken, checkRole([0]), async (req, res) => {
   try {
     await eliminarCliente(req.params.id);
     res.json({ success: true, message: 'Cliente eliminado exitosamente' });
   } catch (error) {
     console.error('Error al eliminar cliente:', error);
-    res.status(500).json({ success: false, message: 'Error interno' });
+    res.status(500).json({ success: false, message: error?.message || 'Error interno' });
   }
 });
 
