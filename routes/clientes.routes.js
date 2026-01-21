@@ -27,6 +27,20 @@ import Credito from '../models/Credito.js';
 const router = Router();
 
 /* ──────────────────────────────────────────────────────────
+   Feature flags
+   ────────────────────────────────────────────────────────── */
+const parseBool = (v, def = false) => {
+  if (v == null) return def;
+  const s = String(v).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'y', 'on'].includes(s)) return true;
+  if (['0', 'false', 'no', 'n', 'off'].includes(s)) return false;
+  return def;
+};
+
+// ✅ DNI foto apagado por defecto. Para habilitar en el futuro: DNI_FOTO_ENABLED=true
+const DNI_FOTO_ENABLED = parseBool(process.env.DNI_FOTO_ENABLED, false);
+
+/* ──────────────────────────────────────────────────────────
    Helpers
    ────────────────────────────────────────────────────────── */
 const getRoleIdFromReq = (req) => {
@@ -328,7 +342,14 @@ router.post(
 );
 
 // Ruta: Subir foto del DNI y actualizar cliente
-router.post('/:id/dni-foto', verifyToken, checkRole([0]), upload.single('imagen'), async (req, res) => {
+// ✅ Ahora queda controlado por feature flag para poder apagarlo sin borrar código.
+router.post('/:id/dni-foto', verifyToken, checkRole([0]), (req, res, next) => {
+  if (!DNI_FOTO_ENABLED) {
+    // 404: “no existe” (más discreto) y evita que alguien detecte feature por permisos
+    return res.status(404).json({ success: false, message: 'Not Found' });
+  }
+  return next();
+}, upload.single('imagen'), async (req, res) => {
   try {
     const { id } = req.params;
     const dni_foto = req.file?.filename;
@@ -483,9 +504,13 @@ router.put('/:id', verifyToken, checkRole([0, 1]), async (req, res) => {
       }
     }
 
-    // ✅ dni_foto: si viene URL/absolute/path, la bajamos a filename; si no viene, preservamos.
-    const dniFotoActualFilename = extractDniFotoFilename(clienteActual?.dni_foto);
-    const dniFotoBodyFilename = body?.dni_foto != null ? extractDniFotoFilename(body.dni_foto) : null;
+    // ✅ dni_foto:
+    // - Si feature apagado => NO procesamos cambios, preservamos el actual.
+    // - Si feature encendido => normalizamos a filename.
+    const dniFotoActualFilename = DNI_FOTO_ENABLED ? extractDniFotoFilename(clienteActual?.dni_foto) : extractDniFotoFilename(clienteActual?.dni_foto);
+    const dniFotoBodyFilename = DNI_FOTO_ENABLED
+      ? (body?.dni_foto != null ? extractDniFotoFilename(body.dni_foto) : null)
+      : null;
 
     const bodyFinal = {
       ...body,
@@ -493,8 +518,10 @@ router.put('/:id', verifyToken, checkRole([0, 1]), async (req, res) => {
       // DNI resuelto (admin no lo cambia; superadmin sí puede)
       dni: dniEnBody ?? clienteActual.dni,
 
-      // foto DNI resuelta a filename para DB
-      dni_foto: dniFotoBodyFilename ?? dniFotoActualFilename ?? null
+      // foto DNI resuelta a filename para DB (solo si feature está habilitado)
+      ...(DNI_FOTO_ENABLED
+        ? { dni_foto: dniFotoBodyFilename ?? dniFotoActualFilename ?? null }
+        : { dni_foto: dniFotoActualFilename ?? null })
     };
 
     // Validación de obligatorios (con dni ya resuelto)

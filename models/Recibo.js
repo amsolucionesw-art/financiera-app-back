@@ -62,6 +62,21 @@ const Recibo = sequelize.define('Recibo', {
         allowNull: false
     },
 
+    // ✅ Para modalidad "libre": ciclo al que se imputó el recibo (1..3)
+    // Esto permite:
+    // - ciclos por calendario (1→2→3) aunque no pague
+    // - mora del ciclo 1 siga corriendo hasta cerrar (mora+interés) de ese ciclo
+    // - imputación por prioridad: mora → interés → capital, empezando por el ciclo más viejo
+    ciclo_libre: {
+        type: DataTypes.SMALLINT,
+        allowNull: true,
+        defaultValue: null,
+        validate: {
+            min: 1,
+            max: 3
+        }
+    },
+
     // ── Campos de desglose ──
     importe_cuota_original: {
         type: DataTypes.DECIMAL(10, 2),

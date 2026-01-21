@@ -74,6 +74,13 @@ const CORS_CREDENTIALS = parseBool(process.env.CORS_CREDENTIALS, false);
 const DB_SYNC = parseBool(process.env.DB_SYNC, false);
 const DB_SYNC_ALTER = parseBool(process.env.DB_SYNC_ALTER, false);
 
+/**
+ * Feature flag para servir uploads públicamente.
+ * - Por defecto: APAGADO (más seguro, no expone DNI ni archivos)
+ * - Para habilitar: setear UPLOADS_PUBLIC_ENABLED=true en el entorno (Dokploy)
+ */
+const UPLOADS_PUBLIC_ENABLED = parseBool(process.env.UPLOADS_PUBLIC_ENABLED, false);
+
 /* ─── App ─── */
 const app = express();
 
@@ -100,7 +107,15 @@ app.use(express.urlencoded({ extended: true }));
 
 /* ─── Archivos estáticos (fuera del prefijo) ─── */
 const uploadsDir = path.resolve(process.cwd(), 'uploads');
-app.use('/uploads', express.static(uploadsDir));
+
+if (UPLOADS_PUBLIC_ENABLED) {
+  app.use('/uploads', express.static(uploadsDir));
+} else {
+  // ✅ No exponemos archivos en /uploads (evita acceso directo a DNI u otros docs)
+  app.use('/uploads', (_req, res) => {
+    res.status(404).json({ ok: false, error: 'NOT_FOUND' });
+  });
+}
 
 /* ─── Healthchecks ─── */
 app.get('/', (_req, res) => res.send('API OK'));
@@ -110,6 +125,7 @@ app.get(`${API_PREFIX}/health`, (_req, res) => {
     ok: true,
     ts: new Date().toISOString(),
     apiPrefix: API_PREFIX,
+    uploadsPublic: UPLOADS_PUBLIC_ENABLED,
   });
 });
 
@@ -190,6 +206,7 @@ const start = async () => {
       console.log(`🚀 Servidor corriendo en http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
       console.log(`🔗 Prefix API: ${API_PREFIX || '(sin prefijo)'}`);
       console.log(`📁 Static uploads: ${uploadsDir}`);
+      console.log(`🧱 Uploads public: ${UPLOADS_PUBLIC_ENABLED ? 'ON' : 'OFF'}`);
     });
   } catch (err) {
     console.error('🔴 Error al iniciar el servidor:', err);

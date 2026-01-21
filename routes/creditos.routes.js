@@ -139,6 +139,18 @@ const construirCuotasPreview = ({
 };
 
 /**
+ * 🔒 Parseo seguro de YYYY-MM-DD a Date local.
+ * Motivo: new Date('YYYY-MM-DD') se interpreta como UTC y en AR (UTC-3)
+ * puede correr 1 día, afectando ciclos/mora cerca de vencimientos.
+ */
+const parseYMDToLocalDate = (ymdStr) => {
+    if (!isValidYMD(ymdStr)) return null;
+    const [y, m, d] = ymdStr.split('-').map((x) => parseInt(x, 10));
+    // mediodía para evitar edge cases por DST/offset
+    return new Date(y, m - 1, d, 12, 0, 0);
+};
+
+/**
  * Valida el payload para crear/actualizar créditos.
  * Devuelve un array de strings con errores. Si está vacío, pasa validación.
  * - isUpdate=false: validaciones de requeridos mínimas para creación
@@ -219,7 +231,7 @@ function validarPayloadCredito(body = {}, isUpdate = false) {
         }
     }
 
-    // fechas (opcionales). Permitimos fechas pasadas para tests de cuotas vencidas.
+    // fechas (opcionales)
     if (fecha_solicitud !== undefined && fecha_solicitud !== null && fecha_solicitud !== '') {
         if (!isValidYMD(fecha_solicitud)) {
             errors.push('fecha_solicitud debe ser YYYY-MM-DD');
@@ -295,14 +307,7 @@ function validarPayloadSimulacion(body = {}) {
     return errors;
 }
 
-/* 1) Créditos por cliente (con filtros opcionales)
-   Query soportada:
-   - estado: pendiente|parcial|vencido|pagado|refinanciado|anulado
-   - modalidad: comun|progresivo|libre
-   - tipo: semanal|quincenal|mensual
-   - desde, hasta: YYYY-MM-DD
-   - conCuotasVencidas: 1|true
-*/
+/* 1) Créditos por cliente (con filtros opcionales) */
 router.get(
     '/cliente/:clienteId',
     verifyToken, checkRole([0, 1]),
@@ -310,7 +315,6 @@ router.get(
         try {
             const clienteId = Number(req.params.clienteId);
 
-            // Sanitizar/validar query sin romper compatibilidad
             const q = {};
             const { estado, modalidad, tipo, desde, hasta, conCuotasVencidas } = req.query || {};
 
@@ -340,7 +344,6 @@ router.get(
                 q.conCuotasVencidas = (val === '1' || val === 'true');
             }
 
-            // Pasamos rol_id al service para aplicar reglas de visualización
             const cliente = await obtenerCreditosPorCliente(clienteId, q, { rol_id: req.user.rol_id });
             if (!cliente) {
                 return res.status(404).json({ success: false, message: 'Cliente no encontrado' });
@@ -353,12 +356,7 @@ router.get(
     }
 );
 
-/* 1.0) SIMULAR crédito (para Cotizador: comun/progresivo)
-   NO toca la base. Devuelve:
-   - interes (porcentaje total aplicado, mínimo 60% según tipo/cantidad)
-   - monto_total_devolver
-   - cuotas: [{ numero_cuota, importe_cuota, fecha_vencimiento? }]
-*/
+/* 1.0) SIMULAR crédito (para Cotizador: comun/progresivo) */
 router.post(
     '/simular',
     verifyToken, checkRole([0, 1]),
@@ -384,8 +382,6 @@ router.post(
 
             const mod = String(modalidad_credito || '').toLowerCase();
 
-            // Para ahora nos enfocamos en comun y progresivo.
-            // Si quisieras, más adelante podemos extender a libre con sus reglas propias.
             if (!['comun', 'progresivo'].includes(mod)) {
                 return res.status(400).json({
                     success: false,
@@ -393,15 +389,12 @@ router.post(
                 });
             }
 
-            // Interés proporcional mínimo 60% (misma regla que en el service real)
             const interesPct = calcularInteresProporcionalMin60(tipo_credito, cantidad_cuotas);
 
-            // capital + interés lineal
             let totalBase = Number(
                 (Number(monto_acreditar) * (1 + interesPct / 100)).toFixed(2)
             );
 
-            // Descuento opcional sólo si el usuario es superadmin (igual que en crearCredito)
             let descuentoPct = 0;
             if (req.user?.rol_id === 0 && Number(descuento) > 0) {
                 descuentoPct = Number(descuento);
@@ -409,7 +402,6 @@ router.post(
                 totalBase = Number((totalBase - discMonto).toFixed(2));
             }
 
-            // Construcción de cuotas (misma lógica que generarCuotasServicio)
             const cuotas = construirCuotasPreview({
                 modalidad_credito: mod,
                 cantidad_cuotas,
@@ -441,7 +433,7 @@ router.post(
     }
 );
 
-/* 1.1) Ficha PDF del crédito (¡antes que "/:id" para no colisionar!) */
+/* 1.1) Ficha PDF del crédito */
 router.get(
     '/:id/ficha.pdf',
     verifyToken, checkRole([0, 1]),
@@ -477,7 +469,7 @@ router.get(
     }
 );
 
-/* 1.3) (REUBICADA) Pre-chequeo de eliminabilidad (solo superadmin) */
+/* 1.3) Pre-chequeo eliminable */
 router.get(
     '/:id/eliminable',
     verifyToken, checkRole([0]),
@@ -492,7 +484,7 @@ router.get(
     }
 );
 
-/* 2) Resumen LIBRE (capital, interés hoy, total) */
+/* 2) Resumen LIBRE */
 router.get(
     '/:id/resumen-libre',
     verifyToken, checkRole([0, 1]),
@@ -502,7 +494,10 @@ router.get(
             if (fecha && !isValidYMD(fecha)) {
                 return res.status(400).json({ success: false, message: 'El parámetro "fecha" debe ser YYYY-MM-DD' });
             }
-            const refDate = fecha ? new Date(fecha) : new Date();
+            const refDate = fecha ? parseYMDToLocalDate(fecha) : new Date();
+            if (fecha && !refDate) {
+                return res.status(400).json({ success: false, message: 'Fecha inválida' });
+            }
             const data = await obtenerResumenLibre(Number(req.params.id), refDate);
             res.json({ success: true, data });
         } catch (error) {
@@ -522,7 +517,10 @@ router.get(
             if (fecha && !isValidYMD(fecha)) {
                 return res.status(400).json({ success: false, message: 'El parámetro "fecha" debe ser YYYY-MM-DD' });
             }
-            const refDate = fecha ? new Date(fecha) : new Date();
+            const refDate = fecha ? parseYMDToLocalDate(fecha) : new Date();
+            if (fecha && !refDate) {
+                return res.status(400).json({ success: false, message: 'Fecha inválida' });
+            }
             const data = await obtenerResumenLibre(Number(req.params.id), refDate);
             res.json({ success: true, data });
         } catch (error) {
@@ -559,7 +557,6 @@ router.post(
                 return res.status(400).json({ success: false, message: 'Validación', errors });
             }
 
-            // Pasamos rol_id y usuario_id al service
             const id = await crearCredito({
                 ...req.body,
                 rol_id: req.user.rol_id,
@@ -580,7 +577,7 @@ router.post(
     }
 );
 
-/* 4.1) Refinanciar crédito (P1/P2/Manual) */
+/* 4.1) Refinanciar crédito */
 router.post(
     '/:id/refinanciar',
     verifyToken, checkRole([0, 1]),
@@ -654,7 +651,6 @@ router.delete(
     verifyToken, checkRole([0]),
     async (req, res) => {
         try {
-            // Pre-chequeo para evitar error de FK y dar mensaje claro
             const { eliminable, cantidadPagos } = await esCreditoEliminable(req.params.id);
             if (!eliminable) {
                 return res.status(409).json({
@@ -689,7 +685,6 @@ router.post(
                 observacion = null
             } = req.body || {};
 
-            // Validación básica de modo de descuento
             if (descuento_sobre && !DESCUENTO_SOBRE_VALIDOS.has(String(descuento_sobre))) {
                 return res.status(400).json({
                     success: false,
@@ -704,7 +699,6 @@ router.post(
                 descuento_sobre,
                 observacion,
                 rol_id: req.user.rol_id,
-                // 👇 nuevo: usuario que cancela el crédito
                 usuario_id: req.user.id
             });
             res.json({ success: true, message: 'Crédito cancelado', data });

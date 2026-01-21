@@ -10,6 +10,13 @@ import { Op } from 'sequelize';
 import * as XLSX from 'xlsx';
 
 /**
+ * Feature flag para DNI FOTO
+ * - Por defecto: APAGADO (no se expone ni se permite editar dni_foto)
+ * - Para habilitar: setear DNI_FOTO_ENABLED=true en el entorno (Dokploy)
+ */
+const DNI_FOTO_ENABLED = String(process.env.DNI_FOTO_ENABLED || '').toLowerCase() === 'true';
+
+/**
  * BASE_URL para absolutizar links (dni_foto).
  * Producción: seteá APP_BASE_URL o BASE_URL (ej: https://tudominio.com)
  * Dev: fallback al puerto local.
@@ -74,12 +81,23 @@ const assertDniDisponible = async (dni, { excludeId = null } = {}) => {
 export const obtenerClientes = async (query) => {
     const where = buildFilters(query, ['dni', 'zona', 'cobrador', 'apellido', 'localidad']);
 
-    return Cliente.findAll({
+    const clientes = await Cliente.findAll({
         where,
         include: [
             { model: Usuario, as: 'cobradorUsuario', attributes: ['id', 'nombre_completo'] },
             { model: Zona, as: 'clienteZona', attributes: ['id', 'nombre'] },
         ],
+    });
+
+    // ✅ Sanitizamos salida para no exponer dni_foto si feature flag está apagado
+    return (clientes || []).map((c) => {
+        const plain = c?.toJSON ? c.toJSON() : c;
+        if (!DNI_FOTO_ENABLED && plain && Object.prototype.hasOwnProperty.call(plain, 'dni_foto')) {
+            delete plain.dni_foto;
+        } else {
+            absolutizeDniFoto(plain);
+        }
+        return plain;
     });
 };
 
@@ -164,7 +182,13 @@ export const obtenerClientePorId = async (id) => {
     if (!cliente) return null;
 
     const plain = cliente.toJSON();
-    absolutizeDniFoto(plain);
+
+    // ✅ Si DNI_FOTO_ENABLED está apagado, NO exponemos dni_foto
+    if (!DNI_FOTO_ENABLED && Object.prototype.hasOwnProperty.call(plain, 'dni_foto')) {
+        delete plain.dni_foto;
+    } else {
+        absolutizeDniFoto(plain);
+    }
 
     return plain;
 };
@@ -193,7 +217,11 @@ export const obtenerClientesPorCobrador = async (cobradorId) => {
     return (clientes || []).map((c) => {
         const plain = c?.toJSON ? c.toJSON() : c;
 
-        absolutizeDniFoto(plain);
+        if (!DNI_FOTO_ENABLED && plain && Object.prototype.hasOwnProperty.call(plain, 'dni_foto')) {
+            delete plain.dni_foto;
+        } else {
+            absolutizeDniFoto(plain);
+        }
 
         if (Array.isArray(plain.creditos)) {
             plain.creditos = plain.creditos.map((cred) => {
@@ -275,6 +303,11 @@ export const actualizarCliente = async (id, data, { actorRoleId = null } = {}) =
     // Clon defensivo (evita mutar referencia externa)
     const payload = data ? { ...data } : {};
 
+    // ✅ Si la función de DNI FOTO está apagada, NO permitimos modificar dni_foto por API (ningún rol)
+    if (!DNI_FOTO_ENABLED && Object.prototype.hasOwnProperty.call(payload, 'dni_foto')) {
+        delete payload.dni_foto;
+    }
+
     // ✅ Admin: no permitir cambios en dni_foto por PUT
     if (esAdmin && Object.prototype.hasOwnProperty.call(payload, 'dni_foto')) {
         delete payload.dni_foto;
@@ -311,7 +344,8 @@ export const actualizarCliente = async (id, data, { actorRoleId = null } = {}) =
     const datosActualizados = {
         ...clientePrevio,
         ...payload,
-        dni_foto: payload.dni_foto ?? clientePrevio.dni_foto,
+        // ✅ Si dni_foto está apagado, preservamos el valor previo sí o sí
+        dni_foto: DNI_FOTO_ENABLED ? (payload.dni_foto ?? clientePrevio.dni_foto) : clientePrevio.dni_foto,
     };
 
     delete datosActualizados.id;
