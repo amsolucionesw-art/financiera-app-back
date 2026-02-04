@@ -62,11 +62,21 @@ const Recibo = sequelize.define('Recibo', {
         allowNull: false
     },
 
+    // ✅ Modalidad del crédito asociada al recibo (para filtros y cálculo LIBRE por ciclo).
+    // NULL para compat con recibos históricos.
+    modalidad_credito: {
+        type: DataTypes.STRING(20),
+        allowNull: true,
+        defaultValue: null,
+        validate: {
+            isIn: {
+                args: [['comun', 'progresivo', 'libre']],
+                msg: 'modalidad_credito inválida'
+            }
+        }
+    },
+
     // ✅ Para modalidad "libre": ciclo al que se imputó el recibo (1..3)
-    // Esto permite:
-    // - ciclos por calendario (1→2→3) aunque no pague
-    // - mora del ciclo 1 siga corriendo hasta cerrar (mora+interés) de ese ciclo
-    // - imputación por prioridad: mora → interés → capital, empezando por el ciclo más viejo
     ciclo_libre: {
         type: DataTypes.SMALLINT,
         allowNull: true,
@@ -98,7 +108,6 @@ const Recibo = sequelize.define('Recibo', {
         allowNull: false,
         defaultValue: 0.00
     },
-    // Para modalidad "libre": interés del/los ciclo/s cobrado/s en liquidación total/adelantada
     interes_ciclo_cobrado: {
         type: DataTypes.DECIMAL(10, 2),
         allowNull: false,

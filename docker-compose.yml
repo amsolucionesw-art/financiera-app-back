@@ -3,12 +3,10 @@ services:
     image: postgres:16-alpine
     container_name: financiera_db
     restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${DB_NAME}
-      POSTGRES_USER: ${DB_USER}
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    env_file:
+      - .env.docker
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -26,37 +24,19 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    environment:
-      NODE_ENV: production
-
-      # API
-      PORT: 3000
-      HOST: 0.0.0.0
-      API_PREFIX: ${API_PREFIX}
-
-      # CORS (para staging y luego dominio real)
-      CORS_ORIGIN: ${CORS_ORIGIN}
-      CORS_CREDENTIALS: ${CORS_CREDENTIALS}
-
-      # DB (Sequelize)
-      DB_HOST: db
-      DB_PORT: 5432
-      DB_NAME: ${DB_NAME}
-      DB_USER: ${DB_USER}
-      DB_PASSWORD: ${DB_PASSWORD}
-
-      # JWT
-      JWT_SECRET: ${JWT_SECRET}
-      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN}
-
-      # Sync SOLO para staging (en producción real lo apagamos)
-      DB_SYNC: ${DB_SYNC}
-      DB_SYNC_ALTER: ${DB_SYNC_ALTER}
-
+    env_file:
+      - .env.docker
     ports:
       - "3000:3000"
+
+    # 🔑 CLAVE PARA DESARROLLO
     volumes:
+      - ./:/app
+      - /app/node_modules
       - uploads:/app/uploads
+
+    # 🔁 nodemon en lugar de node
+    command: npm run dev:docker
 
 volumes:
   pgdata:

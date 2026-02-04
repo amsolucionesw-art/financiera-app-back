@@ -60,6 +60,20 @@ const getRoleIdFromReq = (req) => {
   );
 };
 
+const str = (v) => (v ?? '').toString().trim();
+
+// ✅ Email opcional: si viene vacío -> null; si viene -> validar formato
+const normalizeEmailOrNull = (value) => {
+  const s = str(value);
+  return s ? s : null;
+};
+
+const isValidEmail = (value) => {
+  const s = str(value);
+  if (!s) return true; // opcional
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+};
+
 /**
  * Extrae el filename de dni_foto sin depender del host (sirve en localhost y producción).
  * Acepta:
@@ -444,27 +458,38 @@ router.get('/:id', verifyToken, checkRole([0, 1, 2]), async (req, res) => {
 // POST - Crear cliente
 router.post('/', verifyToken, checkRole([0, 1]), async (req, res) => {
   try {
-    const body = req.body;
+    const body = req.body || {};
+
+    // ✅ Email opcional: normalizamos y validamos solo si viene
+    const emailNorm = normalizeEmailOrNull(body.email);
+    if (!isValidEmail(emailNorm)) {
+      return res.status(400).json({ success: false, message: 'El email tiene formato inválido' });
+    }
+
+    const bodyFinal = {
+      ...body,
+      email: emailNorm
+    };
 
     if (
-      !body.nombre || !body.apellido || !body.dni || !body.direccion || !body.provincia ||
-      !body.localidad || !body.telefono || !body.email || !body.fecha_nacimiento ||
-      !body.fecha_registro || !body.cobrador || !body.zona
+      !bodyFinal.nombre || !bodyFinal.apellido || !bodyFinal.dni || !bodyFinal.direccion || !bodyFinal.provincia ||
+      !bodyFinal.localidad || !bodyFinal.telefono || !bodyFinal.fecha_nacimiento ||
+      !bodyFinal.fecha_registro || !bodyFinal.cobrador || !bodyFinal.zona
     ) {
       return res.status(400).json({ success: false, message: 'Faltan campos obligatorios' });
     }
 
     const zonasCobrador = await CobradorZona.findAll({
-      where: { cobrador_id: body.cobrador },
+      where: { cobrador_id: bodyFinal.cobrador },
       attributes: ['zona_id']
     });
 
-    const zonaValida = zonasCobrador.some(z => z.zona_id.toString() === body.zona.toString());
+    const zonaValida = zonasCobrador.some(z => z.zona_id.toString() === bodyFinal.zona.toString());
     if (!zonaValida) {
       return res.status(400).json({ success: false, message: 'Zona no válida para este cobrador' });
     }
 
-    const nuevoClienteId = await crearCliente(body);
+    const nuevoClienteId = await crearCliente(bodyFinal);
     res.status(201).json({
       success: true,
       message: 'Cliente creado exitosamente',
@@ -480,7 +505,7 @@ router.post('/', verifyToken, checkRole([0, 1]), async (req, res) => {
 router.put('/:id', verifyToken, checkRole([0, 1]), async (req, res) => {
   try {
     const { id } = req.params;
-    const body = req.body;
+    const body = req.body || {};
 
     const roleId = getRoleIdFromReq(req);
 
@@ -504,6 +529,12 @@ router.put('/:id', verifyToken, checkRole([0, 1]), async (req, res) => {
       }
     }
 
+    // ✅ Email opcional: normalizamos y validamos solo si viene
+    const emailNorm = normalizeEmailOrNull(body.email);
+    if (!isValidEmail(emailNorm)) {
+      return res.status(400).json({ success: false, message: 'El email tiene formato inválido' });
+    }
+
     // ✅ dni_foto:
     // - Si feature apagado => NO procesamos cambios, preservamos el actual.
     // - Si feature encendido => normalizamos a filename.
@@ -518,6 +549,9 @@ router.put('/:id', verifyToken, checkRole([0, 1]), async (req, res) => {
       // DNI resuelto (admin no lo cambia; superadmin sí puede)
       dni: dniEnBody ?? clienteActual.dni,
 
+      // Email resuelto (opcional)
+      email: emailNorm,
+
       // foto DNI resuelta a filename para DB (solo si feature está habilitado)
       ...(DNI_FOTO_ENABLED
         ? { dni_foto: dniFotoBodyFilename ?? dniFotoActualFilename ?? null }
@@ -527,7 +561,7 @@ router.put('/:id', verifyToken, checkRole([0, 1]), async (req, res) => {
     // Validación de obligatorios (con dni ya resuelto)
     if (
       !bodyFinal.nombre || !bodyFinal.apellido || !bodyFinal.dni || !bodyFinal.fecha_nacimiento || !bodyFinal.fecha_registro ||
-      !bodyFinal.email || !bodyFinal.telefono || !bodyFinal.direccion || !bodyFinal.provincia || !bodyFinal.localidad ||
+      !bodyFinal.telefono || !bodyFinal.direccion || !bodyFinal.provincia || !bodyFinal.localidad ||
       !bodyFinal.cobrador || !bodyFinal.zona
     ) {
       return res.status(400).json({ success: false, message: 'Faltan campos obligatorios' });

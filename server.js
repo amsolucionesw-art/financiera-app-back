@@ -3,31 +3,18 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import path from 'path';
 
-import sequelize from './models/sequelize.js';
-import { initCuotasCron } from './cronJobs/cuotasCron.js';
+/**
+ * Candado:
+ * - Elegimos explícitamente qué archivo de entorno cargar con ENV_FILE
+ * - Forzamos override por si algún módulo cargó otro .env antes
+ */
+const ENV_FILE = process.env.ENV_FILE || '.env';
+dotenv.config({
+  path: path.resolve(process.cwd(), ENV_FILE),
+  override: true,
+});
 
-dotenv.config();
-
-/* ─── Modelos ─── */
-import './models/Role.js';
-import './models/Usuario.js';
-import './models/Zona.js';
-import './models/CobradorZona.js';
-import './models/Cliente.js';
-import './models/FormaPago.js';
-import './models/associations.js';
-import './models/Pago.js';
-import './models/Credito.js';
-import './models/Cuota.js';
-import './models/Tarea_pendiente.js';
-import './models/Presupuesto.js';
-import './models/CajaMovimiento.js';
-import './models/Compra.js';
-import './models/Gasto.js';
-import './models/VentaManual.js';
-import './models/Proveedor.js';
-
-/* ───────────────── Helpers ───────────────── */
+/* ─── Helpers ─── */
 
 const normalizePrefix = (p) => {
   if (p == null) return '/api';
@@ -45,7 +32,7 @@ const parseBool = (v, def = false) => {
 };
 
 const parseCorsOrigins = (raw) => {
-  if (!raw) return null; // null => usa CORS “abierto” (no recomendado en prod)
+  if (!raw) return null;
   const s = String(raw).trim();
   if (!s) return null;
   if (s === '*' || s.toLowerCase() === 'all') return '*';
@@ -66,20 +53,58 @@ const TRUST_PROXY = parseBool(process.env.TRUST_PROXY, false);
 const CORS_ORIGIN = parseCorsOrigins(process.env.CORS_ORIGIN);
 const CORS_CREDENTIALS = parseBool(process.env.CORS_CREDENTIALS, false);
 
-/**
- * ⚠️ En producción REAL, no conviene sync alter. En staging local puede servir.
- * - DB_SYNC=true => hace sequelize.sync()
- * - DB_SYNC_ALTER=true => hace sequelize.sync({ alter: true })
- */
 const DB_SYNC = parseBool(process.env.DB_SYNC, false);
 const DB_SYNC_ALTER = parseBool(process.env.DB_SYNC_ALTER, false);
 
-/**
- * Feature flag para servir uploads públicamente.
- * - Por defecto: APAGADO (más seguro, no expone DNI ni archivos)
- * - Para habilitar: setear UPLOADS_PUBLIC_ENABLED=true en el entorno (Dokploy)
- */
 const UPLOADS_PUBLIC_ENABLED = parseBool(process.env.UPLOADS_PUBLIC_ENABLED, false);
+
+/**
+ * Importante:
+ * - Todos los imports locales se hacen DESPUÉS del dotenv
+ *   para que sequelize y los modelos tomen el ENV correcto.
+ */
+const { default: sequelize } = await import('./models/sequelize.js');
+const { initCuotasCron } = await import('./cronJobs/cuotasCron.js');
+
+/* ─── Modelos ─── */
+await import('./models/Role.js');
+await import('./models/Usuario.js');
+await import('./models/Zona.js');
+await import('./models/CobradorZona.js');
+await import('./models/Cliente.js');
+await import('./models/FormaPago.js');
+await import('./models/associations.js');
+await import('./models/Pago.js');
+await import('./models/Credito.js');
+await import('./models/Cuota.js');
+await import('./models/Tarea_pendiente.js');
+await import('./models/Presupuesto.js');
+await import('./models/CajaMovimiento.js');
+await import('./models/Compra.js');
+await import('./models/Gasto.js');
+await import('./models/VentaManual.js');
+await import('./models/Proveedor.js');
+
+/* ─── Rutas ─── */
+const { default: clientesRoutes } = await import('./routes/clientes.routes.js');
+const { default: usuariosRoutes } = await import('./routes/usuarios.routes.js');
+const { default: authRoutes } = await import('./routes/auth.routes.js');
+const { default: zonasRoutes } = await import('./routes/zonas.routes.js');
+const { default: creditosRoutes } = await import('./routes/creditos.routes.js');
+const { default: formasPagoRoutes } = await import('./routes/formasPago.routes.js');
+const { default: rolesRoutes } = await import('./routes/roles.routes.js');
+const { default: pagosRoutes } = await import('./routes/pagos.routes.js');
+const { default: cuotasRoutes } = await import('./routes/cuotas.routes.js');
+const { default: informesRoutes } = await import('./routes/informes.routes.js');
+const { default: tareasRoutes } = await import('./routes/tareas.routes.js');
+const { default: presupuestoRoutes } = await import('./routes/presupuesto.routes.js');
+const { default: recibosRoutes } = await import('./routes/recibos.routes.js');
+const { default: cajaRoutes } = await import('./routes/caja.routes.js');
+const { default: comprasRoutes } = await import('./routes/compras.routes.js');
+const { default: gastosRoutes } = await import('./routes/gastos.routes.js');
+const { default: ventasRoutes } = await import('./routes/ventas.routes.js');
+const { default: exportacionesRoutes } = await import('./routes/exportaciones.routes.js');
+const { default: proveedoresRoutes } = await import('./routes/proveedores.routes.js');
 
 /* ─── App ─── */
 const app = express();
@@ -95,7 +120,7 @@ app.use(
         ? '*'
         : CORS_ORIGIN
           ? CORS_ORIGIN
-          : true, // si no se define, permite el origen del request (staging cómodo)
+          : true,
     credentials: CORS_CREDENTIALS,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
@@ -105,13 +130,12 @@ app.use(
 app.use(express.json({ limit: JSON_LIMIT }));
 app.use(express.urlencoded({ extended: true }));
 
-/* ─── Archivos estáticos (fuera del prefijo) ─── */
+/* ─── Archivos estáticos ─── */
 const uploadsDir = path.resolve(process.cwd(), 'uploads');
 
 if (UPLOADS_PUBLIC_ENABLED) {
   app.use('/uploads', express.static(uploadsDir));
 } else {
-  // ✅ No exponemos archivos en /uploads (evita acceso directo a DNI u otros docs)
   app.use('/uploads', (_req, res) => {
     res.status(404).json({ ok: false, error: 'NOT_FOUND' });
   });
@@ -129,37 +153,16 @@ app.get(`${API_PREFIX}/health`, (_req, res) => {
   });
 });
 
-// “Ready” chequea DB (útil para staging/prod)
 app.get(`${API_PREFIX}/ready`, async (_req, res) => {
   try {
     await sequelize.authenticate();
     res.json({ ok: true, db: true });
-  } catch (e) {
+  } catch (_e) {
     res.status(503).json({ ok: false, db: false, error: 'DB_NOT_READY' });
   }
 });
 
-/* ─── Rutas ─── */
-import clientesRoutes from './routes/clientes.routes.js';
-import usuariosRoutes from './routes/usuarios.routes.js';
-import authRoutes from './routes/auth.routes.js';
-import zonasRoutes from './routes/zonas.routes.js';
-import creditosRoutes from './routes/creditos.routes.js';
-import formasPagoRoutes from './routes/formasPago.routes.js';
-import rolesRoutes from './routes/roles.routes.js';
-import pagosRoutes from './routes/pagos.routes.js';
-import cuotasRoutes from './routes/cuotas.routes.js';
-import informesRoutes from './routes/informes.routes.js';
-import tareasRoutes from './routes/tareas.routes.js';
-import presupuestoRoutes from './routes/presupuesto.routes.js';
-import recibosRoutes from './routes/recibos.routes.js';
-import cajaRoutes from './routes/caja.routes.js';
-import comprasRoutes from './routes/compras.routes.js';
-import gastosRoutes from './routes/gastos.routes.js';
-import ventasRoutes from './routes/ventas.routes.js';
-import exportacionesRoutes from './routes/exportaciones.routes.js';
-import proveedoresRoutes from './routes/proveedores.routes.js';
-
+/* ─── Routes ─── */
 app.use(`${API_PREFIX}/auth`, authRoutes);
 app.use(`${API_PREFIX}/usuarios`, usuariosRoutes);
 app.use(`${API_PREFIX}/clientes`, clientesRoutes);
@@ -180,12 +183,16 @@ app.use(`${API_PREFIX}/ventas`, ventasRoutes);
 app.use(`${API_PREFIX}/exportaciones`, exportacionesRoutes);
 app.use(`${API_PREFIX}/proveedores`, proveedoresRoutes);
 
-/* ─── Start/Stop controlado ─── */
+/* ─── Start/Stop ─── */
 let server = null;
 
 const start = async () => {
   try {
-    // 1) DB
+    console.log(`🧩 ENV_FILE: ${ENV_FILE}`);
+    console.log(
+      `🗄️ DB target: host=${process.env.DB_HOST || '(unset)'} port=${process.env.DB_PORT || '(unset)'} db=${process.env.DB_NAME || '(unset)'} user=${process.env.DB_USER || '(unset)'}`
+    );
+
     await sequelize.authenticate();
     console.log('🟢 Conectado a PostgreSQL');
 
@@ -197,11 +204,9 @@ const start = async () => {
       console.log('ℹ️ Sync deshabilitado (DB_SYNC=false).');
     }
 
-    // 2) Cron (una sola vez, con DB lista)
     initCuotasCron();
     console.log('⏱️ Cron de cuotas inicializado');
 
-    // 3) Server
     server = app.listen(PORT, HOST, () => {
       console.log(`🚀 Servidor corriendo en http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
       console.log(`🔗 Prefix API: ${API_PREFIX || '(sin prefijo)'}`);

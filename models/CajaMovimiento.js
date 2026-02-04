@@ -62,7 +62,8 @@ const CajaMovimiento = sequelize.define(
         hora: {
             type: DataTypes.TIME,
             allowNull: false,
-            defaultValue: DataTypes.NOW,
+            // ✅ TIME necesita hora; DataTypes.NOW es timestamp y puede romper según casting
+            defaultValue: sequelize.literal("CURRENT_TIME"),
         },
 
         /** 'ingreso' | 'egreso' | 'ajuste' | 'apertura' | 'cierre' */

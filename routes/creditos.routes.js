@@ -27,6 +27,7 @@ const DESCUENTO_SOBRE_VALIDOS = new Set(['mora', 'total']); // ← nuevo
 const isValidYMD = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
 const isNum = (v) => v !== null && v !== undefined && !Number.isNaN(Number(v));
 const isInt = (v) => Number.isInteger(Number(v));
+const isBool = (v) => typeof v === 'boolean';
 
 /**
  * Longitud de período según tipo_credito:
@@ -155,6 +156,11 @@ const parseYMDToLocalDate = (ymdStr) => {
  * Devuelve un array de strings con errores. Si está vacío, pasa validación.
  * - isUpdate=false: validaciones de requeridos mínimas para creación
  * - isUpdate=true: todos los campos son opcionales pero, si vienen, deben ser válidos
+ *
+ * ✅ Soporta "créditos anteriores":
+ * - es_credito_anterior: boolean (opcional)
+ * - si es_credito_anterior=true => requiere fecha_compromiso_pago (YYYY-MM-DD)
+ * - si vienen ambas fechas => fecha_compromiso_pago no puede ser anterior a fecha_acreditacion
  */
 function validarPayloadCredito(body = {}, isUpdate = false) {
     const errors = [];
@@ -169,7 +175,9 @@ function validarPayloadCredito(body = {}, isUpdate = false) {
         descuento,
         fecha_solicitud,
         fecha_acreditacion,
-        cobrador_id
+        fecha_compromiso_pago,
+        cobrador_id,
+        es_credito_anterior
     } = body ?? {};
 
     // cliente_id
@@ -187,7 +195,7 @@ function validarPayloadCredito(body = {}, isUpdate = false) {
         }
     }
 
-    // tipo_credito (requerido incluso para "libre" para calcular ciclos)
+    // tipo_credito (requerido por compat; en libre el service lo fuerza a mensual igual)
     if (!isUpdate || tipo_credito !== undefined) {
         const t = String(tipo_credito || '').toLowerCase();
         if (!TIPOS_VALIDOS.has(t)) {
@@ -195,21 +203,21 @@ function validarPayloadCredito(body = {}, isUpdate = false) {
         }
     }
 
-    // interes (acepta 0 o mayor; el service normaliza si viene 60 -> 0.60)
+    // interes (acepta 0 o mayor)
     if (!isUpdate || interes !== undefined) {
         if (!isNum(interes) || Number(interes) < 0) {
             errors.push('interes debe ser numérico y ≥ 0');
         }
     }
 
-    // cantidad_cuotas (para no-libre: ≥1; para libre suele ser 1, pero no forzamos)
+    // cantidad_cuotas
     if (!isUpdate || cantidad_cuotas !== undefined) {
         if (!isNum(cantidad_cuotas) || !isInt(cantidad_cuotas) || Number(cantidad_cuotas) < 1) {
             errors.push('cantidad_cuotas debe ser entero ≥ 1');
         }
     }
 
-    // monto_acreditar (capital inicial)
+    // monto_acreditar
     if (!isUpdate || monto_acreditar !== undefined) {
         if (!isNum(monto_acreditar) || Number(monto_acreditar) <= 0) {
             errors.push('monto_acreditar es requerido y debe ser numérico > 0');
@@ -231,6 +239,13 @@ function validarPayloadCredito(body = {}, isUpdate = false) {
         }
     }
 
+    // es_credito_anterior (si viene)
+    if (es_credito_anterior !== undefined) {
+        if (!isBool(es_credito_anterior)) {
+            errors.push('es_credito_anterior debe ser boolean (true/false)');
+        }
+    }
+
     // fechas (opcionales)
     if (fecha_solicitud !== undefined && fecha_solicitud !== null && fecha_solicitud !== '') {
         if (!isValidYMD(fecha_solicitud)) {
@@ -240,6 +255,30 @@ function validarPayloadCredito(body = {}, isUpdate = false) {
     if (fecha_acreditacion !== undefined && fecha_acreditacion !== null && fecha_acreditacion !== '') {
         if (!isValidYMD(fecha_acreditacion)) {
             errors.push('fecha_acreditacion debe ser YYYY-MM-DD');
+        }
+    }
+    if (fecha_compromiso_pago !== undefined && fecha_compromiso_pago !== null && fecha_compromiso_pago !== '') {
+        if (!isValidYMD(fecha_compromiso_pago)) {
+            errors.push('fecha_compromiso_pago debe ser YYYY-MM-DD');
+        }
+    }
+
+    // Regla de "crédito anterior": requiere fecha_compromiso_pago
+    if (es_credito_anterior === true) {
+        if (!fecha_compromiso_pago || !isValidYMD(String(fecha_compromiso_pago))) {
+            errors.push('Para es_credito_anterior=true, fecha_compromiso_pago es obligatoria (YYYY-MM-DD)');
+        }
+    }
+
+    // Coherencia: compromiso no puede ser anterior a acreditación (si ambas válidas)
+    if (
+        fecha_acreditacion &&
+        fecha_compromiso_pago &&
+        isValidYMD(String(fecha_acreditacion)) &&
+        isValidYMD(String(fecha_compromiso_pago))
+    ) {
+        if (String(fecha_compromiso_pago) < String(fecha_acreditacion)) {
+            errors.push('fecha_compromiso_pago no puede ser anterior a fecha_acreditacion');
         }
     }
 

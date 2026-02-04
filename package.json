@@ -93,10 +93,18 @@
     "wrappy": "^1.0.2",
     "xlsx": "^0.18.5"
   },
+  "devDependencies": {
+    "cross-env": "^7.0.3",
+    "nodemon": "^3.1.11"
+  },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "nodemon server.js",
-    "start": "node server.js"
+    "dev:docker": "cross-env ENV_FILE=.env.docker nodemon server.js",
+    "dev:dockerdb": "cross-env ENV_FILE=.env.dockerdb nodemon server.js",
+    "start": "node server.js",
+    "start:docker": "cross-env ENV_FILE=.env.docker node server.js",
+    "start:dockerdb": "cross-env ENV_FILE=.env.dockerdb node server.js"
   },
   "keywords": [],
   "author": "",
