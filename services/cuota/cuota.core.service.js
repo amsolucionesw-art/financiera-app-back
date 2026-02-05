@@ -99,6 +99,62 @@ const assertNoPagoSiAnulado = ({ credito }) => {
     }
 };
 
+/**
+ * Defensa: no permitir pagos si el crédito/cliente no están correctamente asociados.
+ * Esto evita que se registren movimientos (pago/recibo/caja) y luego falle el armado de recibo/UI
+ * por datos nulos (caso típico: créditos importados sin cobrador/zona).
+ *
+ * Nota: Zona puede ser null (se tolera), pero COBRADOR no: se usa en recibos/reportes.
+ */
+const assertClienteYCobradorValidos = ({ credito, cliente, cobrador }) => {
+    if (!cliente) {
+        const err = new Error('El crédito no tiene CLIENTE asociado. No se puede registrar el pago.');
+        err.status = 409;
+        err.code = 'CREDITO_SIN_CLIENTE';
+        throw err;
+    }
+
+    const cobradorId = credito?.cobrador_id ?? null;
+    if (!cobradorId || !cobrador) {
+        const err = new Error(
+            'El crédito no tiene COBRADOR asignado. Asigná un cobrador (y zona si corresponde) antes de cobrar.'
+        );
+        err.status = 409;
+        err.code = 'CREDITO_SIN_COBRADOR';
+        throw err;
+    }
+};
+
+const assertFormaPagoValida = ({ medioPago, forma_pago_id }) => {
+    if (!medioPago) {
+        const err = new Error('Forma de pago inválida o inexistente.');
+        err.status = 400;
+        err.code = 'FORMA_PAGO_INVALIDA';
+        err.details = { forma_pago_id };
+        throw err;
+    }
+};
+
+/**
+ * ✅ IMPORTANTÍSIMO:
+ * El puntaje crediticio NO debe tumbar un cobro.
+ * Si falla (por datos nulos/importación, parse de fechas, etc.), se loguea y se sigue.
+ */
+const recalcularPuntajeClienteSafe = (clienteId) => {
+    const id = Number(clienteId);
+    if (!Number.isFinite(id) || id <= 0) return;
+
+    Promise.resolve()
+        .then(() => calcularPuntajeCliente(id))
+        .catch((e) => {
+            // log mínimo, sin romper el flujo de pago
+            console.warn('[puntaje] No se pudo recalcular puntaje_crediticio:', {
+                clienteId: id,
+                message: e?.message
+            });
+        });
+};
+
 /* ───────────────── Vencimientos ───────────────── */
 export const actualizarCuotasVencidas = async () => {
     const hoy = todayYMD(); // YMD en TZ negocio
@@ -942,6 +998,10 @@ const pagarCuotaTotal = async ({
         const cobrador = await Usuario.findByPk(credito.cobrador_id, { transaction: t });
         const medioPago = await FormaPago.findByPk(forma_pago_id, { transaction: t });
 
+        // ✅ Validaciones fuertes ANTES de registrar movimientos
+        assertClienteYCobradorValidos({ credito, cliente, cobrador });
+        assertFormaPagoValida({ medioPago, forma_pago_id });
+
         // —— LIBRE → delega a cuota.libre.service.js (mantiene core liviano) —— 
         if (esCreditoLibre(credito)) {
             const result = await pagarCuotaLibreEnTx({
@@ -963,7 +1023,9 @@ const pagarCuotaTotal = async ({
             });
 
             await t.commit();
-            await calcularPuntajeCliente(cliente.id);
+
+            // ✅ NO bloqueante / no rompe el cobro
+            recalcularPuntajeClienteSafe(cliente?.id);
 
             return result;
         }
@@ -1047,7 +1109,8 @@ const pagarCuotaTotal = async ({
 
         await t.commit();
 
-        await calcularPuntajeCliente(cliente.id);
+        // ✅ NO bloqueante / no rompe el cobro
+        recalcularPuntajeClienteSafe(cliente?.id);
 
         return { cuota, recibo };
     } catch (err) {
@@ -1087,6 +1150,10 @@ export const registrarPagoParcial = async ({
         const cobrador = await Usuario.findByPk(credito.cobrador_id, { transaction: t });
         const medioPago = await FormaPago.findByPk(forma_pago_id, { transaction: t });
 
+        // ✅ Validaciones fuertes ANTES de registrar movimientos
+        assertClienteYCobradorValidos({ credito, cliente, cobrador });
+        assertFormaPagoValida({ medioPago, forma_pago_id });
+
         // —— LIBRE → delega a cuota.libre.service.js —— 
         if (esCreditoLibre(credito)) {
             const result = await registrarPagoParcialLibreEnTx({
@@ -1108,7 +1175,9 @@ export const registrarPagoParcial = async ({
             });
 
             await t.commit();
-            await calcularPuntajeCliente(credito.cliente_id);
+
+            // ✅ NO bloqueante / no rompe el cobro
+            recalcularPuntajeClienteSafe(credito?.cliente_id);
 
             return result;
         }
@@ -1218,7 +1287,8 @@ export const registrarPagoParcial = async ({
 
         await t.commit();
 
-        await calcularPuntajeCliente(credito.cliente_id);
+        // ✅ NO bloqueante / no rompe el cobro
+        recalcularPuntajeClienteSafe(credito?.cliente_id);
 
         return { cuota, recibo };
     } catch (err) {

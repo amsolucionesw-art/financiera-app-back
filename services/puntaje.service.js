@@ -1,6 +1,22 @@
 import { Cliente, Credito, Cuota } from '../models/associations.js';
-import { Op } from 'sequelize';
-import { differenceInDays, parseISO } from 'date-fns';
+import { differenceInDays, parseISO, isValid } from 'date-fns';
+
+const safeParseISO = (v) => {
+    if (v === null || v === undefined) return null;
+
+    // Si ya es Date
+    if (v instanceof Date) return isValid(v) ? v : null;
+
+    const s = String(v).trim();
+    if (!s) return null;
+
+    try {
+        const d = parseISO(s);
+        return isValid(d) ? d : null;
+    } catch {
+        return null;
+    }
+};
 
 export const calcularPuntajeCliente = async (clienteId) => {
     const cliente = await Cliente.findByPk(clienteId);
@@ -8,11 +24,11 @@ export const calcularPuntajeCliente = async (clienteId) => {
 
     let puntaje = 0;
 
-    // 🗓️ Antigüedad
-    const fechaRegistro = parseISO(cliente.fecha_registro);
-    const diasAntiguedad = differenceInDays(new Date(), fechaRegistro);
-    if (diasAntiguedad >= 365) {
-        puntaje += 5;
+    // 🗓️ Antigüedad (si no hay fecha_registro válida, no suma ni resta)
+    const fechaRegistro = safeParseISO(cliente.fecha_registro);
+    if (fechaRegistro) {
+        const diasAntiguedad = differenceInDays(new Date(), fechaRegistro);
+        if (diasAntiguedad >= 365) puntaje += 5;
     }
 
     // 📄 Traer créditos y cuotas
@@ -27,23 +43,28 @@ export const calcularPuntajeCliente = async (clienteId) => {
 
     for (const credito of creditos) {
         let cuotasVencidas = 0;
-        let cuotasPagadasATiempo = 0;
-        let cuotasPagadasTarde = 0;
 
-        for (const cuota of credito.cuotas) {
-            const vencimiento = parseISO(cuota.fecha_vencimiento);
+        // Seguridad: por si viene null/undefined
+        const cuotas = Array.isArray(credito?.cuotas) ? credito.cuotas : [];
+
+        for (const cuota of cuotas) {
+            const vencimiento = safeParseISO(cuota.fecha_vencimiento);
 
             if (cuota.estado === 'pagada') {
-                const fechaPago = new Date(cuota.updatedAt || cuota.fecha_vencimiento); // usamos updatedAt como referencia de pago
-                if (differenceInDays(fechaPago, vencimiento) <= 0) {
-                    cuotasPagadasATiempo++;
-                    puntaje += 10;
-                } else {
-                    cuotasPagadasTarde++;
-                    puntaje -= 5;
+                // usamos updatedAt como referencia de pago; si no existe usamos "ahora"
+                const fechaPago = safeParseISO(cuota.updatedAt) || safeParseISO(cuota.fecha_vencimiento) || new Date();
+
+                // Si no hay vencimiento válido, no evaluamos “a tiempo/tarde”
+                if (vencimiento) {
+                    if (differenceInDays(fechaPago, vencimiento) <= 0) {
+                        puntaje += 10;
+                    } else {
+                        puntaje -= 5;
+                    }
                 }
 
-                totalDevuelto += parseFloat(cuota.monto_pagado_acumulado);
+                const pagado = Number(cuota.monto_pagado_acumulado);
+                if (Number.isFinite(pagado)) totalDevuelto += pagado;
             }
 
             if (cuota.estado === 'vencida') {
@@ -62,19 +83,13 @@ export const calcularPuntajeCliente = async (clienteId) => {
     }
 
     // ✔️ Crédito vigente sin mora
-    if (tieneCreditoVigenteSinMora) {
-        puntaje += 10;
-    }
+    if (tieneCreditoVigenteSinMora) puntaje += 10;
 
     // ❌ Crédito con mora
-    if (tieneCreditoConMora) {
-        puntaje -= 30;
-    }
+    if (tieneCreditoConMora) puntaje -= 30;
 
     // 💵 Total devuelto mayor a $100.000
-    if (totalDevuelto >= 100000) {
-        puntaje += 10;
-    }
+    if (totalDevuelto >= 100000) puntaje += 10;
 
     // 🚨 Aseguramos que esté entre 0 y 100
     puntaje = Math.max(0, Math.min(puntaje, 100));
