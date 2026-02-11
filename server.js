@@ -115,32 +115,43 @@ if (TRUST_PROXY) app.set('trust proxy', 1);
 /* ─── Middlewares ─── */
 
 /**
- * ✅ FIX CORS (PDF / preflight):
- * - Si credentials=true, NO se puede responder Access-Control-Allow-Origin: *
- * - En ese caso, usamos origin: true (refleja el Origin entrante) o una allowlist (array).
- * - Si credentials=false, podemos permitir '*'.
+ * ✅ FIX CORS (PDF / preflight) — versión correcta:
+ * Problema que viste:
+ * - El preflight te devuelve Access-Control-Allow-Origin: *
+ * - El browser rechaza eso cuando la request se hace con credenciales (Authorization / include)
+ *
+ * Solución:
+ * - NO devolver "*" cuando CORS_CREDENTIALS=true.
+ * - Si CORS_ORIGIN='*' y credentials=true => reflejar el Origin entrante (devolver origin exacto).
+ * - Si CORS_ORIGIN es lista => permitir solo esa lista.
+ * - Si no hay CORS_ORIGIN configurado => permitir y reflejar (seguro para credentials).
  */
-const computeCorsOrigin = () => {
-  // Si el env pide "*":
+const corsOriginHandler = (origin, cb) => {
+  // Requests sin Origin (curl/server-to-server): permitir
+  if (!origin) return cb(null, true);
+
+  // Sin configuración: permitir (con credentials reflejamos origin)
+  if (!CORS_ORIGIN) {
+    return cb(null, CORS_CREDENTIALS ? origin : true);
+  }
+
+  // Env pide "*"
   if (CORS_ORIGIN === '*') {
-    // Con credenciales, '*' rompe el navegador. Reflejamos origin.
-    return CORS_CREDENTIALS ? true : '*';
+    // Con credenciales, '*' rompe el navegador => reflejar origin
+    return cb(null, CORS_CREDENTIALS ? origin : '*');
   }
 
-  // Si viene lista en env, la usamos
-  if (Array.isArray(CORS_ORIGIN) && CORS_ORIGIN.length) {
-    return CORS_ORIGIN;
-  }
+  // Allowlist
+  const allowed = Array.isArray(CORS_ORIGIN) ? CORS_ORIGIN : [CORS_ORIGIN];
+  if (allowed.includes(origin)) return cb(null, origin);
 
-  // Si no configuraron nada:
-  // - con credenciales, reflejar origin (evita '*' + credentials)
-  // - sin credenciales, dejar que cors permita el request (true refleja)
-  return true;
+  // Bloqueado
+  return cb(new Error(`CORS bloqueado para origin: ${origin}`));
 };
 
 app.use(
   cors({
-    origin: computeCorsOrigin(),
+    origin: corsOriginHandler,
     credentials: CORS_CREDENTIALS,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
@@ -219,7 +230,7 @@ const start = async () => {
 
     console.log(`🌐 CORS_ORIGIN env: ${process.env.CORS_ORIGIN || '(unset)'}`);
     console.log(`🍪 CORS_CREDENTIALS: ${CORS_CREDENTIALS ? 'true' : 'false'}`);
-    console.log(`🌐 CORS origin efectivo: ${JSON.stringify(computeCorsOrigin())}`);
+    console.log(`🌐 CORS_ORIGIN parseado: ${JSON.stringify(CORS_ORIGIN)}`);
 
     await sequelize.authenticate();
     console.log('🟢 Conectado a PostgreSQL');
