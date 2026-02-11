@@ -113,17 +113,41 @@ app.disable('x-powered-by');
 if (TRUST_PROXY) app.set('trust proxy', 1);
 
 /* ─── Middlewares ─── */
+
+/**
+ * ✅ FIX CORS (PDF / preflight):
+ * - Si credentials=true, NO se puede responder Access-Control-Allow-Origin: *
+ * - En ese caso, usamos origin: true (refleja el Origin entrante) o una allowlist (array).
+ * - Si credentials=false, podemos permitir '*'.
+ */
+const computeCorsOrigin = () => {
+  // Si el env pide "*":
+  if (CORS_ORIGIN === '*') {
+    // Con credenciales, '*' rompe el navegador. Reflejamos origin.
+    return CORS_CREDENTIALS ? true : '*';
+  }
+
+  // Si viene lista en env, la usamos
+  if (Array.isArray(CORS_ORIGIN) && CORS_ORIGIN.length) {
+    return CORS_ORIGIN;
+  }
+
+  // Si no configuraron nada:
+  // - con credenciales, reflejar origin (evita '*' + credentials)
+  // - sin credenciales, dejar que cors permita el request (true refleja)
+  return true;
+};
+
 app.use(
   cors({
-    origin:
-      CORS_ORIGIN === '*'
-        ? '*'
-        : CORS_ORIGIN
-          ? CORS_ORIGIN
-          : true,
+    origin: computeCorsOrigin(),
     credentials: CORS_CREDENTIALS,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
+    // útil para downloads cuando el back setea Content-Disposition
+    exposedHeaders: ['Content-Disposition'],
+    maxAge: 86400,
+    optionsSuccessStatus: 204,
   })
 );
 
@@ -192,6 +216,10 @@ const start = async () => {
     console.log(
       `🗄️ DB target: host=${process.env.DB_HOST || '(unset)'} port=${process.env.DB_PORT || '(unset)'} db=${process.env.DB_NAME || '(unset)'} user=${process.env.DB_USER || '(unset)'}`
     );
+
+    console.log(`🌐 CORS_ORIGIN env: ${process.env.CORS_ORIGIN || '(unset)'}`);
+    console.log(`🍪 CORS_CREDENTIALS: ${CORS_CREDENTIALS ? 'true' : 'false'}`);
+    console.log(`🌐 CORS origin efectivo: ${JSON.stringify(computeCorsOrigin())}`);
 
     await sequelize.authenticate();
     console.log('🟢 Conectado a PostgreSQL');
