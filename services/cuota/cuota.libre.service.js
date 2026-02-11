@@ -50,7 +50,15 @@ export const TASA_INTERES_CICLO_LIBRE = 0.60;
           Solución sin migración:
             - tag determinístico en `concepto`: [ciclo_libre:N]
             - filtros siempre por where.ciclo_libre; cuota.utils lo traduce a concepto ILIKE si falta columna
+
+   ✅ FIX 4 (desajustes/intermitencias):
+          - Nunca pasamos { transaction: null } a Sequelize
+          - Si no nos pasan cuotaIds, los resolvemos por crédito para evitar
+            contaminación por cliente (otros créditos del mismo cliente).
    ============================================================================= */
+
+const txOpt = (t) => (t ? { transaction: t } : {});
+const setTx = (obj, t) => (t ? { ...(obj || {}), transaction: t } : (obj || {}));
 
 let _cacheTieneCicloLibreCol = null;
 
@@ -91,13 +99,14 @@ const safeTieneCicloLibreCol = async (t = null) => {
     };
 
     // 1) Intento robusto contra DB (preferible)
-    const r1 = await tryCall(async () => reciboTieneCicloLibreCol({ transaction: t }));
+    //    ⚠️ Nunca pasar transaction:null
+    const r1 = await tryCall(async () => reciboTieneCicloLibreCol(t ? { transaction: t } : undefined));
     if (r1 !== null) {
         _cacheTieneCicloLibreCol = r1;
         return _cacheTieneCicloLibreCol;
     }
 
-    const r2 = await tryCall(async () => reciboTieneCicloLibreCol(t));
+    const r2 = await tryCall(async () => reciboTieneCicloLibreCol(t || undefined));
     if (r2 !== null) {
         _cacheTieneCicloLibreCol = r2;
         return _cacheTieneCicloLibreCol;
@@ -202,6 +211,15 @@ const baseVencimientoCiclo1 = (credito) => {
     return asYMD(credito?.fecha_compromiso_pago) || asYMD(credito?.fecha_acreditacion) || null;
 };
 
+/**
+ * ⚠️ IMPORTANTE (nuevo requerimiento cliente):
+ * - Las FECHAS de ciclos siguen siendo fijas (por calendario).
+ * - Pero el "ciclo actual" para cálculos/pagos NO debe avanzar por fecha
+ *   si el ciclo anterior no está cerrado (mora+interés cubiertos).
+ *
+ * Este helper mantiene el cálculo ORIGINAL por fecha (calendario).
+ * La lógica "según regla" se implementa en deudaLibreTotalHoy / cicloLibreMasViejoAbierto.
+ */
 export const cicloLibreActual = (credito, hoyYMD = todayYMD()) => {
     const vto1 = baseVencimientoCiclo1(credito);
     if (!vto1) return 1;
@@ -216,6 +234,10 @@ export const cicloLibreActual = (credito, hoyYMD = todayYMD()) => {
     if (vto3 && hoy <= vto3) return 3;
 
     return LIBRE_MAX_CICLOS;
+};
+
+const cicloLibreMaxPorFecha = (credito, hoyYMD = todayYMD()) => {
+    return clamp(toNumber(cicloLibreActual(credito, hoyYMD)), 1, LIBRE_MAX_CICLOS);
 };
 
 export const rangoCicloLibre = (credito, ciclo) => {
@@ -266,21 +288,25 @@ export const whereRecibosLibrePorCiclo = (credito, ciclo, cuotaIds = []) => {
 /**
  * ✅ Siempre devolvemos filtro por `ciclo_libre` cuando es posible.
  * - Si la DB tiene columna: funciona directo.
- * - Si NO la tiene: findAllReciboSafe() (cuota.utils.js) lo traduce a `concepto ILIKE '%[ciclo_libre:N]%'`.
+ * - Si NO la tiene: findAllReciboSafe() (cuota.utils.js) lo traduce a `concepto ILIKE '%[ciclo_libre:N]%'` si falta columna
  * - Último recurso: fallback por fechas si ciclo no es numérico.
  *
  * ✅ FIX (tu bug actual):
  * En tu DB existe `ciclo_libre`, pero hay recibos con `ciclo_libre = NULL` y concepto "(Ciclo N)".
- * Entonces buscamos por OR: ciclo_libre o concepto (tag) o concepto "ciclo N".
+ * Entonces buscamos por OR: ciclo_libre o concepto (tag) o concepto con "(Ciclo N)".
  */
 export const whereRecibosLibrePorCicloCompat = async (credito, ciclo, cuotaIds = [], t = null) => {
     const cicloNum = Number(ciclo);
     if (Number.isFinite(cicloNum)) {
         const tag = buildCicloTag(cicloNum);
 
+        // ✅ Endurecido: preferimos "(Ciclo N)" / "[ciclo_libre:N]".
+        // Mantenemos un fallback suave para "ciclo N" SOLO si viene pegado a paréntesis,
+        // evitando matchear por texto casual.
         const conceptoOr = [
             { concepto: { [Op.iLike]: `%${tag}%` } },
-            { concepto: { [Op.iLike]: `%ciclo ${cicloNum}%` } } // matchea "(Ciclo 1)" / "ciclo 1"
+            { concepto: { [Op.iLike]: `%(Ciclo ${cicloNum})%` } },
+            { concepto: { [Op.iLike]: `%(ciclo ${cicloNum})%` } }
         ];
 
         const tieneCol = await safeTieneCicloLibreCol(t);
@@ -292,6 +318,8 @@ export const whereRecibosLibrePorCicloCompat = async (credito, ciclo, cuotaIds =
         if (Array.isArray(cuotaIds) && cuotaIds.length > 0) {
             where.cuota_id = { [Op.in]: cuotaIds };
         } else {
+            // ⚠️ Si no nos pasan cuotaIds, el llamador debe resolverlos.
+            // Igual dejamos algo defensivo para no traer recibos "huérfanos".
             where.cuota_id = { [Op.ne]: null };
         }
 
@@ -307,7 +335,7 @@ export const obtenerCuotaIdsPorCredito = async ({ credito_id, t = null }) => {
         where: { credito_id },
         attributes: ['id'],
         order: [['numero_cuota', 'ASC']],
-        transaction: t
+        ...txOpt(t)
     });
     return cuotas.map((c) => c.id);
 };
@@ -316,13 +344,20 @@ export const obtenerCuotaBaseLibre = async ({ credito_id, t = null }) => {
     const cuota = await Cuota.findOne({
         where: { credito_id },
         order: [['numero_cuota', 'ASC']],
-        transaction: t
+        ...txOpt(t)
     });
     return cuota;
 };
 
 export const sumRecibosCampoPorCiclo = async ({ credito, ciclo, campo, cuotaIds = [], t = null }) => {
-    const where = await whereRecibosLibrePorCicloCompat(credito, ciclo, cuotaIds, t);
+    // ✅ FIX: si no nos pasan cuotaIds, los resolvemos por crédito para evitar
+    // mezclar otros créditos del mismo cliente.
+    let cuotaIdsSafe = Array.isArray(cuotaIds) ? cuotaIds.filter(Boolean) : [];
+    if ((!cuotaIdsSafe || cuotaIdsSafe.length === 0) && credito?.id) {
+        cuotaIdsSafe = await obtenerCuotaIdsPorCredito({ credito_id: credito.id, t });
+    }
+
+    const where = await whereRecibosLibrePorCicloCompat(credito, ciclo, cuotaIdsSafe, t);
 
     const sumar = (rows) =>
         fix2(rows.reduce((acc, r) => acc + fix2(toNumber(r?.[campo] ?? 0)), 0));
@@ -331,7 +366,7 @@ export const sumRecibosCampoPorCiclo = async ({ credito, ciclo, campo, cuotaIds 
         const rows = await findAllReciboSafe({
             where,
             attributes: [campo],
-            transaction: t
+            ...txOpt(t)
         });
         return sumar(rows);
     } catch (e) {
@@ -340,12 +375,12 @@ export const sumRecibosCampoPorCiclo = async ({ credito, ciclo, campo, cuotaIds 
         if (isMissingColumnError?.(e)) {
             if (_cacheTieneCicloLibreCol === true) {
                 _cacheTieneCicloLibreCol = false;
-                const whereFallback = whereRecibosLibrePorCiclo(credito, ciclo, cuotaIds);
+                const whereFallback = whereRecibosLibrePorCiclo(credito, ciclo, cuotaIdsSafe);
                 try {
                     const rows2 = await findAllReciboSafe({
                         where: whereFallback,
                         attributes: [campo],
-                        transaction: t
+                        ...txOpt(t)
                     });
                     return sumar(rows2);
                 } catch (e2) {
@@ -377,7 +412,7 @@ const recalcularInteresAcumuladoHistoricoLibreEnTx = async ({ creditoId, cuotaId
 
     const sum = await Recibo.sum('interes_ciclo_cobrado', {
         where: { cuota_id: { [Op.in]: ids } },
-        transaction: t
+        ...txOpt(t)
     });
 
     return fix2(toNumber(sum || 0));
@@ -491,18 +526,54 @@ export const deudaLibrePorCiclo = async ({ credito, cuotaBase, cuotaIds, ciclo, 
     };
 };
 
-export const deudaLibreTotalHoy = async ({ credito, hoyYMD, t = null }) => {
-    const ciclo_actual = cicloLibreActual(credito, hoyYMD);
+/**
+ * ✅ NUEVA REGLA (cliente):
+ * - El ciclo NO avanza por fecha si el ciclo anterior NO está cerrado (mora+interés).
+ * - Sólo se "habilita" el siguiente ciclo cuando el anterior quedó en 0 (mora + interés).
+ * - Las fechas siguen siendo fijas (vto por calendario), por lo que si se habilita tarde y su vto quedó atrás,
+ *   entrará en mora según su vencimiento fijo.
+ */
+const cicloLibreActualSegunReglaEnTx = async ({ credito, hoyYMD, t = null }) => {
+    const cicloMax = cicloLibreMaxPorFecha(credito, hoyYMD);
 
     const cuotaIds = await obtenerCuotaIdsPorCredito({ credito_id: credito.id, t });
+    const cuotaBase = await obtenerCuotaBaseLibre({ credito_id: credito.id, t });
+
+    // buscamos el primer ciclo "abierto" (interés pendiente o mora pendiente)
+    for (let c = 1; c <= cicloMax; c++) {
+        const det = await deudaLibrePorCiclo({
+            credito,
+            cuotaBase,
+            cuotaIds,
+            ciclo: c,
+            hoyYMD,
+            t
+        });
+
+        const abierto = fix2(det.interes_pendiente) > 0 || fix2(det.mora_pendiente) > 0;
+        if (abierto) return { ciclo_actual: c, ciclo_max: cicloMax, cuotaIds, cuotaBase };
+    }
+
+    // si todos hasta cicloMax están cerrados, el ciclo actual queda en cicloMax
+    return { ciclo_actual: cicloMax, ciclo_max: cicloMax, cuotaIds, cuotaBase };
+};
+
+export const deudaLibreTotalHoy = async ({ credito, hoyYMD, t = null }) => {
+    // ciclo según regla (gatillado por cierre real de ciclos)
+    const { ciclo_actual, cuotaIds, cuotaBase } = await cicloLibreActualSegunReglaEnTx({
+        credito,
+        hoyYMD,
+        t
+    });
 
     let interes_pendiente_total = 0;
     let mora_pendiente_total = 0;
 
+    // ✅ Por regla, solo existe deuda de interés/mora hasta el ciclo "actual" (el abierto más viejo)
     for (let c = 1; c <= ciclo_actual; c++) {
         const det = await deudaLibrePorCiclo({
             credito,
-            cuotaBase: await obtenerCuotaBaseLibre({ credito_id: credito.id, t }),
+            cuotaBase,
             cuotaIds,
             ciclo: c,
             hoyYMD,
@@ -520,12 +591,15 @@ export const deudaLibreTotalHoy = async ({ credito, hoyYMD, t = null }) => {
 };
 
 export const cicloLibreMasViejoAbierto = async ({ credito, hoyYMD, t = null }) => {
-    const cicloActual = cicloLibreActual(credito, hoyYMD);
+    // ✅ usa regla del cliente: el primero abierto determina el "ciclo actual"
+    const { ciclo_actual, ciclo_max, cuotaIds, cuotaBase } = await cicloLibreActualSegunReglaEnTx({
+        credito,
+        hoyYMD,
+        t
+    });
 
-    const cuotaIds = await obtenerCuotaIdsPorCredito({ credito_id: credito.id, t });
-    const cuotaBase = await obtenerCuotaBaseLibre({ credito_id: credito.id, t });
-
-    for (let c = 1; c <= cicloActual; c++) {
+    // devolvemos el más viejo abierto hasta ciclo_max (por si hay inconsistencias históricas)
+    for (let c = 1; c <= ciclo_max; c++) {
         const detalle = await deudaLibrePorCiclo({
             credito,
             cuotaBase,
@@ -543,12 +617,12 @@ export const cicloLibreMasViejoAbierto = async ({ credito, hoyYMD, t = null }) =
         credito,
         cuotaBase,
         cuotaIds,
-        ciclo: cicloActual,
+        ciclo: ciclo_actual,
         hoyYMD,
         t
     });
 
-    return { ciclo: cicloActual, detalle };
+    return { ciclo: ciclo_actual, detalle };
 };
 
 export const calcularInteresPendienteLibre = async ({ credito, hoyYMD, t = null }) => {
@@ -557,15 +631,19 @@ export const calcularInteresPendienteLibre = async ({ credito, hoyYMD, t = null 
 };
 
 export const calcularMoraPendienteLibreExacto = async ({ credito, hoyYMD, t = null, ciclo = null, cuotaIds = null }) => {
-    const cicloActual = cicloLibreActual(credito, hoyYMD);
+    // ⚠️ IMPORTANTÍSIMO:
+    // Para mora exacta de un ciclo particular, NO dependemos de "ciclo actual según regla".
+    // La mora se computa por vencimiento fijo del ciclo solicitado (o por los ciclos hasta el max por fecha).
+    const cicloMax = cicloLibreMaxPorFecha(credito, hoyYMD);
+
     const cuotasIdsLocal = Array.isArray(cuotaIds)
         ? cuotaIds
         : await obtenerCuotaIdsPorCredito({ credito_id: credito.id, t });
 
     const ciclosAProcesar =
         ciclo != null
-            ? [clamp(toNumber(ciclo), 1, cicloActual)]
-            : Array.from({ length: cicloActual }, (_, i) => i + 1);
+            ? [clamp(toNumber(ciclo), 1, cicloMax)]
+            : Array.from({ length: cicloMax }, (_, i) => i + 1);
 
     const hoy = ymdDate(hoyYMD);
 
@@ -591,7 +669,7 @@ export const calcularMoraPendienteLibreExacto = async ({ credito, hoyYMD, t = nu
                 where,
                 attributes: ['numero_recibo', 'fecha', 'interes_ciclo_cobrado', 'mora_cobrada'],
                 order: [['fecha', 'ASC'], ['numero_recibo', 'ASC']],
-                transaction: t
+                ...txOpt(t)
             });
         } catch (e) {
             if (isMissingColumnError?.(e)) {
@@ -603,7 +681,7 @@ export const calcularMoraPendienteLibreExacto = async ({ credito, hoyYMD, t = nu
                             where: whereFallback,
                             attributes: ['numero_recibo', 'fecha', 'interes_ciclo_cobrado', 'mora_cobrada'],
                             order: [['fecha', 'ASC'], ['numero_recibo', 'ASC']],
-                            transaction: t
+                            ...txOpt(t)
                         });
                     } catch (e2) {
                         if (isMissingColumnError?.(e2)) {
@@ -747,7 +825,7 @@ export const obtenerResumenLibrePorCredito = async (credito_id, hoyDate = new Da
     const mora_ciclo_hoy = mora_pendiente_hoy;
 
     // ✅ Contrato consistente con credito.core:
-    // total_actual = liquidación al día (acumulado 1..ciclo_actual)
+    // total_actual = liquidación al día (acumulado 1..ciclo_actual según REGLA)
     const total_actual = total_liquidacion_hoy;
 
     return {
@@ -907,6 +985,7 @@ export const pagarCuotaLibreEnTx = async ({
     let moraTotal = 0;
     let moraBonificadaTotal = 0;
 
+    // ✅ Por regla, el total de interés/mora viene ya acotado por resumen/cicloActual
     for (let c = 1; c <= cicloActual; c++) {
         const det = await deudaLibrePorCiclo({
             credito,
@@ -1098,16 +1177,17 @@ export const pagarCuotaLibreEnTx = async ({
     let cicloObjetivo = null;
     let detalleCiclo = null;
 
+    // ✅ Regla: no se permite saltar ciclos; siempre se paga el más viejo abierto
     if (ciclo_libre != null && String(ciclo_libre).trim() !== '') {
-        cicloObjetivo = clamp(toNumber(ciclo_libre), 1, cicloActual);
-        detalleCiclo = await deudaLibrePorCiclo({
-            credito,
-            cuotaBase,
-            cuotaIds,
-            ciclo: cicloObjetivo,
-            hoyYMD: hoyYMD_TZ,
-            t
-        });
+        // Si el front insiste con ciclo_libre, lo clampamos al ciclo más viejo abierto (regla)
+        const masViejo = await cicloLibreMasViejoAbierto({ credito, hoyYMD: hoyYMD_TZ, t });
+        const cicloMasViejo = masViejo?.ciclo ?? cicloActual;
+
+        const pedido = clamp(toNumber(ciclo_libre), 1, cicloActual);
+        cicloObjetivo = pedido <= cicloMasViejo ? pedido : cicloMasViejo;
+        detalleCiclo = (pedido === cicloObjetivo)
+            ? await deudaLibrePorCiclo({ credito, cuotaBase, cuotaIds, ciclo: cicloObjetivo, hoyYMD: hoyYMD_TZ, t })
+            : masViejo?.detalle ?? null;
     } else {
         const masViejo = await cicloLibreMasViejoAbierto({ credito, hoyYMD: hoyYMD_TZ, t });
         cicloObjetivo = masViejo?.ciclo ?? cicloActual;
@@ -1146,6 +1226,7 @@ export const pagarCuotaLibreEnTx = async ({
     const interesCicloCobrado = fix2(Math.min(restante, interesPendienteCiclo));
     restante = fix2(restante - interesCicloCobrado);
 
+    // ✅ Regla cliente: sólo puede tocar capital si cubrió mora+interés del ciclo objetivo
     const puedeIrACapital =
         fix2(moraNetaCiclo - moraCobrada) <= 0 && fix2(interesPendienteCiclo - interesCicloCobrado) <= 0;
 
@@ -1248,6 +1329,7 @@ export const pagarCuotaLibreEnTx = async ({
     creditoPatch = { ...creditoPatch, interes_acumulado: interesHist };
     await credito.update({ interes_acumulado: interesHist }, { transaction: t });
 
+    // ✅ Tope 3 ciclos (según REGLA, no por fecha)
     if (cicloActual >= 3) {
         const deudaTotDespues = await deudaLibreTotalHoy({ credito, hoyYMD: hoyYMD_TZ, t });
         const sinInteresMora =
@@ -1325,7 +1407,9 @@ export const registrarPagoParcialLibreEnTx = async ({
 
     const hoyYMD_TZ = todayYMD();
 
-    const cicloActual = cicloLibreActual(credito, hoyYMD_TZ);
+    // ✅ Tope 3 ciclos SEGÚN REGLA (no por fecha)
+    const resumen = await obtenerResumenLibrePorCredito(credito.id, ymdDate(hoyYMD_TZ));
+    const cicloActual = clamp(toNumber(resumen?.ciclo_actual ?? 1), 1, LIBRE_MAX_CICLOS);
     if (cicloActual >= LIBRE_MAX_CICLOS) {
         throw new Error(
             'En el 3er ciclo del crédito LIBRE no se permite pago parcial. Debe cancelar (pago total) o refinanciar.'
@@ -1371,6 +1455,7 @@ export const registrarPagoParcialLibreEnTx = async ({
     const aInteres = fix2(Math.min(restoTrasMora, interesPendienteCiclo));
     const restoTrasInteres = fix2(restoTrasMora - aInteres);
 
+    // ✅ Regla: capital sólo si cubre mora+interés del ciclo
     const puedeIrACapital = fix2(moraNetaCiclo - aMora) <= 0 && fix2(interesPendienteCiclo - aInteres) <= 0;
     const aCapital = puedeIrACapital ? fix2(Math.min(restoTrasInteres, saldoAntesCapital)) : 0;
 

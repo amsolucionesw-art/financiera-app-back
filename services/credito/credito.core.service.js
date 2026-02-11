@@ -632,20 +632,17 @@ export const obtenerCreditoPorId = async (id, { rol_id = null } = {}) => {
       cred.setDataValue('total_liquidacion_hoy', resumen.total_liquidacion_hoy); // acumulado 1..ciclo_actual
       cred.setDataValue('total_ciclo_hoy', resumen.total_ciclo_hoy); // solo ciclo actual
 
-      // ✅ acumulados auditables
-      if (typeof resumen.interes_cobrado_historico !== 'undefined') {
-        cred.setDataValue('interes_cobrado_historico', resumen.interes_cobrado_historico);
-      }
-      if (typeof resumen.intereses_acumulados !== 'undefined') {
-        cred.setDataValue('intereses_acumulados', resumen.intereses_acumulados);
-      }
+      // ✅ FIX LIBRE (devengado): el resumen NO trae "interes_cobrado_historico" ni "intereses_acumulados".
+      // Fuente de verdad del "cobrado histórico": Credito.interes_acumulado (lo actualiza cuota.libre.service.js al pagar).
+      const interesCobradoHistorico = fix2(toNumber(plain?.interes_acumulado ?? 0));
+      const interesPendienteTotal = fix2(toNumber(resumen?.interes_pendiente_total ?? 0));
+      const interesDevengado = fix2(interesCobradoHistorico + interesPendienteTotal);
 
-      // ✅ FIX CLAVE: interes_acumulado expuesto al front = devengado (cobrado + pendiente total)
-      if (typeof resumen.intereses_acumulados !== 'undefined') {
-        cred.setDataValue('interes_acumulado', fix2(toNumber(resumen.intereses_acumulados)));
-      } else if (typeof resumen.interes_cobrado_historico !== 'undefined') {
-        cred.setDataValue('interes_acumulado', fix2(toNumber(resumen.interes_cobrado_historico)));
-      }
+      cred.setDataValue('interes_cobrado_historico', interesCobradoHistorico);
+      cred.setDataValue('intereses_acumulados', interesDevengado);
+
+      // ✅ Campo que consume el front como "interés acumulado" (devengado, no solo cobrado)
+      cred.setDataValue('interes_acumulado', interesDevengado);
 
       // ✅ total_actual: total “al día” (capital + interés_total + mora_total)
       totalActual = fix2(toNumber(resumen.total_liquidacion_hoy));
@@ -661,6 +658,14 @@ export const obtenerCreditoPorId = async (id, { rol_id = null } = {}) => {
         totalActual = calcularTotalActualCreditoPlain(plain);
         console.error('[obtenerCreditoPorId] Fallback total_actual LIBRE:', e?.message || e);
       }
+
+      const interesCobradoHistorico = fix2(toNumber(plain?.interes_acumulado ?? 0));
+      const interesEstimado = fix2(calcularInteresCicloLibre(plain));
+      const interesDevengado = fix2(interesCobradoHistorico + interesEstimado);
+
+      cred.setDataValue('interes_cobrado_historico', interesCobradoHistorico);
+      cred.setDataValue('intereses_acumulados', interesDevengado);
+      cred.setDataValue('interes_acumulado', interesDevengado);
 
       cred.setDataValue('total_actual', fix2(toNumber(totalActual)));
       cred.setDataValue('saldo_total_actual', fix2(toNumber(totalActual)));
@@ -1575,19 +1580,16 @@ export const obtenerCreditosPorCliente = async (clienteId, query = {}, { rol_id 
           cr.total_liquidacion_hoy = resumen.total_liquidacion_hoy;
           cr.total_ciclo_hoy = resumen.total_ciclo_hoy;
 
-          if (typeof resumen.interes_cobrado_historico !== 'undefined') {
-            cr.interes_cobrado_historico = resumen.interes_cobrado_historico;
-          }
-          if (typeof resumen.intereses_acumulados !== 'undefined') {
-            cr.intereses_acumulados = resumen.intereses_acumulados;
-          }
+          // ✅ FIX LIBRE (devengado): en listado, usamos Credito.interes_acumulado (cobrado) + pendiente_total
+          const interesCobradoHistorico = fix2(toNumber(cr?.interes_acumulado ?? 0));
+          const interesPendienteTotal = fix2(toNumber(resumen?.interes_pendiente_total ?? 0));
+          const interesDevengado = fix2(interesCobradoHistorico + interesPendienteTotal);
 
-          // ✅ FIX CLAVE: interes_acumulado expuesto al front = devengado (cobrado + pendiente total)
-          if (typeof resumen.intereses_acumulados !== 'undefined') {
-            cr.interes_acumulado = fix2(toNumber(resumen.intereses_acumulados));
-          } else if (typeof resumen.interes_cobrado_historico !== 'undefined') {
-            cr.interes_acumulado = fix2(toNumber(resumen.interes_cobrado_historico));
-          }
+          cr.interes_cobrado_historico = interesCobradoHistorico;
+          cr.intereses_acumulados = interesDevengado;
+
+          // ✅ Campo que consume el front como "interés acumulado" (devengado)
+          cr.interes_acumulado = interesDevengado;
 
           // total_actual “al día”
           cr.total_actual = resumen.total_liquidacion_hoy;
@@ -1602,6 +1604,14 @@ export const obtenerCreditosPorCliente = async (clienteId, query = {}, { rol_id 
             cr.total_actual = calcularTotalActualCreditoPlain(cr);
             console.error('[obtenerCreditosPorCliente] Fallback total_actual LIBRE:', e?.message || e);
           }
+
+          const interesCobradoHistorico = fix2(toNumber(cr?.interes_acumulado ?? 0));
+          const interesEstimado = fix2(calcularInteresCicloLibre(cr));
+          const interesDevengado = fix2(interesCobradoHistorico + interesEstimado);
+
+          cr.interes_cobrado_historico = interesCobradoHistorico;
+          cr.intereses_acumulados = interesDevengado;
+          cr.interes_acumulado = interesDevengado;
 
           // compat/UI
           cr.saldo_total_actual = fix2(toNumber(cr.total_actual));

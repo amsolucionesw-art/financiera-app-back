@@ -307,10 +307,25 @@ export const nowTime = (d = new Date()) => {
     }).format(d);
 };
 
-/** Devuelve Date “fecha-solo” (00:00 local) a partir de 'YYYY-MM-DD'. */
+/**
+ * Devuelve Date “fecha-solo” a partir de 'YYYY-MM-DD', de forma inmune a TZ del servidor.
+ *
+ * Problema real en producción (contenedor en UTC):
+ * - new Date(Y, M-1, D) crea 00:00 en TZ del servidor (UTC)
+ * - al formatear en America/Argentina/Tucuman (UTC-3) cae al día anterior (21:00)
+ * - rompe comparaciones YMD y deja mora = 0 en el día 1 de atraso
+ *
+ * Solución:
+ * - Construir el Date en UTC al mediodía (12:00) para evitar “day shift”.
+ */
 export const dateFromYMD = (ymdStr) => {
     const [Y, M, D] = String(ymdStr).split('-').map((x) => parseInt(x, 10));
-    return new Date(Y, (M || 1) - 1, D || 1);
+
+    const yy = Number.isFinite(Y) ? Y : 1970;
+    const mm = Number.isFinite(M) ? (M || 1) : 1;
+    const dd = Number.isFinite(D) ? (D || 1) : 1;
+
+    return new Date(Date.UTC(yy, (mm - 1), dd, 12, 0, 0));
 };
 
 /** Devuelve YYYY-MM-DD seguro en TZ negocio, a partir de Date o string. */

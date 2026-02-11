@@ -28,7 +28,8 @@ import {
   fix2,
   ymd,
   ymdDate,
-  normalizeRate
+  normalizeRate,
+  clamp
 } from '../cuota/cuota.utils.js';
 
 import {
@@ -36,7 +37,6 @@ import {
   VTO_FICTICIO_LIBRE,
   MORA_DIARIA_LIBRE,
   cicloLibreActual as cicloLibreActualCuota,
-  rangoCicloLibre,
   vencimientoCicloLibre,
   // ✅ Fuente de verdad del resumen (evita contrato viejo del facade cuota.service.js)
   obtenerResumenLibrePorCredito as obtenerResumenLibrePorCreditoCuota
@@ -68,6 +68,11 @@ export const fechaBaseLibre = (credito) => {
 /**
  * Compat export: devuelve 1..3
  * Acepta `hoy` como Date o YMD.
+ *
+ * ⚠️ Nota (regla cliente nueva):
+ * Este helper sigue devolviendo el "ciclo por calendario" (por fechas fijas),
+ * NO el "ciclo operativo" (que ahora se determina por el ciclo más viejo abierto).
+ * Para el ciclo operativo, usar `obtenerCicloLibreActualSegunRegla()` (async).
  */
 export const cicloLibreActual = (credito, hoy = new Date()) => {
   const hoyYMD = typeof hoy === 'string' ? hoy : ymd(hoy);
@@ -75,13 +80,26 @@ export const cicloLibreActual = (credito, hoy = new Date()) => {
 };
 
 /**
+ * ✅ NUEVO (regla cliente):
+ * Devuelve el "ciclo operativo" según la regla:
+ * - NO avanza al siguiente hasta que el anterior se cierre (mora + interés).
+ *
+ * Fuente de verdad: obtenerResumenLibrePorCreditoCuota() (cuota.libre.service.js)
+ */
+export const obtenerCicloLibreActualSegunRegla = async (creditoId, fecha = ymdDate(todayYMD())) => {
+  const hoyYMD = ymd(fecha);
+  const resumen = await obtenerResumenLibrePorCreditoCuota(creditoId, ymdDate(hoyYMD));
+  const c = toNumber(resumen?.ciclo_actual ?? 1);
+  return clamp(c, 1, LIBRE_MAX_CICLOS);
+};
+
+/**
  * Devuelve vencimientos por ciclo (FIN INCLUSIVE de cada ciclo),
- * consistente con cuota.libre.service.js (rangoCicloLibre/vencimientoCicloLibre).
+ * consistente con cuota.libre.service.js (vencimientoCicloLibre).
  */
 export const obtenerFechasCiclosLibre = (credito) => {
   if (!credito) return null;
 
-  // Solo para compat de UI: 1..3
   const vto1 = vencimientoCicloLibre(credito, 1);
   const vto2 = vencimientoCicloLibre(credito, 2);
   const vto3 = vencimientoCicloLibre(credito, 3);
@@ -107,7 +125,6 @@ export const verificarTopeCiclosLibre = (credito, hoyYMD = todayYMD()) => {
   const vto3 = vencimientoCicloLibre(credito, 3);
   if (!vto3) return;
 
-  // Si HOY está luego del fin del ciclo 3 y aún hay saldo => no puede “seguir”
   if (String(hoyYMD) > String(vto3)) {
     const err = new Error(
       `Crédito LIBRE superó el tope de ${LIBRE_MAX_CICLOS} ciclos. Debe cancelarse o refinanciarse.`
@@ -123,7 +140,6 @@ export const verificarTopeCiclosLibre = (credito, hoyYMD = todayYMD()) => {
 // ─────────────────────────────────────────────────────────────
 
 const obtenerInteresCobradoHistoricoLibre = async (creditoId, t = null) => {
-  // Evita depender de asociaciones: trae IDs de cuotas del crédito y suma recibos.
   const cuotas = await Cuota.findAll({
     where: { credito_id: creditoId },
     attributes: ['id'],
@@ -143,7 +159,6 @@ const obtenerInteresCobradoHistoricoLibre = async (creditoId, t = null) => {
 
 /* ===================== Helpers fallback (solo si falla resumen exacto) ===================== */
 
-// Interés del ciclo (fallback) — NO es fuente de verdad.
 export const calcularInteresCicloLibre = (credito) => {
   if (!credito) return 0;
   const tasa = normalizeRate(credito.interes); // 60 ó 0.60 -> 0.60
@@ -158,7 +173,7 @@ export const calcularInteresCicloLibre = (credito) => {
 /**
  * Mora LIBRE (fallback)
  * Regla: mora_diaria = 2.5% del INTERÉS DEL CICLO, por día de atraso.
- * Nota: este fallback SOLO calcula sobre el ciclo actual.
+ * Nota: este fallback SOLO calcula sobre el ciclo actual (por calendario).
  */
 export const calcularMoraLibre = (credito, hoy = ymdDate(todayYMD())) => {
   if (!credito) return 0;
@@ -168,7 +183,6 @@ export const calcularMoraLibre = (credito, hoy = ymdDate(todayYMD())) => {
   const vto = vencimientoCicloLibre(credito, ciclo);
   if (!vto) return 0;
 
-  // vto inclusive: mora recién desde el día siguiente
   if (String(hoyY) <= String(vto)) return 0;
 
   const dias = Math.max(differenceInCalendarDays(ymdDate(hoyY), ymdDate(vto)), 0);
@@ -180,43 +194,25 @@ export const calcularMoraLibre = (credito, hoy = ymdDate(todayYMD())) => {
   return fix2(interesCiclo * MORA_DIARIA_LIBRE * dias);
 };
 
-// En LIBRE, el importe visible de la cuota es SOLO capital pendiente
 export const calcularImporteCuotaLibre = (credito) => {
   return fix2(toNumber(credito?.saldo_actual || 0));
 };
 
 /* ===================== Fuente de verdad: resumen exacto desde cuota.libre.service.js ===================== */
 
-/**
- * Obtiene resumen LIBRE desde cuota.libre.service.js y lo normaliza para UI/compat.
- *
- * ✅ FIX PRINCIPAL:
- * - NO dependemos del facade cuota.service.js (puede devolver contrato viejo sin *_total).
- * - Respetamos separación:
- *   - *_total = acumulado 1..ciclo_actual (para total a pagar “al día”)
- *   - *_hoy   = solo ciclo actual (para UI informativa)
- *
- * ✅ FIX “Intereses acumulados” (historial cobrado):
- * - intereses_acumulados = interes_cobrado_historico (NO cambia con pagos hacia atrás)
- * - interes_devengado_total = interes_cobrado_historico + interes_pendiente_total (auditable)
- */
 const obtenerResumenLibreExactoSafe = async (creditoId, hoyYMD) => {
   try {
     const credito = await Credito.findByPk(creditoId);
     if (!credito || !esLibre(credito)) return null;
 
-    // ✅ Fuente de verdad real: cuota.libre.service.js
     const resumen = await obtenerResumenLibrePorCreditoCuota(creditoId, ymdDate(hoyYMD));
     if (!resumen) return null;
 
-    // Normalizamos capital
     const saldo_capital = fix2(toNumber(resumen?.saldo_capital ?? credito?.saldo_actual ?? 0));
 
-    // Totales acumulados hasta ciclo actual
     const interes_total = fix2(
       toNumber(
         resumen?.interes_pendiente_total ??
-        // compat si viene viejo
         resumen?.interes_total ??
         0
       )
@@ -225,20 +221,17 @@ const obtenerResumenLibreExactoSafe = async (creditoId, hoyYMD) => {
     const mora_total = fix2(
       toNumber(
         resumen?.mora_pendiente_total ??
-        // compat si viene viejo
         resumen?.mora_total ??
         0
       )
     );
 
-    // Ciclo actual
     const cicloCalc = cicloLibreActualCuota(credito, hoyYMD);
     const ciclo_actual = Math.min(
       Math.max(toNumber(resumen?.ciclo_actual ?? resumen?.ciclo ?? cicloCalc ?? 1), 1),
       LIBRE_MAX_CICLOS
     );
 
-    // “HOY” = SOLO del ciclo actual (si viene del resumen, lo respetamos)
     const interes_hoy = fix2(
       toNumber(
         resumen?.interes_pendiente_hoy ??
@@ -257,7 +250,6 @@ const obtenerResumenLibreExactoSafe = async (creditoId, hoyYMD) => {
       )
     );
 
-    // Total de liquidación “al día”
     const total_liquidacion_hoy = fix2(
       toNumber(
         resumen?.total_liquidacion_hoy ??
@@ -266,7 +258,6 @@ const obtenerResumenLibreExactoSafe = async (creditoId, hoyYMD) => {
       )
     );
 
-    // Total SOLO ciclo actual (informativo)
     const total_ciclo_hoy = fix2(
       toNumber(
         resumen?.total_ciclo_hoy ??
@@ -274,16 +265,10 @@ const obtenerResumenLibreExactoSafe = async (creditoId, hoyYMD) => {
       )
     );
 
-    // ✅ Interés cobrado histórico (historial real)
     const interes_cobrado_historico = await obtenerInteresCobradoHistoricoLibre(creditoId);
-
-    // ✅ “Intereses acumulados” para UI = HISTORIAL COBRADO (no debe variar por pagos)
     const intereses_acumulados = fix2(interes_cobrado_historico);
-
-    // ✅ “Devengado total” (auditable): cobrado + pendiente
     const interes_devengado_total = fix2(interes_cobrado_historico + interes_total);
 
-    // Exponemos vencimientos para auditoría rápida
     const fechas = obtenerFechasCiclosLibre(credito);
 
     return {
@@ -292,31 +277,25 @@ const obtenerResumenLibreExactoSafe = async (creditoId, hoyYMD) => {
       hoy: hoyYMD,
       tasa_decimal: normalizeRate(credito?.interes),
 
-      // normalizados
       saldo_capital,
       interes_pendiente_total: interes_total,
       mora_pendiente_total: mora_total,
       ciclo_actual,
 
-      // “HOY” (solo ciclo actual)
       interes_pendiente_hoy: interes_hoy,
       mora_pendiente_hoy: mora_hoy,
 
-      // aliases modernos para UI
       interes_ciclo_hoy: interes_hoy,
       mora_ciclo_hoy: mora_hoy,
 
-      // totales
       total_liquidacion_hoy,
       total_actual: total_liquidacion_hoy,
       total_ciclo_hoy,
 
-      // ✅ acumulados auditables (historial + devengado)
       interes_cobrado_historico,
       intereses_acumulados,
       interes_devengado_total,
 
-      // vencimientos (debug)
       ...(fechas || {})
     };
   } catch {
@@ -326,9 +305,6 @@ const obtenerResumenLibreExactoSafe = async (creditoId, hoyYMD) => {
 
 /**
  * ✅ Refrescar cuota LIBRE
- * - Importe = capital
- * - Mora = desde resumen exacto (ciclo actual)
- * - Estado 'vencida' si hoy pasó el vencimiento del ciclo actual (vto inclusive sin mora)
  */
 export const refrescarCuotaLibre = async (creditoId, t = null) => {
   const credito = await Credito.findByPk(creditoId, t ? { transaction: t } : undefined);
@@ -337,7 +313,6 @@ export const refrescarCuotaLibre = async (creditoId, t = null) => {
 
   const hoyYMD = todayYMD();
 
-  // Buscar/crear cuota 1
   let cuotaLibre = await Cuota.findOne({
     where: { credito_id: credito.id },
     order: [['numero_cuota', 'ASC']],
@@ -345,11 +320,8 @@ export const refrescarCuotaLibre = async (creditoId, t = null) => {
   });
 
   const nuevoImporte = fix2(calcularImporteCuotaLibre(credito));
-
-  // ✅ Fuente de verdad
   const resumenExacto = await obtenerResumenLibreExactoSafe(credito.id, hoyYMD);
 
-  // Guardamos mora del ciclo actual (HOY) si está; si no, fallback.
   const moraLibre = fix2(
     resumenExacto?.mora_pendiente_hoy ??
     resumenExacto?.mora_ciclo_hoy ??
@@ -410,13 +382,6 @@ export const obtenerTotalHoyLibreExacto = async (creditoId, fecha = ymdDate(toda
   return fix2(capital + interes + mora);
 };
 
-/**
- * ⚠️ Importante:
- * Esta función NO debe crear recibos ni impactar caja directamente.
- * La ejecución real del pago/cancelación LIBRE vive en cuota.service.js
- * para mantener consistencia contable y transaccional.
- */
-
 export const cancelarCreditoLibre = async ({
   credito,
   forma_pago_id,
@@ -448,7 +413,6 @@ export const cancelarCreditoLibre = async ({
     };
   }
 
-  // ✅ Resumen exacto
   const resumenExacto = await obtenerResumenLibreExactoSafe(credito.id, hoyYMD);
 
   let interesPendiente = 0;
@@ -515,8 +479,7 @@ export const cancelarCreditoLibre = async ({
       {
         saldo_actual: 0,
         estado: 'pagado',
-        // ✅ Nota: este campo NO es "historial"; se mantiene como lo venías usando.
-        // El historial de interés cobrado sale de Recibo.sum(interes_ciclo_cobrado)
+        // Nota: historial real sale de Recibo.sum(interes_ciclo_cobrado)
         interes_acumulado: fix2(toNumber(credito.interes_acumulado) + interesNeto)
       },
       { where: { id: credito.id }, transaction: t }
@@ -588,6 +551,14 @@ export const cancelarCreditoLibre = async ({
       { transaction: t }
     );
 
+    // ✅ Caja consistente (ingreso) en la misma transacción
+    await registrarIngresoDesdeReciboEnTx({
+      t,
+      recibo,
+      forma_pago_id,
+      usuario_id
+    });
+
     await t.commit();
 
     return {
@@ -621,13 +592,8 @@ export const obtenerResumenLibre = async (creditoId, fecha = ymdDate(todayYMD())
   const saldo_capital = fix2(toNumber(credito.saldo_actual || 0));
   const ciclo = cicloLibreActualCuota(credito, hoyYMD);
 
-  // ✅ En fallback también devolvemos acumulados coherentes
   const interes_cobrado_historico = await obtenerInteresCobradoHistoricoLibre(creditoId);
-
-  // ✅ “Intereses acumulados” = HISTORIAL COBRADO
   const intereses_acumulados = fix2(interes_cobrado_historico);
-
-  // ✅ Devengado total (auditable)
   const interes_devengado_total = fix2(interes_cobrado_historico + interes);
 
   return {
@@ -649,7 +615,6 @@ export const obtenerResumenLibre = async (creditoId, fecha = ymdDate(todayYMD())
     total_liquidacion_hoy: fix2(saldo_capital + interes + mora),
     total_actual: fix2(saldo_capital + interes + mora),
 
-    // ✅ acumulados auditables (fallback)
     interes_cobrado_historico,
     intereses_acumulados,
     interes_devengado_total,
