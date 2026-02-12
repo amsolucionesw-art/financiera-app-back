@@ -1,5 +1,12 @@
 // financiera-backend/services/credito/credito.pdf.service.js
 // Generación de PDF para ficha del crédito (aislado para no inflar el service principal).
+//
+// ✅ Mejoras incluidas (camino A):
+// - Logo desde financiera-backend/assets/logo.png (en runtime: process.cwd()/assets/logo.png)
+// - Header prolijo (logo + título + fecha)
+// - Secciones con cajas/sombreado suave
+// - Tabla con encabezado sombreado + repetición de encabezado al saltar de página
+// - Corte de página automático para no “romper” filas
 
 import { obtenerCreditoPorId } from './credito.core.service.js';
 
@@ -16,21 +23,10 @@ import {
 
 import { obtenerFechasCiclosLibre } from './credito.libre.service.js';
 
+import fs from 'fs';
+import path from 'path';
+
 /* ===================== TOTAL ACTUAL (helper local para PDF) ===================== */
-/**
- * Evita depender de un helper NO exportado del core.
- * Regla:
- * - LIBRE: capital (saldo_actual) + interés del ciclo estimado + mora en cuota (intereses_vencidos_acumulados).
- * - COMÚN/PROGRESIVO: suma por cuotas activas (pendiente/parcial/vencida):
- *    (importe - descuento - pagado) + mora (intereses_vencidos_acumulados)
- *
- * Nota importante:
- * - En tu arquitectura, el "total_actual" oficial viene seteadísimo por obtenerCreditoPorId().
- * - Este helper es SOLO fallback defensivo si por algún motivo c.total_actual viene null/undefined.
- * - Para LIBRE, el interés estimado NO lo recalculamos acá para no duplicar lógica:
- *   usamos "interes_pendiente_total" / "interes_pendiente_hoy" / "intereses_acumulados"
- *   que ya vienen aplanados por el core cuando existe resumen_libre.
- */
 const calcularTotalActualCreditoPlainPDF = (creditoPlain) => {
   if (!creditoPlain) return 0;
 
@@ -38,17 +34,14 @@ const calcularTotalActualCreditoPlainPDF = (creditoPlain) => {
     const cuota = Array.isArray(creditoPlain.cuotas) ? creditoPlain.cuotas[0] : null;
     const mora = fix2(toNumber(cuota?.intereses_vencidos_acumulados));
 
-    // Preferimos valores ya normalizados por el core (si existen)
     const capital = fix2(toNumber(creditoPlain.saldo_capital ?? creditoPlain.saldo_actual));
-    const interes =
-      fix2(
-        toNumber(
-          creditoPlain.interes_pendiente_total ??
-          creditoPlain.interes_pendiente_hoy ??
-          // fallback ultra defensivo: si no hay resumen, tomamos 0
-          0
-        )
-      );
+    const interes = fix2(
+      toNumber(
+        creditoPlain.interes_pendiente_total ??
+        creditoPlain.interes_pendiente_hoy ??
+        0
+      )
+    );
 
     return fix2(capital + interes + mora);
   }
@@ -64,10 +57,72 @@ const calcularTotalActualCreditoPlainPDF = (creditoPlain) => {
       0
     );
     const mora = fix2(toNumber(c.intereses_vencidos_acumulados));
-
     total = fix2(total + principalPend + mora);
   }
   return total;
+};
+
+/* ===================== Helpers de layout PDF ===================== */
+const COLORS = {
+  text: '#111111',
+  muted: '#6B7280',
+  line: '#E5E7EB',
+  headerFill: '#F3F4F6',
+  tableHeaderFill: '#F3F4F6',
+  boxFill: '#FAFAFA'
+};
+
+const safeSetColor = (doc, hex) => {
+  try { doc.fillColor(hex); } catch (_) {}
+};
+
+const safeStrokeColor = (doc, hex) => {
+  try { doc.strokeColor(hex); } catch (_) {}
+};
+
+const drawHR = (doc, x1, x2, y) => {
+  safeStrokeColor(doc, COLORS.line);
+  doc.moveTo(x1, y).lineTo(x2, y).stroke();
+  safeStrokeColor(doc, COLORS.text);
+};
+
+const drawSectionTitle = (doc, title) => {
+  doc.moveDown(0.4);
+  safeSetColor(doc, COLORS.text);
+  doc.fontSize(12).font('Helvetica-Bold').text(title);
+  doc.moveDown(0.2);
+  drawHR(doc, doc.page.margins.left, doc.page.width - doc.page.margins.right, doc.y);
+  doc.moveDown(0.4);
+  doc.font('Helvetica');
+};
+
+const drawKV = (doc, x, y, label, value, opts = {}) => {
+  const labelW = opts.labelWidth ?? 140;
+  const valueW = opts.valueWidth ?? 360;
+  const fontSize = opts.fontSize ?? 10;
+
+  doc.fontSize(fontSize);
+  safeSetColor(doc, COLORS.muted);
+  doc.font('Helvetica').text(label, x, y, { width: labelW });
+
+  safeSetColor(doc, COLORS.text);
+  doc.font('Helvetica').text(String(value ?? '-'), x + labelW, y, { width: valueW });
+
+  return y + (opts.rowHeight ?? 14);
+};
+
+const ensureSpace = (doc, neededHeight, onNewPage) => {
+  const bottom = doc.page.height - doc.page.margins.bottom;
+  if (doc.y + neededHeight <= bottom) return;
+  doc.addPage();
+  if (typeof onNewPage === 'function') onNewPage();
+};
+
+const resolveLogoPath = () => {
+  // En producción y docker, process.cwd() suele ser /app
+  // Logo: /app/assets/logo.png
+  const p = path.resolve(process.cwd(), 'assets', 'logo.png');
+  return p;
 };
 
 /* ===================== PDF: Ficha del Crédito ===================== */
@@ -93,7 +148,6 @@ export const imprimirFichaCredito = async (req, res) => {
     const cli = c.cliente || {};
     const cuotas = Array.isArray(c.cuotas) ? c.cuotas : [];
 
-    // ✅ Preferimos el total_actual ya calculado por el core
     const total_actual = fix2(toNumber(
       typeof c.total_actual !== 'undefined' && c.total_actual !== null
         ? c.total_actual
@@ -101,7 +155,6 @@ export const imprimirFichaCredito = async (req, res) => {
     ));
 
     const fechaEmision = todayYMD();
-
     const ciclosLibre = esLibre(c) ? obtenerFechasCiclosLibre(c) : null;
 
     const vtosValidos = cuotas
@@ -111,9 +164,7 @@ export const imprimirFichaCredito = async (req, res) => {
       .filter(Boolean)
       .sort();
 
-    let primerVto =
-      vtosValidos[0] || (c.fecha_compromiso_pago ? ymd(c.fecha_compromiso_pago) : '-');
-
+    let primerVto = vtosValidos[0] || (c.fecha_compromiso_pago ? ymd(c.fecha_compromiso_pago) : '-');
     let ultimoVto = vtosValidos.length
       ? vtosValidos[vtosValidos.length - 1]
       : (c.fecha_compromiso_pago ? ymd(c.fecha_compromiso_pago) : '-');
@@ -127,7 +178,15 @@ export const imprimirFichaCredito = async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="ficha-credito-${c.id}.pdf"`);
     res.setHeader('Cache-Control', 'no-store');
 
-    const doc = new PDFDocument({ size: 'A4', margin: 36 });
+    const doc = new PDFDocument({
+      size: 'A4',
+      margin: 36,
+      info: {
+        Title: `Ficha de Crédito #${c.id}`,
+        Author: 'SyE - Financiera',
+        Producer: 'PDFKit'
+      }
+    });
 
     doc.on('error', (err) => {
       console.error('[PDFKit][imprimirFichaCredito] Error de stream:', err?.message || err);
@@ -136,83 +195,192 @@ export const imprimirFichaCredito = async (req, res) => {
 
     doc.pipe(res);
 
-    doc.fontSize(16).text('Ficha de Crédito', { align: 'center' });
-    doc.moveDown(0.3);
-    doc.fontSize(9).fillColor('#555').text(`Emitido: ${fechaEmision}`, { align: 'center' });
-    doc.moveDown(1);
-    doc.fillColor('#000');
+    /* ===================== Header (logo + título) ===================== */
+    const left = doc.page.margins.left;
+    const right = doc.page.width - doc.page.margins.right;
+    const top = doc.page.margins.top;
 
-    doc.fontSize(12).text('Cliente', { underline: true });
-    doc.moveDown(0.3);
-    doc.fontSize(10)
-      .text(`Nombre: ${[cli.nombre, cli.apellido].filter(Boolean).join(' ') || '-'}`)
-      .text(`DNI: ${cli.dni || '-'}`)
-      .text(`Teléfono(s): ${[cli.telefono_1, cli.telefono_2, cli.telefono].filter(Boolean).join(' / ') || '-'}`)
-      .text(`Dirección: ${[cli.direccion_1, cli.direccion_2, cli.direccion].filter(Boolean).join(' | ') || '-'}`);
-    doc.moveDown(0.8);
+    // Banda superior
+    const headerH = 64;
+    safeStrokeColor(doc, COLORS.line);
+    doc.rect(left, top - 10, right - left, headerH).stroke();
+    safeStrokeColor(doc, COLORS.text);
 
-    doc.fontSize(12).text('Crédito', { underline: true });
-    doc.moveDown(0.3);
-    doc.fontSize(10)
-      .text(`ID: ${c.id}`)
-      .text(`Modalidad: ${labelModalidad(c.modalidad_credito)}`)
-      .text(`Tipo: ${String(c.tipo_credito || '').toUpperCase()}`)
-      .text(`Cuotas: ${c.cantidad_cuotas ?? '-'}`)
-      .text(`Estado: ${String(c.estado || '').toUpperCase()}`)
-      .text(`Fecha solicitud: ${c.fecha_solicitud || '-'}`)
-      .text(`Fecha acreditación: ${c.fecha_acreditacion || '-'}`);
-
-    if (ciclosLibre) {
-      doc
-        .text(`Vto 1er ciclo: ${ciclosLibre.vencimiento_ciclo_1 || '-'}`)
-        .text(`Vto 2° ciclo: ${ciclosLibre.vencimiento_ciclo_2 || '-'}`)
-        .text(`Vto 3er ciclo: ${ciclosLibre.vencimiento_ciclo_3 || '-'}`);
+    // Logo
+    const logoPath = resolveLogoPath();
+    let logoDrawn = false;
+    if (fs.existsSync(logoPath)) {
+      try {
+        doc.image(logoPath, left + 10, top - 2, { height: 44 }); // mantiene proporción
+        logoDrawn = true;
+      } catch (e) {
+        console.error('[PDFKit][logo] No se pudo cargar logo:', e?.message || e);
+      }
     } else {
-      doc
-        .text(`Fecha 1er vencimiento: ${primerVto}`)
-        .text(`Fecha fin de crédito: ${ultimoVto}`);
+      console.warn('[PDFKit][logo] No existe:', logoPath);
     }
 
-    doc.text(`Cobrador asignado: ${c.cobradorCredito?.nombre_completo || '-'}`);
-    doc.moveDown(0.3);
-    doc.fontSize(11).text(`Saldo actual declarado: ${fmtARS(c.saldo_actual)}`);
-    doc.fontSize(12).text(`TOTAL ACTUAL: ${fmtARS(total_actual)}`);
-    doc.moveDown(1);
+    // Título + fecha (a la derecha del logo)
+    const titleX = logoDrawn ? left + 10 + 160 : left + 10;
+    const titleW = right - titleX - 10;
 
-    doc.fontSize(12).text('Detalle de cuotas', { underline: true });
-    doc.moveDown(0.4);
-    doc.fontSize(9);
+    safeSetColor(doc, COLORS.text);
+    doc.font('Helvetica-Bold').fontSize(18).text('Ficha de Crédito', titleX, top + 2, { width: titleW, align: 'right' });
+
+    safeSetColor(doc, COLORS.muted);
+    doc.font('Helvetica').fontSize(9).text(`Emitido: ${fechaEmision}`, titleX, top + 28, { width: titleW, align: 'right' });
+
+    // Subtítulo pequeño
+    safeSetColor(doc, COLORS.muted);
+    doc.fontSize(9).text(`Crédito #${c.id} · ${String(c.estado || '').toUpperCase()} · ${labelModalidad(c.modalidad_credito)}`, titleX, top + 42, {
+      width: titleW,
+      align: 'right'
+    });
+
+    // Cursor debajo del header
+    doc.y = top + headerH + 8;
+    safeSetColor(doc, COLORS.text);
+
+    /* ===================== Cliente ===================== */
+    drawSectionTitle(doc, 'Cliente');
+
+    const nombreCompleto = [cli.nombre, cli.apellido].filter(Boolean).join(' ') || '-';
+    const telefonos = [cli.telefono_1, cli.telefono_2, cli.telefono].filter(Boolean).join(' / ') || '-';
+    const direcciones = [cli.direccion_1, cli.direccion_2, cli.direccion].filter(Boolean).join(' | ') || '-';
+
+    let y0 = doc.y;
+    y0 = drawKV(doc, left, y0, 'Nombre', nombreCompleto);
+    y0 = drawKV(doc, left, y0, 'DNI', cli.dni || '-');
+    y0 = drawKV(doc, left, y0, 'Teléfono(s)', telefonos);
+    y0 = drawKV(doc, left, y0, 'Dirección', direcciones, { rowHeight: 16 });
+    doc.y = y0 + 6;
+
+    /* ===================== Crédito ===================== */
+    drawSectionTitle(doc, 'Crédito');
+
+    let y1 = doc.y;
+    y1 = drawKV(doc, left, y1, 'Modalidad', labelModalidad(c.modalidad_credito));
+    y1 = drawKV(doc, left, y1, 'Tipo', String(c.tipo_credito || '').toUpperCase());
+    y1 = drawKV(doc, left, y1, 'Cuotas', c.cantidad_cuotas ?? '-');
+    y1 = drawKV(doc, left, y1, 'Fecha solicitud', c.fecha_solicitud || '-');
+    y1 = drawKV(doc, left, y1, 'Fecha acreditación', c.fecha_acreditacion || '-');
+
+    if (ciclosLibre) {
+      y1 = drawKV(doc, left, y1, 'Vto 1er ciclo', ciclosLibre.vencimiento_ciclo_1 || '-');
+      y1 = drawKV(doc, left, y1, 'Vto 2° ciclo', ciclosLibre.vencimiento_ciclo_2 || '-');
+      y1 = drawKV(doc, left, y1, 'Vto 3er ciclo', ciclosLibre.vencimiento_ciclo_3 || '-');
+    } else {
+      y1 = drawKV(doc, left, y1, '1er vencimiento', primerVto);
+      y1 = drawKV(doc, left, y1, 'Fin de crédito', ultimoVto);
+    }
+
+    y1 = drawKV(doc, left, y1, 'Cobrador asignado', c.cobradorCredito?.nombre_completo || '-');
+
+    // Caja “totales”
+    const totalsBoxH = 54;
+    ensureSpace(doc, totalsBoxH + 18);
+
+    const boxY = y1 + 10;
+    safeStrokeColor(doc, COLORS.line);
+    doc.rect(left, boxY, right - left, totalsBoxH).stroke();
+    safeStrokeColor(doc, COLORS.text);
+
+    safeSetColor(doc, COLORS.muted);
+    doc.font('Helvetica').fontSize(10).text('Saldo actual declarado', left + 12, boxY + 10);
+    safeSetColor(doc, COLORS.text);
+    doc.font('Helvetica-Bold').fontSize(12).text(fmtARS(c.saldo_actual), left + 12, boxY + 26);
+
+    safeSetColor(doc, COLORS.muted);
+    doc.font('Helvetica').fontSize(10).text('TOTAL ACTUAL', right - 210, boxY + 10, { width: 198, align: 'right' });
+    safeSetColor(doc, COLORS.text);
+    doc.font('Helvetica-Bold').fontSize(16).text(fmtARS(total_actual), right - 210, boxY + 24, { width: 198, align: 'right' });
+
+    doc.font('Helvetica');
+    doc.y = boxY + totalsBoxH + 12;
+
+    /* ===================== Detalle de cuotas (tabla) ===================== */
+    drawSectionTitle(doc, 'Detalle de cuotas');
 
     const headers = ['#', 'Vencimiento', 'Importe', 'Pagado', 'Desc.', 'Mora', 'Saldo', 'Estado'];
-    const colWidths = [25, 85, 70, 70, 55, 55, 70, 70];
+    const colWidths = [26, 78, 70, 70, 55, 55, 70, 72];
 
-    let x = doc.x, y = doc.y;
-    headers.forEach((h, i) => {
-      doc.text(h, x, y, { width: colWidths[i], align: i <= 1 ? 'left' : 'right' });
-      x += colWidths[i];
-    });
-    doc.moveDown(0.5);
-    doc.moveTo(36, doc.y).lineTo(559, doc.y).strokeColor('#ddd').stroke();
-    doc.strokeColor('#000');
+    const tableX = left;
+    const tableW = colWidths.reduce((a, b) => a + b, 0);
+    const rowH = 18;
 
-    let totalPrincipalPend = 0, totalMora = 0;
-    cuotas.forEach((ct) => {
+    const drawTableHeader = () => {
+      ensureSpace(doc, rowH + 6);
+
+      const y = doc.y;
+
+      // fondo header
+      safeStrokeColor(doc, COLORS.line);
+      doc.rect(tableX, y, tableW, rowH).stroke();
+      doc.save();
+      doc.fillColor(COLORS.tableHeaderFill);
+      doc.rect(tableX, y, tableW, rowH).fill();
+      doc.restore();
+
+      // textos
+      let cx = tableX;
+      doc.font('Helvetica-Bold').fontSize(9);
+      safeSetColor(doc, COLORS.text);
+
+      headers.forEach((h, i) => {
+        const align = i <= 1 ? 'left' : 'right';
+        doc.text(h, cx + 6, y + 5, { width: colWidths[i] - 10, align });
+        cx += colWidths[i];
+      });
+
+      doc.font('Helvetica');
+      doc.y = y + rowH;
+      return y + rowH;
+    };
+
+    const drawRow = (cells) => {
+      ensureSpace(doc, rowH + 2, () => {
+        // al nueva página, repetimos header
+        drawTableHeader();
+      });
+
+      const y = doc.y;
+      safeStrokeColor(doc, COLORS.line);
+      doc.rect(tableX, y, tableW, rowH).stroke();
+      safeStrokeColor(doc, COLORS.text);
+
+      let cx = tableX;
+      doc.fontSize(9);
+      cells.forEach((cell, i) => {
+        const align = i <= 1 ? 'left' : 'right';
+        doc.text(String(cell ?? ''), cx + 6, y + 5, { width: colWidths[i] - 10, align });
+        cx += colWidths[i];
+      });
+
+      doc.y = y + rowH;
+    };
+
+    drawTableHeader();
+
+    let totalPrincipalPend = 0;
+    let totalMora = 0;
+
+    for (const ct of cuotas) {
       const principalPend = Math.max(
         fix2(toNumber(ct.importe_cuota) - toNumber(ct.descuento_cuota) - toNumber(ct.monto_pagado_acumulado)),
         0
       );
       const mora = fix2(toNumber(ct.intereses_vencidos_acumulados));
+
       totalPrincipalPend = fix2(totalPrincipalPend + principalPend);
       totalMora = fix2(totalMora + mora);
 
-      const vto =
-        ct.fecha_vencimiento === LIBRE_VTO_FICTICIO
-          ? '—'
-          : (ct.fecha_vencimiento ? ymd(ct.fecha_vencimiento) : '-');
+      const vto = ct.fecha_vencimiento === LIBRE_VTO_FICTICIO
+        ? '—'
+        : (ct.fecha_vencimiento ? ymd(ct.fecha_vencimiento) : '-');
 
       const saldoCuota = fix2(principalPend + mora);
 
-      const row = [
+      drawRow([
         ct.numero_cuota,
         vto,
         fmtARS(ct.importe_cuota),
@@ -221,37 +389,41 @@ export const imprimirFichaCredito = async (req, res) => {
         fmtARS(mora),
         fmtARS(saldoCuota),
         String(ct.estado || '').toUpperCase()
-      ];
+      ]);
+    }
 
-      let cx = 36;
-      row.forEach((cell, i) => {
-        doc.text(cell, cx, doc.y + 2, { width: colWidths[i], align: i <= 1 ? 'left' : 'right' });
-        cx += colWidths[i];
-      });
-      doc.moveDown(0.6);
-    });
+    // Totales debajo de tabla
+    doc.moveDown(0.6);
+    ensureSpace(doc, 50);
 
-    doc.moveDown(0.2);
-    doc.moveTo(36, doc.y).lineTo(559, doc.y).strokeColor('#ddd').stroke();
-    doc.strokeColor('#000');
-    doc.moveDown(0.4);
+    const totalsY = doc.y;
+    safeStrokeColor(doc, COLORS.line);
+    doc.rect(left, totalsY, right - left, 42).stroke();
+    safeStrokeColor(doc, COLORS.text);
 
-    const labelX = 36 + colWidths.slice(0, 5).reduce((a, b) => a + b, 0);
-    const valueX = 36 + colWidths.slice(0, 6).reduce((a, b) => a + b, 0);
+    doc.font('Helvetica-Bold').fontSize(10);
+    safeSetColor(doc, COLORS.text);
+    doc.text('Totales', left + 10, totalsY + 12);
 
-    doc.fontSize(10);
-    doc.text('Tot. Mora:', labelX, doc.y, { width: colWidths[5], align: 'right' });
-    doc.text(fmtARS(totalMora), valueX, doc.y, { width: colWidths[6], align: 'right' });
-    doc.moveDown(0.2);
-    doc.text('Tot. Principal pendiente:', labelX, doc.y, { width: colWidths[5], align: 'right' });
-    doc.text(fmtARS(totalPrincipalPend), valueX, doc.y, { width: colWidths[6], align: 'right' });
+    doc.font('Helvetica').fontSize(10);
+    safeSetColor(doc, COLORS.muted);
+    doc.text('Mora:', right - 260, totalsY + 10, { width: 70, align: 'right' });
+    safeSetColor(doc, COLORS.text);
+    doc.text(fmtARS(totalMora), right - 180, totalsY + 10, { width: 160, align: 'right' });
 
-    doc.moveDown(1);
-    doc.fontSize(9).fillColor('#666')
-      .text(
-        'Nota: Esta ficha es informativa. Los importes pueden variar según pagos registrados y recálculos de mora.',
-        { align: 'left' }
-      );
+    safeSetColor(doc, COLORS.muted);
+    doc.text('Principal pendiente:', right - 260, totalsY + 24, { width: 70, align: 'right' });
+    safeSetColor(doc, COLORS.text);
+    doc.text(fmtARS(totalPrincipalPend), right - 180, totalsY + 24, { width: 160, align: 'right' });
+
+    doc.moveDown(1.4);
+
+    // Nota final
+    safeSetColor(doc, COLORS.muted);
+    doc.fontSize(9).text(
+      'Nota: Esta ficha es informativa. Los importes pueden variar según pagos registrados y recálculos de mora.',
+      { align: 'left' }
+    );
 
     doc.end();
   } catch (error) {
