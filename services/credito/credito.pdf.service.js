@@ -2,7 +2,73 @@
 // Generación de PDF para ficha del crédito (aislado para no inflar el service principal).
 
 import { obtenerCreditoPorId } from './credito.core.service.js';
-import { fmtARS, labelModalidad, todayYMD, nowTime, fix2, toNumber } from './credito.utils.js';
+
+import {
+  fmtARS,
+  labelModalidad,
+  todayYMD,
+  fix2,
+  toNumber,
+  ymd,
+  esLibre,
+  LIBRE_VTO_FICTICIO
+} from './credito.utils.js';
+
+import { obtenerFechasCiclosLibre } from './credito.libre.service.js';
+
+/* ===================== TOTAL ACTUAL (helper local para PDF) ===================== */
+/**
+ * Evita depender de un helper NO exportado del core.
+ * Regla:
+ * - LIBRE: capital (saldo_actual) + interés del ciclo estimado + mora en cuota (intereses_vencidos_acumulados).
+ * - COMÚN/PROGRESIVO: suma por cuotas activas (pendiente/parcial/vencida):
+ *    (importe - descuento - pagado) + mora (intereses_vencidos_acumulados)
+ *
+ * Nota importante:
+ * - En tu arquitectura, el "total_actual" oficial viene seteadísimo por obtenerCreditoPorId().
+ * - Este helper es SOLO fallback defensivo si por algún motivo c.total_actual viene null/undefined.
+ * - Para LIBRE, el interés estimado NO lo recalculamos acá para no duplicar lógica:
+ *   usamos "interes_pendiente_total" / "interes_pendiente_hoy" / "intereses_acumulados"
+ *   que ya vienen aplanados por el core cuando existe resumen_libre.
+ */
+const calcularTotalActualCreditoPlainPDF = (creditoPlain) => {
+  if (!creditoPlain) return 0;
+
+  if (esLibre(creditoPlain)) {
+    const cuota = Array.isArray(creditoPlain.cuotas) ? creditoPlain.cuotas[0] : null;
+    const mora = fix2(toNumber(cuota?.intereses_vencidos_acumulados));
+
+    // Preferimos valores ya normalizados por el core (si existen)
+    const capital = fix2(toNumber(creditoPlain.saldo_capital ?? creditoPlain.saldo_actual));
+    const interes =
+      fix2(
+        toNumber(
+          creditoPlain.interes_pendiente_total ??
+          creditoPlain.interes_pendiente_hoy ??
+          // fallback ultra defensivo: si no hay resumen, tomamos 0
+          0
+        )
+      );
+
+    return fix2(capital + interes + mora);
+  }
+
+  let total = 0;
+  const cuotas = Array.isArray(creditoPlain.cuotas) ? creditoPlain.cuotas : [];
+  for (const c of cuotas) {
+    const estado = String(c.estado || '').toLowerCase();
+    if (!['pendiente', 'parcial', 'vencida'].includes(estado)) continue;
+
+    const principalPend = Math.max(
+      fix2(toNumber(c.importe_cuota) - toNumber(c.descuento_cuota) - toNumber(c.monto_pagado_acumulado)),
+      0
+    );
+    const mora = fix2(toNumber(c.intereses_vencidos_acumulados));
+
+    total = fix2(total + principalPend + mora);
+  }
+  return total;
+};
 
 /* ===================== PDF: Ficha del Crédito ===================== */
 export const imprimirFichaCredito = async (req, res) => {
@@ -26,19 +92,27 @@ export const imprimirFichaCredito = async (req, res) => {
     const c = credito.get ? credito.get({ plain: true }) : credito;
     const cli = c.cliente || {};
     const cuotas = Array.isArray(c.cuotas) ? c.cuotas : [];
-    const total_actual = toNumber(c.total_actual ?? calcularTotalActualCreditoPlain(c));
+
+    // ✅ Preferimos el total_actual ya calculado por el core
+    const total_actual = fix2(toNumber(
+      typeof c.total_actual !== 'undefined' && c.total_actual !== null
+        ? c.total_actual
+        : calcularTotalActualCreditoPlainPDF(c)
+    ));
+
     const fechaEmision = todayYMD();
 
     const ciclosLibre = esLibre(c) ? obtenerFechasCiclosLibre(c) : null;
 
     const vtosValidos = cuotas
-      .map(ct => ct.fecha_vencimiento)
-      .filter(f => f && f !== LIBRE_VTO_FICTICIO)
-      .map(f => ymd(f))
+      .map((ct) => ct.fecha_vencimiento)
+      .filter((f) => f && f !== LIBRE_VTO_FICTICIO)
+      .map((f) => ymd(f))
+      .filter(Boolean)
       .sort();
 
-    let primerVto = vtosValidos[0]
-      || (c.fecha_compromiso_pago ? ymd(c.fecha_compromiso_pago) : '-');
+    let primerVto =
+      vtosValidos[0] || (c.fecha_compromiso_pago ? ymd(c.fecha_compromiso_pago) : '-');
 
     let ultimoVto = vtosValidos.length
       ? vtosValidos[vtosValidos.length - 1]
@@ -57,7 +131,7 @@ export const imprimirFichaCredito = async (req, res) => {
 
     doc.on('error', (err) => {
       console.error('[PDFKit][imprimirFichaCredito] Error de stream:', err?.message || err);
-      try { res.end(); } catch (_) { }
+      try { res.end(); } catch (_) {}
     });
 
     doc.pipe(res);
@@ -90,9 +164,9 @@ export const imprimirFichaCredito = async (req, res) => {
 
     if (ciclosLibre) {
       doc
-        .text(`Vto 1er ciclo: ${ciclosLibre.vencimiento_ciclo_1}`)
-        .text(`Vto 2° ciclo: ${ciclosLibre.vencimiento_ciclo_2}`)
-        .text(`Vto 3er ciclo: ${ciclosLibre.vencimiento_ciclo_3}`);
+        .text(`Vto 1er ciclo: ${ciclosLibre.vencimiento_ciclo_1 || '-'}`)
+        .text(`Vto 2° ciclo: ${ciclosLibre.vencimiento_ciclo_2 || '-'}`)
+        .text(`Vto 3er ciclo: ${ciclosLibre.vencimiento_ciclo_3 || '-'}`);
     } else {
       doc
         .text(`Fecha 1er vencimiento: ${primerVto}`)
@@ -124,15 +198,17 @@ export const imprimirFichaCredito = async (req, res) => {
     let totalPrincipalPend = 0, totalMora = 0;
     cuotas.forEach((ct) => {
       const principalPend = Math.max(
-        fix2(toNumber(ct.importe_cuota) - toNumber(ct.descuento_cuota) - toNumber(ct.monto_pagado_acumulado)), 0
+        fix2(toNumber(ct.importe_cuota) - toNumber(ct.descuento_cuota) - toNumber(ct.monto_pagado_acumulado)),
+        0
       );
       const mora = fix2(toNumber(ct.intereses_vencidos_acumulados));
       totalPrincipalPend = fix2(totalPrincipalPend + principalPend);
       totalMora = fix2(totalMora + mora);
 
       const vto =
-        ct.fecha_vencimiento === LIBRE_VTO_FICTICIO ? '—' :
-          (ct.fecha_vencimiento ? ymd(ct.fecha_vencimiento) : '-');
+        ct.fecha_vencimiento === LIBRE_VTO_FICTICIO
+          ? '—'
+          : (ct.fecha_vencimiento ? ymd(ct.fecha_vencimiento) : '-');
 
       const saldoCuota = fix2(principalPend + mora);
 
@@ -172,7 +248,10 @@ export const imprimirFichaCredito = async (req, res) => {
 
     doc.moveDown(1);
     doc.fontSize(9).fillColor('#666')
-      .text('Nota: Esta ficha es informativa. Los importes pueden variar según pagos registrados y recálculos de mora.', { align: 'left' });
+      .text(
+        'Nota: Esta ficha es informativa. Los importes pueden variar según pagos registrados y recálculos de mora.',
+        { align: 'left' }
+      );
 
     doc.end();
   } catch (error) {
@@ -180,7 +259,7 @@ export const imprimirFichaCredito = async (req, res) => {
     if (!res.headersSent) {
       res.status(500).json({ success: false, message: 'Error al generar la ficha del crédito' });
     } else {
-      try { res.end(); } catch (_) { }
+      try { res.end(); } catch (_) {}
     }
   }
 };

@@ -1,230 +1,263 @@
-// financiera-backend/services/credito/credito.utils.js
-// Helpers compartidos para crédito (sin lógica de endpoints).
-// Objetivo: aislar utilidades y efectos secundarios (caja/recibo) para reducir acoplamiento.
+// financiera-backend/services/credito/credito.pdf.service.js
+// Generación de PDF para ficha del crédito (aislado para no inflar el service principal).
+//
+// ✅ Objetivo de este archivo:
+// - NO depender de helpers internos de credito.core.service.js (para evitar imports circulares / acoplamiento)
+// - Reusar únicamente exports públicos de credito.utils.js y credito.libre.service.js
+// - Fallbacks locales si falta algún campo calculado (por compat o edge-cases)
 
-import Recibo from '../../models/Recibo.js';
-import CajaMovimiento from '../../models/CajaMovimiento.js';
+import { obtenerCreditoPorId } from './credito.core.service.js';
 
-/* ===================== Constantes ===================== */
-export const MORA_DIARIA = 0.025;        // 2.5% por día
-export const LIBRE_MAX_CICLOS = 3;       // tope 3 meses para crédito libre
-export const LIBRE_VTO_FICTICIO = '2099-12-31';
+import {
+  fmtARS,
+  labelModalidad,
+  todayYMD,
+  fix2,
+  toNumber,
+  ymd,
+  esLibre,
+  LIBRE_VTO_FICTICIO
+} from './credito.utils.js';
 
-/* ===================== Zona horaria negocio ===================== */
-export const APP_TZ = process.env.APP_TZ || 'America/Argentina/Tucuman';
+import { obtenerFechasCiclosLibre } from './credito.libre.service.js';
 
-const YMD_RE = /^\d{4}-\d{2}-\d{2}$/;
-
-const fmtYMDInTZ = (dateObj) =>
-  new Intl.DateTimeFormat('en-CA', {
-    timeZone: APP_TZ,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit'
-  }).format(dateObj);
-
-// YYYY-MM-DD en TZ negocio
-export const todayYMD = () => fmtYMDInTZ(new Date());
-
-// HH:mm:ss en TZ negocio
-export const nowTime = () =>
-  new Intl.DateTimeFormat('en-GB', {
-    timeZone: APP_TZ,
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false
-  }).format(new Date());
-
-/* ===================== Helpers numéricos ===================== */
-export const toNumber = (v) => {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : 0;
-};
-
-export const fix2 = (n) => Math.round(toNumber(n) * 100) / 100;
-
-/* ===================== Helpers de fecha (YMD estricto y TZ-safe) ===================== */
+/* ===================== TOTAL ACTUAL (fallback local) ===================== */
 /**
- * asYMD:
- * - Si viene 'YYYY-MM-DD' => se devuelve tal cual (NO se parsea como Date).
- * - Si viene Date / timestamp / string ISO => se formatea a YMD en APP_TZ.
+ * Fallback local por si por algún motivo no viene c.total_actual.
+ * - NO-LIBRE: suma principal pendiente + mora (intereses_vencidos_acumulados) de cuotas activas
+ * - LIBRE: prioriza total_liquidacion_hoy / total_ciclo_hoy si existen; si no, capital + mora guardada en la cuota.
+ *   (El cálculo exacto de LIBRE lo hace el core con obtenerResumenLibre; acá no lo duplicamos.)
  */
-const asYMD = (input) => {
-  if (input == null) return null;
+const calcularTotalActualCreditoPlainLocal = (creditoPlain) => {
+  if (!creditoPlain) return 0;
 
-  // String: si ya es YMD, respetarlo (evita corrimiento por UTC parsing)
-  if (typeof input === 'string') {
-    const s = input.slice(0, 10);
-    if (YMD_RE.test(s)) return s;
+  const cuotas = Array.isArray(creditoPlain.cuotas) ? creditoPlain.cuotas : [];
 
-    const dt = new Date(input);
-    if (!Number.isFinite(dt.getTime())) return null;
-    return fmtYMDInTZ(dt);
+  if (esLibre(creditoPlain)) {
+    // Si el core ya aplanó valores, aprovechamos
+    if (creditoPlain.total_liquidacion_hoy != null) return fix2(toNumber(creditoPlain.total_liquidacion_hoy));
+    if (creditoPlain.total_ciclo_hoy != null) return fix2(toNumber(creditoPlain.total_ciclo_hoy));
+
+    // Fallback mínimo: capital + mora hoy (guardada en intereses_vencidos_acumulados de la cuota única)
+    const cuota = cuotas[0] || null;
+    const mora = fix2(toNumber(cuota?.intereses_vencidos_acumulados));
+    const capital = fix2(toNumber(creditoPlain.saldo_actual));
+    return fix2(capital + mora);
   }
 
-  // Date o número u otro: intentar Date
-  const dt = input instanceof Date ? input : new Date(input);
-  if (!Number.isFinite(dt.getTime())) return null;
-  return fmtYMDInTZ(dt);
+  // común/progresivo
+  let total = 0;
+  for (const ct of cuotas) {
+    const estado = String(ct.estado || '').toLowerCase();
+    if (!['pendiente', 'parcial', 'vencida'].includes(estado)) continue;
+
+    const principalPend = Math.max(
+      fix2(toNumber(ct.importe_cuota) - toNumber(ct.descuento_cuota) - toNumber(ct.monto_pagado_acumulado)),
+      0
+    );
+    const mora = fix2(toNumber(ct.intereses_vencidos_acumulados));
+    total = fix2(total + principalPend + mora);
+  }
+  return total;
 };
 
-export const ymd = (dateOrStr) => asYMD(dateOrStr);
-
-/**
- * ymdDate:
- * - Convierte un YMD a Date sin corrimientos por timezone.
- * - Usamos mediodía UTC para que en TZ negativas/positivas no "cruce" de día.
- */
-export const ymdDate = (dateOrStr) => {
-  const s = asYMD(dateOrStr);
-  if (!s) return new Date('Invalid Date');
-  return new Date(`${s}T12:00:00.000Z`);
-};
-
-/* ===================== Helpers formato ===================== */
-export const fmtARS = (n) =>
-  Number(n || 0).toLocaleString('es-AR', { style: 'currency', currency: 'ARS' });
-
-/* Mapea modalidad para mostrar en interfaz/PDF */
-export const labelModalidad = (modalidad) => {
-  const m = String(modalidad || '').toLowerCase();
-  if (m === 'comun') return 'PLAN DE CUOTAS FIJAS';
-  return m.toUpperCase();
-};
-
-/* ===================== Helpers de tasas ===================== */
-/** Normaliza un valor de tasa que puede venir como "60" o "0.60" a porcentaje 60 */
-export const normalizePercent = (val, fallback = 60) => {
-  const n = toNumber(val);
-  if (!n) return fallback;
-  // Si viene 0.6 ó 0.60, lo paso a 60
-  if (n > 0 && n <= 1) return n * 100;
-  return n;
-};
-/** De porcentaje (60) a decimal (0.60) */
-export const percentToDecimal = (pct) => toNumber(pct) / 100.0;
-
-/* ===================== Helpers de interés / períodos ===================== */
-export const periodLengthFromTipo = (tipo_credito) =>
-  tipo_credito === 'semanal' ? 4 :
-    tipo_credito === 'quincenal' ? 2 : 1;
-
-/**
- * Interés proporcional mínimo 60% (común / progresivo):
- *   - semanal   → 60% * (semanas / 4)
- *   - quincenal → 60% * (quincenas / 2)
- *   - mensual   → 60% * (meses)
- */
-export const calcularInteresProporcionalMin60 = (tipo_credito, cantidad_cuotas) => {
-  const n = Math.max(toNumber(cantidad_cuotas), 1);
-  const pl = periodLengthFromTipo(tipo_credito);
-  const proporcional = 60 * (n / pl);
-  return Math.max(60, proporcional);
-};
-
-/** Detecta si el crédito es de modalidad "libre" */
-export const esLibre = (credito) => {
-  const mod = credito?.modalidad_credito || (credito?.get ? credito.get('modalidad_credito') : null);
-  return String(mod) === 'libre';
-};
-
-/* ===================== Helpers refinanciación (flags para UI) ===================== */
-export const anexarFlagsRefinanciacionPlain = (creditoPlain, hijoId = null) => {
-  if (!creditoPlain) return creditoPlain;
-
-  const estado = String(creditoPlain.estado || '').toLowerCase();
-  const origenId = creditoPlain.id_credito_origen ?? creditoPlain.credito_origen_id ?? null;
-
-  creditoPlain.credito_origen_id = origenId ?? null;
-  creditoPlain.es_credito_de_refinanciacion = Boolean(origenId);
-
-  creditoPlain.es_refinanciado = (estado === 'refinanciado');
-  creditoPlain.credito_refinanciado_hacia_id =
-    creditoPlain.es_refinanciado ? (hijoId ?? creditoPlain.credito_refinanciado_hacia_id ?? null) : null;
-
-  return creditoPlain;
-};
-
-// ───────────────── Compat DB: columna ciclo_libre puede no existir ─────────────────
-export const isMissingColumnError = (err, col = 'ciclo_libre') => {
-  const msg = String(
-    err?.original?.message ||
-    err?.parent?.message ||
-    err?.message ||
-    ''
-  );
-  const code = String(err?.original?.code || err?.parent?.code || '');
-  const lower = msg.toLowerCase();
-  const colLower = String(col).toLowerCase();
-
-  // Postgres undefined_column = 42703
-  const missing =
-    code === '42703' ||
-    /column .* does not exist/i.test(msg) ||
-    /no existe la columna/i.test(msg);
-
-  return missing && lower.includes(colLower);
-};
-
-export const createReciboSafe = async (payload, options = {}) => {
+/* ===================== PDF: Ficha del Crédito ===================== */
+export const imprimirFichaCredito = async (req, res) => {
   try {
-    return await Recibo.create(payload, options);
-  } catch (e) {
-    if (payload && Object.prototype.hasOwnProperty.call(payload, 'ciclo_libre') && isMissingColumnError(e, 'ciclo_libre')) {
-      const clone = { ...payload };
-      delete clone.ciclo_libre;
-      return await Recibo.create(clone, options);
+    const { id } = req.params || {};
+    const credito = await obtenerCreditoPorId(id);
+
+    if (!credito) {
+      return res.status(404).json({ success: false, message: 'Crédito no encontrado' });
     }
-    throw e;
+
+    let PDFDocument;
+    try {
+      ({ default: PDFDocument } = await import('pdfkit'));
+    } catch {
+      return res.status(500).json({
+        success: false,
+        message: 'Falta la dependencia pdfkit. Ejecutá: npm i pdfkit'
+      });
+    }
+
+    const c = credito.get ? credito.get({ plain: true }) : credito;
+    const cli = c.cliente || {};
+    const cuotas = Array.isArray(c.cuotas) ? c.cuotas : [];
+
+    const total_actual = fix2(
+      toNumber(c.total_actual != null ? c.total_actual : calcularTotalActualCreditoPlainLocal(c))
+    );
+
+    const fechaEmision = todayYMD();
+
+    // ✅ Para libre: fechas de ciclos (si existen)
+    const ciclosLibre = esLibre(c) ? obtenerFechasCiclosLibre(c) : null;
+
+    // ✅ Para no-libre: primer/último vencimiento desde cuotas (ignorando ficticio)
+    const vtosValidos = cuotas
+      .map((ct) => ct.fecha_vencimiento)
+      .filter((f) => f && f !== LIBRE_VTO_FICTICIO)
+      .map((f) => ymd(f))
+      .sort();
+
+    let primerVto =
+      vtosValidos[0] || (c.fecha_compromiso_pago ? ymd(c.fecha_compromiso_pago) : '-');
+
+    let ultimoVto = vtosValidos.length
+      ? vtosValidos[vtosValidos.length - 1]
+      : (c.fecha_compromiso_pago ? ymd(c.fecha_compromiso_pago) : '-');
+
+    if (ciclosLibre) {
+      primerVto = ciclosLibre.vencimiento_ciclo_1 || primerVto;
+      ultimoVto = ciclosLibre.vencimiento_ciclo_3 || ultimoVto;
+    }
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="ficha-credito-${c.id}.pdf"`);
+    res.setHeader('Cache-Control', 'no-store');
+
+    const doc = new PDFDocument({ size: 'A4', margin: 36 });
+
+    doc.on('error', (err) => {
+      console.error('[PDFKit][imprimirFichaCredito] Error de stream:', err?.message || err);
+      try { res.end(); } catch (_) {}
+    });
+
+    doc.pipe(res);
+
+    doc.fontSize(16).text('Ficha de Crédito', { align: 'center' });
+    doc.moveDown(0.3);
+    doc.fontSize(9).fillColor('#555').text(`Emitido: ${fechaEmision}`, { align: 'center' });
+    doc.moveDown(1);
+    doc.fillColor('#000');
+
+    doc.fontSize(12).text('Cliente', { underline: true });
+    doc.moveDown(0.3);
+    doc.fontSize(10)
+      .text(`Nombre: ${[cli.nombre, cli.apellido].filter(Boolean).join(' ') || '-'}`)
+      .text(`DNI: ${cli.dni || '-'}`)
+      .text(`Teléfono(s): ${[cli.telefono_1, cli.telefono_2, cli.telefono].filter(Boolean).join(' / ') || '-'}`)
+      .text(`Dirección: ${[cli.direccion_1, cli.direccion_2, cli.direccion].filter(Boolean).join(' | ') || '-'}`);
+    doc.moveDown(0.8);
+
+    doc.fontSize(12).text('Crédito', { underline: true });
+    doc.moveDown(0.3);
+    doc.fontSize(10)
+      .text(`ID: ${c.id}`)
+      .text(`Modalidad: ${labelModalidad(c.modalidad_credito)}`)
+      .text(`Tipo: ${String(c.tipo_credito || '').toUpperCase()}`)
+      .text(`Cuotas: ${c.cantidad_cuotas ?? '-'}`)
+      .text(`Estado: ${String(c.estado || '').toUpperCase()}`)
+      .text(`Fecha solicitud: ${c.fecha_solicitud || '-'}`)
+      .text(`Fecha acreditación: ${c.fecha_acreditacion || '-'}`);
+
+    if (ciclosLibre) {
+      doc
+        .text(`Vto 1er ciclo: ${ciclosLibre.vencimiento_ciclo_1 || '-'}`)
+        .text(`Vto 2° ciclo: ${ciclosLibre.vencimiento_ciclo_2 || '-'}`)
+        .text(`Vto 3er ciclo: ${ciclosLibre.vencimiento_ciclo_3 || '-'}`);
+    } else {
+      doc
+        .text(`Fecha 1er vencimiento: ${primerVto}`)
+        .text(`Fecha fin de crédito: ${ultimoVto}`);
+    }
+
+    doc.text(`Cobrador asignado: ${c.cobradorCredito?.nombre_completo || '-'}`);
+    doc.moveDown(0.3);
+
+    doc.fontSize(11).text(`Saldo actual declarado: ${fmtARS(c.saldo_actual)}`);
+    doc.fontSize(12).text(`TOTAL ACTUAL: ${fmtARS(total_actual)}`);
+    doc.moveDown(1);
+
+    doc.fontSize(12).text('Detalle de cuotas', { underline: true });
+    doc.moveDown(0.4);
+    doc.fontSize(9);
+
+    const headers = ['#', 'Vencimiento', 'Importe', 'Pagado', 'Desc.', 'Mora', 'Saldo', 'Estado'];
+    const colWidths = [25, 85, 70, 70, 55, 55, 70, 70];
+
+    let x = doc.x, y = doc.y;
+    headers.forEach((h, i) => {
+      doc.text(h, x, y, { width: colWidths[i], align: i <= 1 ? 'left' : 'right' });
+      x += colWidths[i];
+    });
+
+    doc.moveDown(0.5);
+    doc.moveTo(36, doc.y).lineTo(559, doc.y).strokeColor('#ddd').stroke();
+    doc.strokeColor('#000');
+
+    let totalPrincipalPend = 0;
+    let totalMora = 0;
+
+    cuotas.forEach((ct) => {
+      const principalPend = Math.max(
+        fix2(toNumber(ct.importe_cuota) - toNumber(ct.descuento_cuota) - toNumber(ct.monto_pagado_acumulado)),
+        0
+      );
+      const mora = fix2(toNumber(ct.intereses_vencidos_acumulados));
+
+      totalPrincipalPend = fix2(totalPrincipalPend + principalPend);
+      totalMora = fix2(totalMora + mora);
+
+      const vto =
+        ct.fecha_vencimiento === LIBRE_VTO_FICTICIO
+          ? '—'
+          : (ct.fecha_vencimiento ? ymd(ct.fecha_vencimiento) : '-');
+
+      const saldoCuota = fix2(principalPend + mora);
+
+      const row = [
+        ct.numero_cuota,
+        vto,
+        fmtARS(ct.importe_cuota),
+        fmtARS(ct.monto_pagado_acumulado),
+        fmtARS(ct.descuento_cuota),
+        fmtARS(mora),
+        fmtARS(saldoCuota),
+        String(ct.estado || '').toUpperCase()
+      ];
+
+      let cx = 36;
+      row.forEach((cell, i) => {
+        doc.text(cell, cx, doc.y + 2, { width: colWidths[i], align: i <= 1 ? 'left' : 'right' });
+        cx += colWidths[i];
+      });
+
+      doc.moveDown(0.6);
+    });
+
+    doc.moveDown(0.2);
+    doc.moveTo(36, doc.y).lineTo(559, doc.y).strokeColor('#ddd').stroke();
+    doc.strokeColor('#000');
+    doc.moveDown(0.4);
+
+    const labelX = 36 + colWidths.slice(0, 5).reduce((a, b) => a + b, 0);
+    const valueX = 36 + colWidths.slice(0, 6).reduce((a, b) => a + b, 0);
+
+    doc.fontSize(10);
+    doc.text('Tot. Mora:', labelX, doc.y, { width: colWidths[5], align: 'right' });
+    doc.text(fmtARS(totalMora), valueX, doc.y, { width: colWidths[6], align: 'right' });
+
+    doc.moveDown(0.2);
+    doc.text('Tot. Principal pendiente:', labelX, doc.y, { width: colWidths[5], align: 'right' });
+    doc.text(fmtARS(totalPrincipalPend), valueX, doc.y, { width: colWidths[6], align: 'right' });
+
+    doc.moveDown(1);
+    doc.fontSize(9)
+      .fillColor('#666')
+      .text(
+        'Nota: Esta ficha es informativa. Los importes pueden variar según pagos registrados y recálculos de mora.',
+        { align: 'left' }
+      );
+
+    doc.end();
+  } catch (error) {
+    console.error('[imprimirFichaCredito]', error);
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, message: 'Error al generar la ficha del crédito' });
+    } else {
+      try { res.end(); } catch (_) {}
+    }
   }
-};
-
-/* ===================== Helpers internos Caja ===================== */
-
-export const registrarEgresoDesembolsoCredito = async ({
-  creditoId,
-  clienteNombre,
-  fecha_acreditacion,
-  monto,
-  usuario_id = null
-}, { t = null } = {}) => {
-  if (!monto || toNumber(monto) <= 0) return;
-
-  const fecha = fecha_acreditacion || todayYMD();
-  const hora = nowTime();
-
-  await CajaMovimiento.create({
-    fecha,
-    hora,
-    tipo: 'egreso',
-    monto: fix2(monto),
-    forma_pago_id: null,
-    concepto: `Desembolso crédito #${creditoId} - ${clienteNombre || 'Cliente'}`.slice(0, 255),
-    referencia_tipo: 'credito',
-    referencia_id: creditoId,
-    usuario_id: usuario_id ?? null
-  }, t ? { transaction: t } : undefined);
-};
-
-export const registrarIngresoDesdeReciboEnTx = async ({
-  t,
-  recibo,
-  forma_pago_id,
-  usuario_id = null
-}) => {
-  if (!recibo) return;
-  const fecha = recibo.fecha || todayYMD();
-  const hora = recibo.hora || nowTime();
-  await CajaMovimiento.create({
-    fecha,
-    hora,
-    tipo: 'ingreso',
-    monto: fix2(recibo.monto_pagado || 0),
-    forma_pago_id: forma_pago_id ?? null,
-    concepto: `Cobro recibo #${recibo.numero_recibo ?? ''} - ${recibo.cliente_nombre || 'Cliente'}`.slice(0, 255),
-    referencia_tipo: 'recibo',
-    referencia_id: recibo.numero_recibo ?? null,
-    usuario_id: usuario_id ?? null
-  }, { transaction: t });
 };
