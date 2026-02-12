@@ -73,11 +73,11 @@ const COLORS = {
 };
 
 const safeSetColor = (doc, hex) => {
-  try { doc.fillColor(hex); } catch (_) {}
+  try { doc.fillColor(hex); } catch (_) { }
 };
 
 const safeStrokeColor = (doc, hex) => {
-  try { doc.strokeColor(hex); } catch (_) {}
+  try { doc.strokeColor(hex); } catch (_) { }
 };
 
 const drawHR = (doc, x1, x2, y) => {
@@ -190,7 +190,7 @@ export const imprimirFichaCredito = async (req, res) => {
 
     doc.on('error', (err) => {
       console.error('[PDFKit][imprimirFichaCredito] Error de stream:', err?.message || err);
-      try { res.end(); } catch (_) {}
+      try { res.end(); } catch (_) { }
     });
 
     doc.pipe(res);
@@ -394,36 +394,55 @@ export const imprimirFichaCredito = async (req, res) => {
 
     // Totales debajo de tabla
     doc.moveDown(0.6);
-    ensureSpace(doc, 50);
+    ensureSpace(doc, 64);
 
     const totalsY = doc.y;
+    const boxH = 54;
+
     safeStrokeColor(doc, COLORS.line);
-    doc.rect(left, totalsY, right - left, 42).stroke();
+    doc.rect(left, totalsY, right - left, boxH).stroke();
     safeStrokeColor(doc, COLORS.text);
 
+    // Título
     doc.font('Helvetica-Bold').fontSize(10);
     safeSetColor(doc, COLORS.text);
-    doc.text('Totales', left + 10, totalsY + 12);
+    doc.text('Totales', left + 10, totalsY + 10);
 
+    // Columna derecha (etiquetas + valores)
     doc.font('Helvetica').fontSize(10);
+
+    const labelW = 70;
+    const valueW = 160;
+    const rightPad = 12;
+
+    const labelX = right - rightPad - (valueW + labelW);
+    const valueX = right - rightPad - valueW;
+
     safeSetColor(doc, COLORS.muted);
-    doc.text('Mora:', right - 260, totalsY + 10, { width: 70, align: 'right' });
+    doc.text('Mora:', labelX, totalsY + 10, { width: labelW, align: 'right' });
     safeSetColor(doc, COLORS.text);
-    doc.text(fmtARS(totalMora), right - 180, totalsY + 10, { width: 160, align: 'right' });
+    doc.text(fmtARS(totalMora), valueX, totalsY + 10, { width: valueW, align: 'right' });
 
     safeSetColor(doc, COLORS.muted);
-    doc.text('Principal pendiente:', right - 260, totalsY + 24, { width: 70, align: 'right' });
+    doc.text('Principal pendiente:', labelX, totalsY + 26, { width: labelW, align: 'right' });
     safeSetColor(doc, COLORS.text);
-    doc.text(fmtARS(totalPrincipalPend), right - 180, totalsY + 24, { width: 160, align: 'right' });
+    doc.text(fmtARS(totalPrincipalPend), valueX, totalsY + 26, { width: valueW, align: 'right' });
 
-    doc.moveDown(1.4);
+    // Nota (a la izquierda, con ancho acotado para no invadir la columna derecha)
+    const noteX = left + 10;
+    const noteW = (labelX - 12) - noteX; // deja un gap antes de la columna derecha
 
-    // Nota final
     safeSetColor(doc, COLORS.muted);
-    doc.fontSize(9).text(
+    doc.font('Helvetica').fontSize(8);
+    doc.text(
       'Nota: Esta ficha es informativa. Los importes pueden variar según pagos registrados y recálculos de mora.',
-      { align: 'left' }
+      noteX,
+      totalsY + 30,
+      { width: Math.max(noteW, 120), align: 'left' }
     );
+
+    doc.y = totalsY + boxH + 10;
+
 
     doc.end();
   } catch (error) {
@@ -431,7 +450,7 @@ export const imprimirFichaCredito = async (req, res) => {
     if (!res.headersSent) {
       res.status(500).json({ success: false, message: 'Error al generar la ficha del crédito' });
     } else {
-      try { res.end(); } catch (_) {}
+      try { res.end(); } catch (_) { }
     }
   }
 };
