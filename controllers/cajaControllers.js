@@ -5,6 +5,9 @@ import * as XLSX from 'xlsx';
 import CajaMovimiento from '../models/CajaMovimiento.js';
 import FormaPago from '../models/FormaPago.js';
 
+// ✅ NUEVO: para observaciones del pago
+import Pago from '../models/Pago.js';
+
 // Para exportación (4 hojas)
 import Gasto from '../models/Gasto.js';
 import Compra from '../models/Compra.js';
@@ -81,6 +84,44 @@ const ensureRange = (desde, hasta) => {
         if (a > b) return [hasta, desde];
     }
     return [desde, hasta];
+};
+
+/** Extrae observaciones desde un objeto "Recibo" sin asumir un nombre exacto de columna */
+const pickObsFromRecibo = (r) => {
+    if (!r) return '';
+    const cand = [
+        r.observaciones,
+        r.observacion,
+        r.nota,
+        r.detalle,
+        r.comentarios,
+        r.comentario
+    ].find(v => typeof v === 'string' && v.trim() !== '');
+    return cand ? String(cand).trim() : '';
+};
+
+/** PK real de Recibo (en algunas DBs es numero_recibo y NO id) */
+const RECIBO_PK = (() => {
+    const attr =
+        Recibo?.primaryKeyAttribute ||
+        (Array.isArray(Recibo?.primaryKeyAttributes) && Recibo.primaryKeyAttributes[0]) ||
+        null;
+    return attr || 'id';
+})();
+
+/** Lee "total" de un recibo sin asumir nombre exacto */
+const pickTotalFromRecibo = (r) => {
+    if (!r) return 0;
+    // Prioridad típica: total -> monto_total -> total_pagado -> total_cobrado -> monto_pagado -> monto
+    const cand = [
+        r.total,
+        r.monto_total,
+        r.total_pagado,
+        r.total_cobrado,
+        r.monto_pagado,
+        r.monto
+    ].find(v => v !== null && v !== undefined && String(v).trim?.() !== '');
+    return fix2(sanitizeNumber(cand));
 };
 
 /* ───────────────── CRUD ───────────────── */
@@ -196,10 +237,10 @@ export const obtenerMovimientos = async (req, res) => {
                 }
             } else if (typeof referencia_tipo === 'string') {
                 const raw = referencia_tipo.trim().toLowerCase();
-                if (raw === 'null' || 'none') {
+                if (raw === 'null' || raw === 'none') {
                     where.referencia_tipo = { [Op.is]: null };
                 } else {
-                    const vals = raw.split(',').map(s => s.trim()).filter(Boolean);
+                    const vals = raw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
                     if (vals.length) where.referencia_tipo = { [Op.in]: vals };
                 }
             }
@@ -233,11 +274,61 @@ export const obtenerMovimientos = async (req, res) => {
             offset
         });
 
-        // Normalizamos montos a number ya acá por seguridad
+        // Armamos plain + monto normalizado
         const data = rows.map(r => ({
             ...r.get({ plain: true }),
             monto: fix2(r.monto)
         }));
+
+        // ✅ Enriquecemos observaciones para movimientos "recibo":
+        // PRIORIDAD:
+        // 1) Pago.observacion (porque es donde hoy guardás la observación del pago)
+        // 2) Fallback: cualquier campo tipo observacion/nota/etc en Recibo (por compat)
+        const reciboRefs = [...new Set(
+            data
+                .filter(m => String(m.referencia_tipo || '').toLowerCase() === 'recibo' && m.referencia_id != null)
+                .map(m => m.referencia_id)
+        )];
+
+        if (reciboRefs.length) {
+            // 1) Traemos Recibos mínimos para mapear recibo -> pago_id (+ fallback obs)
+            const recibos = await Recibo.findAll({
+                where: { [RECIBO_PK]: { [Op.in]: reciboRefs } },
+                attributes: [RECIBO_PK, 'pago_id', 'concepto'],
+                raw: true
+            });
+
+            const mapReciboToPagoId = new Map(recibos.map(r => [r[RECIBO_PK], r.pago_id]));
+            const mapReciboObsFallback = new Map(recibos.map(r => [r[RECIBO_PK], pickObsFromRecibo(r)]));
+
+            // 2) Traemos Pagos para leer "observacion"
+            const pagoIds = [...new Set(
+                recibos.map(r => Number(r.pago_id)).filter(Number.isFinite)
+            )];
+
+            let mapPagoObs = new Map();
+            if (pagoIds.length) {
+                const pagos = await Pago.findAll({
+                    where: { id: { [Op.in]: pagoIds } },
+                    attributes: ['id', 'observacion'],
+                    raw: true
+                });
+                mapPagoObs = new Map(pagos.map(p => [p.id, (p.observacion || '').trim()]));
+            }
+
+            for (const m of data) {
+                if (String(m.referencia_tipo || '').toLowerCase() === 'recibo') {
+                    const pagoId = mapReciboToPagoId.get(m.referencia_id);
+                    const obsPago = pagoId != null ? (mapPagoObs.get(Number(pagoId)) || '') : '';
+                    const obsRecibo = mapReciboObsFallback.get(m.referencia_id) || '';
+                    m.observaciones = obsPago || obsRecibo || '';
+                } else {
+                    m.observaciones = '';
+                }
+            }
+        } else {
+            for (const m of data) m.observaciones = '';
+        }
 
         res.json({
             success: true,
@@ -492,10 +583,16 @@ export const registrarIngresoDesdeRecibo = async ({
     let montoNum = fix2(sanitizeNumber(monto));
 
     // 🔧 Blindaje: si viene referencia a Recibo, usamos su total cuando detectamos factor 100.
-    if (referencia_id) {
-        const recibo = await Recibo.findByPk(referencia_id, { attributes: ['id', 'total'], transaction, raw: true });
+    if (referencia_id != null) {
+        const recibo = await Recibo.findOne({
+            where: { [RECIBO_PK]: referencia_id },
+            attributes: [RECIBO_PK, 'total', 'monto_total', 'total_pagado', 'total_cobrado', 'monto_pagado', 'monto'],
+            transaction,
+            raw: true
+        });
+
         if (recibo) {
-            const totalRecibo = fix2(sanitizeNumber(recibo.total));
+            const totalRecibo = pickTotalFromRecibo(recibo);
             if (totalRecibo > 0 && montoNum > 0 && Math.abs(totalRecibo - montoNum) > 0.009) {
                 // Si totalRecibo ≈ montoNum*100  => monto venía dividido por 100
                 // Si totalRecibo*100 ≈ montoNum  => monto venía multiplicado por 100
@@ -517,9 +614,10 @@ export const registrarIngresoDesdeRecibo = async ({
     if (!(montoNum > 0)) {
         throw new Error('monto debe ser > 0 para registrar ingreso');
     }
+
     const conceptoFinal = String(concepto || (referencia_id ? `Cobro recibo #${referencia_id}` : 'Ingreso')).slice(0, 255);
 
-    if (referencia_id) {
+    if (referencia_id != null) {
         const exists = await CajaMovimiento.findOne({
             where: {
                 tipo: 'ingreso',
@@ -930,17 +1028,23 @@ export const exportarExcel = async (req, res) => {
         const creditos = credIds.length ? await Credito.findAll({
             where: { id: { [Op.in]: credIds } },
             include: [{ model: Cliente, as: 'cliente', attributes: ['id', 'nombre', 'apellido'] }],
-            raw: true, nest: true
+            raw: true,
+            nest: true
         }) : [];
+
         const mapCreditoCliente = new Map(
-            creditos.map(c => [c.id, [c.cliente?.nombre, c.cliente?.apellido].filter(Boolean).join(' ')]));
+            creditos.map(c => [c.id, [c.cliente?.nombre, c.cliente?.apellido].filter(Boolean).join(' ')])
+        );
+
         const reciboIds = [...new Set(movsCredito
             .filter(m => m.referencia_tipo === 'recibo')
             .map(m => m.referencia_id)
             .filter(Boolean))];
 
+        // ⬇⬇⬇ IMPORTANTE: también traemos pago_id para leer Pago.observacion
         const recibos = reciboIds.length ? await Recibo.findAll({
-            where: { id: { [Op.in]: reciboIds } },
+            where: { [RECIBO_PK]: { [Op.in]: reciboIds } },
+            attributes: [RECIBO_PK, 'pago_id'],
             include: [{
                 model: Cuota, as: 'cuota',
                 include: [{
@@ -948,15 +1052,31 @@ export const exportarExcel = async (req, res) => {
                     include: [{ model: Cliente, as: 'cliente', attributes: ['id', 'nombre', 'apellido'] }]
                 }]
             }],
-            raw: true, nest: true
+            raw: true,
+            nest: true
         }) : [];
+
         const mapReciboCliente = new Map(
             recibos.map(r => {
                 const cli = r?.cuota?.credito?.cliente;
                 const nombre = [cli?.nombre, cli?.apellido].filter(Boolean).join(' ');
-                return [r.id, nombre];
+                return [r[RECIBO_PK], nombre];
             })
         );
+
+        // fallback (si algún recibo tuviera obs)
+        const mapReciboObsFallback = new Map(
+            recibos.map(r => [r[RECIBO_PK], pickObsFromRecibo(r)])
+        );
+
+        // Observaciones reales desde pagos.observacion
+        const pagoIds = [...new Set(recibos.map(r => Number(r.pago_id)).filter(Number.isFinite))];
+        const pagos = pagoIds.length ? await Pago.findAll({
+            where: { id: { [Op.in]: pagoIds } },
+            attributes: ['id', 'observacion'],
+            raw: true
+        }) : [];
+        const mapPagoObs = new Map(pagos.map(p => [p.id, (p.observacion || '').trim()]));
 
         const sheetCredito = movsCredito.map(m => {
             const tipoMov = m.referencia_tipo === 'credito' ? 'Acreditación' : 'Cobro';
@@ -964,6 +1084,16 @@ export const exportarExcel = async (req, res) => {
                 m.referencia_tipo === 'credito'
                     ? (mapCreditoCliente.get(m.referencia_id) || '')
                     : (mapReciboCliente.get(m.referencia_id) || '');
+
+            let observaciones = '';
+            if (m.referencia_tipo === 'recibo') {
+                const rec = recibos.find(r => r[RECIBO_PK] === m.referencia_id);
+                const pagoId = rec?.pago_id != null ? Number(rec.pago_id) : null;
+                const obsPago = pagoId != null ? (mapPagoObs.get(pagoId) || '') : '';
+                const obsRecibo = mapReciboObsFallback.get(m.referencia_id) || '';
+                observaciones = obsPago || obsRecibo || '';
+            }
+
             return {
                 'Fecha': m.fecha,
                 'Hora': m.hora || '',
@@ -973,6 +1103,7 @@ export const exportarExcel = async (req, res) => {
                 'Cliente': cliente,
                 'Forma de pago': nombreFP(m.forma_pago_id),
                 'Concepto': m.concepto || '',
+                'Observaciones': observaciones,
                 'Monto': Number(m.monto),
                 'CajaMovID': m.id
             };

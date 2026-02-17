@@ -193,8 +193,8 @@ const buildWhereMovimientos = (query = {}, { defaultLastDays = true } = {}) => {
         const tipos = Array.isArray(tipo)
             ? tipo.map((s) => String(s).trim().toLowerCase())
             : String(tipo)
-                  .split(',')
-                  .map((s) => s.trim().toLowerCase());
+                .split(',')
+                .map((s) => s.trim().toLowerCase());
         const validos = tipos.filter((t) => TIPOS_VALIDOS.has(t));
         if (validos.length) where.tipo = { [Op.in]: validos };
     }

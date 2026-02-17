@@ -83,7 +83,24 @@ const createCajaMovimientoSafe = async (payload, options = {}) => {
 };
 
 /* ───────── Caja: registrar ingreso desde un Recibo dentro de la misma TX ───────── */
-export const registrarIngresoDesdeReciboEnTx = async ({ t, recibo, forma_pago_id, usuario_id = null }) => {
+/**
+ * Registra el movimiento de caja asociado a un recibo.
+ * Soporta observación opcional (para visualizarla en movimientos de caja).
+ *
+ * @param {object} params
+ * @param {object} params.t - transaction Sequelize
+ * @param {object} params.recibo - recibo (plain u instancia sequelize)
+ * @param {number|null} params.forma_pago_id
+ * @param {number|null} params.usuario_id
+ * @param {string|null} params.observacion - observación del cobro (opcional)
+ */
+export const registrarIngresoDesdeReciboEnTx = async ({
+    t,
+    recibo,
+    forma_pago_id,
+    usuario_id = null,
+    observacion = null
+}) => {
     if (!recibo) return;
 
     // Normalizar recibo (por si llega como instancia Sequelize)
@@ -93,6 +110,16 @@ export const registrarIngresoDesdeReciboEnTx = async ({ t, recibo, forma_pago_id
     const horaNow = nowTime(new Date());
 
     const numeroRef = r?.numero_recibo ?? r?.id ?? null;
+
+    // ✅ Tomamos observación desde el parámetro, o desde el recibo si existiera.
+    const obs =
+        (observacion != null && String(observacion).trim() !== '')
+            ? String(observacion).trim()
+            : (r?.observacion != null && String(r.observacion).trim() !== '')
+                ? String(r.observacion).trim()
+                : (r?.pago_observacion != null && String(r.pago_observacion).trim() !== '')
+                    ? String(r.pago_observacion).trim()
+                    : null;
 
     const payload = {
         fecha: r?.fecha || nowYMD,
@@ -107,7 +134,10 @@ export const registrarIngresoDesdeReciboEnTx = async ({ t, recibo, forma_pago_id
         ).slice(0, 255),
         referencia_tipo: 'recibo',
         referencia_id: numeroRef,
-        usuario_id: usuario_id ?? null
+        usuario_id: usuario_id ?? null,
+
+        // ✅ NUEVO: observación visible en movimientos de caja (si la DB tiene la columna).
+        observacion: obs
     };
 
     await createCajaMovimientoSafe(payload, { transaction: t });

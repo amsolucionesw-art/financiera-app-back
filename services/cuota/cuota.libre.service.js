@@ -145,6 +145,41 @@ const appendCicloTagEnReciboPayload = (payload, ciclo) => {
 };
 
 /* =============================================================================
+   ✅ Descuentos: persistencia + efecto contable en resumen LIBRE
+
+   PROBLEMA REAL (tu caso):
+   - El FRONT manda descuento_mora / descuento_interes.
+   - El recibo se creaba con descuento_aplicado=0 y sin “pagar” el descuento a nivel
+     de campos usados por el resumen (mora_cobrada / interes_ciclo_cobrado).
+   - Entonces el resumen y la ficha quedaban como si no existiera el descuento.
+
+   SOLUCIÓN:
+   1) Persistimos SIEMPRE en recibo:
+      - descuento_aplicado (en $)
+      - descuento_sobre (mora/interes/total)
+      - descuento_porcentaje (cuando aplica 1 solo %, si son 2 => NULL para no mentir)
+   2) Para que la deuda pendiente baje (resumen/ficha), el descuento debe “contar” como
+      cancelación de mora/interés. Para eso:
+      - sumamos el descuento a mora_cobrada / interes_ciclo_cobrado (según corresponda)
+      - monto_pagado NO cambia (caja sigue correcta).
+   ============================================================================= */
+
+const buildDescuentoMeta = ({ pctMora, pctInteres }) => {
+    const m = fix2(toNumber(pctMora)) > 0;
+    const i = fix2(toNumber(pctInteres)) > 0;
+
+    const sobre = m && i ? 'total' : i ? 'interes' : 'mora';
+    // Si son 2 porcentajes distintos, NO hay un “% único” verdadero → guardamos NULL.
+    const porcentaje = (m && i)
+        ? null
+        : i
+            ? clamp(fix2(toNumber(pctInteres)), 0, 100)
+            : clamp(fix2(toNumber(pctMora)), 0, 100);
+
+    return { sobre, porcentaje };
+};
+
+/* =============================================================================
    Helpers LIBRE
    ============================================================================= */
 
@@ -300,9 +335,6 @@ export const whereRecibosLibrePorCicloCompat = async (credito, ciclo, cuotaIds =
     if (Number.isFinite(cicloNum)) {
         const tag = buildCicloTag(cicloNum);
 
-        // ✅ Endurecido: preferimos "(Ciclo N)" / "[ciclo_libre:N]".
-        // Mantenemos un fallback suave para "ciclo N" SOLO si viene pegado a paréntesis,
-        // evitando matchear por texto casual.
         const conceptoOr = [
             { concepto: { [Op.iLike]: `%${tag}%` } },
             { concepto: { [Op.iLike]: `%(Ciclo ${cicloNum})%` } },
@@ -318,15 +350,12 @@ export const whereRecibosLibrePorCicloCompat = async (credito, ciclo, cuotaIds =
         if (Array.isArray(cuotaIds) && cuotaIds.length > 0) {
             where.cuota_id = { [Op.in]: cuotaIds };
         } else {
-            // ⚠️ Si no nos pasan cuotaIds, el llamador debe resolverlos.
-            // Igual dejamos algo defensivo para no traer recibos "huérfanos".
             where.cuota_id = { [Op.ne]: null };
         }
 
         return where;
     }
 
-    // ⚠️ ciclo inválido → rango por fechas (último recurso)
     return whereRecibosLibrePorCiclo(credito, ciclo, cuotaIds);
 };
 
@@ -350,8 +379,6 @@ export const obtenerCuotaBaseLibre = async ({ credito_id, t = null }) => {
 };
 
 export const sumRecibosCampoPorCiclo = async ({ credito, ciclo, campo, cuotaIds = [], t = null }) => {
-    // ✅ FIX: si no nos pasan cuotaIds, los resolvemos por crédito para evitar
-    // mezclar otros créditos del mismo cliente.
     let cuotaIdsSafe = Array.isArray(cuotaIds) ? cuotaIds.filter(Boolean) : [];
     if ((!cuotaIdsSafe || cuotaIdsSafe.length === 0) && credito?.id) {
         cuotaIdsSafe = await obtenerCuotaIdsPorCredito({ credito_id: credito.id, t });
@@ -370,8 +397,6 @@ export const sumRecibosCampoPorCiclo = async ({ credito, ciclo, campo, cuotaIds 
         });
         return sumar(rows);
     } catch (e) {
-        // fallback extremo: si explota por “missing column” en algún entorno raro,
-        // usamos rango por fechas.
         if (isMissingColumnError?.(e)) {
             if (_cacheTieneCicloLibreCol === true) {
                 _cacheTieneCicloLibreCol = false;
@@ -539,7 +564,6 @@ const cicloLibreActualSegunReglaEnTx = async ({ credito, hoyYMD, t = null }) => 
     const cuotaIds = await obtenerCuotaIdsPorCredito({ credito_id: credito.id, t });
     const cuotaBase = await obtenerCuotaBaseLibre({ credito_id: credito.id, t });
 
-    // buscamos el primer ciclo "abierto" (interés pendiente o mora pendiente)
     for (let c = 1; c <= cicloMax; c++) {
         const det = await deudaLibrePorCiclo({
             credito,
@@ -554,12 +578,10 @@ const cicloLibreActualSegunReglaEnTx = async ({ credito, hoyYMD, t = null }) => 
         if (abierto) return { ciclo_actual: c, ciclo_max: cicloMax, cuotaIds, cuotaBase };
     }
 
-    // si todos hasta cicloMax están cerrados, el ciclo actual queda en cicloMax
     return { ciclo_actual: cicloMax, ciclo_max: cicloMax, cuotaIds, cuotaBase };
 };
 
 export const deudaLibreTotalHoy = async ({ credito, hoyYMD, t = null }) => {
-    // ciclo según regla (gatillado por cierre real de ciclos)
     const { ciclo_actual, cuotaIds, cuotaBase } = await cicloLibreActualSegunReglaEnTx({
         credito,
         hoyYMD,
@@ -569,7 +591,6 @@ export const deudaLibreTotalHoy = async ({ credito, hoyYMD, t = null }) => {
     let interes_pendiente_total = 0;
     let mora_pendiente_total = 0;
 
-    // ✅ Por regla, solo existe deuda de interés/mora hasta el ciclo "actual" (el abierto más viejo)
     for (let c = 1; c <= ciclo_actual; c++) {
         const det = await deudaLibrePorCiclo({
             credito,
@@ -591,14 +612,12 @@ export const deudaLibreTotalHoy = async ({ credito, hoyYMD, t = null }) => {
 };
 
 export const cicloLibreMasViejoAbierto = async ({ credito, hoyYMD, t = null }) => {
-    // ✅ usa regla del cliente: el primero abierto determina el "ciclo actual"
     const { ciclo_actual, ciclo_max, cuotaIds, cuotaBase } = await cicloLibreActualSegunReglaEnTx({
         credito,
         hoyYMD,
         t
     });
 
-    // devolvemos el más viejo abierto hasta ciclo_max (por si hay inconsistencias históricas)
     for (let c = 1; c <= ciclo_max; c++) {
         const detalle = await deudaLibrePorCiclo({
             credito,
@@ -631,9 +650,6 @@ export const calcularInteresPendienteLibre = async ({ credito, hoyYMD, t = null 
 };
 
 export const calcularMoraPendienteLibreExacto = async ({ credito, hoyYMD, t = null, ciclo = null, cuotaIds = null }) => {
-    // ⚠️ IMPORTANTÍSIMO:
-    // Para mora exacta de un ciclo particular, NO dependemos de "ciclo actual según regla".
-    // La mora se computa por vencimiento fijo del ciclo solicitado (o por los ciclos hasta el max por fecha).
     const cicloMax = cicloLibreMaxPorFecha(credito, hoyYMD);
 
     const cuotasIdsLocal = Array.isArray(cuotaIds)
@@ -815,7 +831,6 @@ export const obtenerResumenLibrePorCredito = async (credito_id, hoyDate = new Da
     const total_liquidacion_hoy = fix2(saldo_capital + interes_pendiente_total + mora_pendiente_total);
     const total_ciclo_hoy = fix2(saldo_capital + interes_pendiente_hoy + mora_pendiente_hoy);
 
-    // Vencimientos (auditoría)
     const vto1 = baseVencimientoCiclo1(credito);
     const vencimiento_ciclo_1 = vto1;
     const vencimiento_ciclo_2 = vto1 ? addMonthsYMD(vto1, 1) : null;
@@ -824,8 +839,6 @@ export const obtenerResumenLibrePorCredito = async (credito_id, hoyDate = new Da
     const interes_ciclo_hoy = interes_pendiente_hoy;
     const mora_ciclo_hoy = mora_pendiente_hoy;
 
-    // ✅ Contrato consistente con credito.core:
-    // total_actual = liquidación al día (acumulado 1..ciclo_actual según REGLA)
     const total_actual = total_liquidacion_hoy;
 
     return {
@@ -871,12 +884,10 @@ const buildCreditoUIConResumen = ({ credito, creditoFresh, resumen_libre }) => {
     const saldoActual = fix2(creditoFresh?.saldo_actual ?? credito?.saldo_actual ?? 0);
     const estado = creditoFresh?.estado ?? credito?.estado;
 
-    // total_actual = liquidación hoy (acumulado)
     const total_actual = resumen_libre
         ? fix2(toNumber(resumen_libre?.total_liquidacion_hoy ?? resumen_libre?.total_actual ?? 0))
         : undefined;
 
-    // saldo_total_actual = total del ciclo actual (compat UI)
     const saldo_total_actual = resumen_libre
         ? fix2(toNumber(resumen_libre?.total_ciclo_hoy ?? 0))
         : undefined;
@@ -929,6 +940,51 @@ const reapplyLibreStateEnTx = async ({
     }
 };
 
+/* =============================================================================
+   ✅ Descuentos (nueva regla cliente):
+   - Admin (rol 1): sólo puede bonificar MORA (igual que antes)
+   - Superadmin (rol 0): puede bonificar MORA e INTERÉS en pagos parciales
+   - Implementación en % (0..100) para mantener compat con descuento_mora existente
+   ============================================================================= */
+
+const normScope = (s) => String(s || '').trim().toLowerCase();
+
+const getPctDescuentoMora = ({ rol_id, descuento, descuento_scope, descuento_mora }) => {
+    const isAdmin = Number(rol_id) === 1;
+    const isSuper = Number(rol_id) === 0;
+
+    const scope = normScope(descuento_scope);
+
+    if (isAdmin) {
+        const raw = descuento_mora != null ? toNumber(descuento_mora) : toNumber(descuento);
+        return clamp(fix2(raw), 0, 100);
+    }
+
+    if (isSuper && (scope === 'mora' || scope === 'total')) {
+        const raw = descuento_mora != null ? toNumber(descuento_mora) : toNumber(descuento);
+        return clamp(fix2(raw), 0, 100);
+    }
+
+    return 0;
+};
+
+const getPctDescuentoInteres = ({ rol_id, descuento, descuento_scope, descuento_interes }) => {
+    const isSuper = Number(rol_id) === 0;
+    if (!isSuper) return 0;
+
+    const scope = normScope(descuento_scope);
+
+    if (descuento_interes != null && String(descuento_interes).trim() !== '') {
+        return clamp(fix2(toNumber(descuento_interes)), 0, 100);
+    }
+
+    if (scope === 'interes' || scope === 'total') {
+        return clamp(fix2(toNumber(descuento)), 0, 100);
+    }
+
+    return 0;
+};
+
 export const pagarCuotaLibreEnTx = async ({
     t,
     cuota,
@@ -940,13 +996,13 @@ export const pagarCuotaLibreEnTx = async ({
     descuento = 0,
     descuento_scope = null,
     descuento_mora = null,
+    descuento_interes = null, // ✅ NUEVO
     observacion = null,
     usuario_id = null,
     rol_id = null,
     monto_pagado = null,
     ciclo_libre = null
 }) => {
-    // ✅ Blindajes backend
     assertNoPagoSiRefinanciado({ credito, cuota });
     assertNoPagoSiAnulado({ credito });
 
@@ -959,33 +1015,21 @@ export const pagarCuotaLibreEnTx = async ({
     const moraPendienteTotalAntes = fix2(toNumber(resumen?.mora_pendiente_total ?? 0));
     const cicloActual = clamp(toNumber(resumen?.ciclo_actual ?? 1), 1, LIBRE_MAX_CICLOS);
 
-    const isAdmin = Number(rol_id) === 1;
-    const scope = isAdmin ? 'mora' : (String(descuento_scope || '').toLowerCase() || null);
-
-    const pctRaw =
-        scope === 'mora' || scope === 'total'
-            ? descuento_mora != null
-                ? toNumber(descuento_mora)
-                : toNumber(descuento)
-            : 0;
-
-    const pct = clamp(fix2(pctRaw), 0, 100);
+    const pctMora = getPctDescuentoMora({ rol_id, descuento, descuento_scope, descuento_mora });
+    const pctInteres = getPctDescuentoInteres({ rol_id, descuento, descuento_scope, descuento_interes });
 
     const montoIngresado =
         monto_pagado != null && String(monto_pagado).trim() !== '' ? fix2(toNumber(monto_pagado)) : null;
-
-    // ─────────────────────────────────────────────────────────────
-    // ✅ LIQUIDACIÓN TOTAL
-    // ─────────────────────────────────────────────────────────────
 
     const cuotaBase = await obtenerCuotaBaseLibre({ credito_id: credito.id, t });
     const cuotaIds = await obtenerCuotaIdsPorCredito({ credito_id: credito.id, t });
 
     let interesTotal = 0;
     let moraTotal = 0;
-    let moraBonificadaTotal = 0;
 
-    // ✅ Por regla, el total de interés/mora viene ya acotado por resumen/cicloActual
+    let moraBonificadaTotal = 0;
+    let interesBonificadoTotal = 0;
+
     for (let c = 1; c <= cicloActual; c++) {
         const det = await deudaLibrePorCiclo({
             credito,
@@ -999,12 +1043,17 @@ export const pagarCuotaLibreEnTx = async ({
         const interesPend = fix2(det?.interes_pendiente ?? 0);
         const moraPend = fix2(det?.mora_pendiente ?? 0);
 
-        const bonif = fix2(moraPend * (pct / 100));
-        const moraNeta = fix2(Math.max(moraPend - bonif, 0));
+        const bonifM = fix2(moraPend * (pctMora / 100));
+        const bonifI = fix2(interesPend * (pctInteres / 100));
 
-        interesTotal = fix2(interesTotal + interesPend);
+        const moraNeta = fix2(Math.max(moraPend - bonifM, 0));
+        const interesNeto = fix2(Math.max(interesPend - bonifI, 0));
+
+        interesTotal = fix2(interesTotal + interesNeto);
         moraTotal = fix2(moraTotal + moraNeta);
-        moraBonificadaTotal = fix2(moraBonificadaTotal + bonif);
+
+        moraBonificadaTotal = fix2(moraBonificadaTotal + bonifM);
+        interesBonificadaTotal = fix2(interesBonificadaTotal + bonifI);
     }
 
     const totalLiquidacionNeta = fix2(saldoCapitalAntes + interesTotal + moraTotal);
@@ -1028,11 +1077,13 @@ export const pagarCuotaLibreEnTx = async ({
         const tieneCicloLibre = await safeTieneCicloLibreCol(t);
 
         const capital = fix2(saldoCapitalAntes);
-        const interesCobrar = fix2(interesTotal);
-        const moraCobrar = fix2(moraTotal);
-        const moraBonificada = fix2(moraBonificadaTotal);
+        const interesCobrarNeto = fix2(interesTotal);
+        const moraCobrarNeto = fix2(moraTotal);
 
-        const totalAplicado = fix2(capital + interesCobrar + moraCobrar);
+        const moraBonificada = fix2(moraBonificadaTotal);
+        const interesBonificada = fix2(interesBonificadaTotal);
+
+        const totalAplicado = fix2(capital + interesCobrarNeto + moraCobrarNeto);
 
         if (!(totalAplicado > 0)) {
             const err = new Error('No hay deuda para liquidar en este crédito LIBRE.');
@@ -1052,7 +1103,6 @@ export const pagarCuotaLibreEnTx = async ({
             { transaction: t }
         );
 
-        // Se setea saldo/estado; el interes_acumulado (historial) se recalcula luego del recibo
         let creditoPatch = {
             saldo_actual: 0,
             estado: 'pagado'
@@ -1072,6 +1122,19 @@ export const pagarCuotaLibreEnTx = async ({
         const totalAntes = fix2(totalLiquidacionNeta);
         const totalDespues = 0;
 
+        const descuentoTotal = fix2(moraBonificada + interesBonificada);
+        const { sobre: descuentoSobre, porcentaje: descuentoPorcentaje } = buildDescuentoMeta({ pctMora, pctInteres });
+
+        const conceptoDesc =
+            descuentoTotal > 0
+                ? ` (Desc: mora ${fix2(moraBonificada)} / interés ${fix2(interesBonificada)})`
+                : '';
+
+        // ✅ CLAVE: para que el RESUMEN/FICHA descuente la deuda,
+        // contamos el descuento como “cancelación” de mora/interés en los campos usados por cálculos.
+        const moraCobradaSettle = fix2(moraCobrarNeto + moraBonificada);
+        const interesCicloCobradoSettle = fix2(interesCobrarNeto + interesBonificada);
+
         const reciboBase = {
             credito,
             cuota,
@@ -1081,17 +1144,20 @@ export const pagarCuotaLibreEnTx = async ({
             medioPagoNombre: medioPago?.nombre ?? 'N/D',
             importeOriginalCuota: fix2(toNumber(cuota.importe_cuota || saldoCapitalAntes)),
 
-            descuentoAplicado: moraBonificada,
+            // ✅ NUEVO: observaciones -> recibo
+            observaciones: observacion,
 
-            moraCobrada: moraCobrar,
+            descuentoAplicado: descuentoTotal,
+
+            moraCobrada: moraCobradaSettle,
             principalPagado: capital,
-            interesCicloCobrado: interesCobrar,
+            interesCicloCobrado: interesCicloCobradoSettle,
 
             saldoCuotaAnterior: totalAntes,
             saldoCuotaActual: totalDespues,
             saldoMoraRestante: 0,
 
-            conceptoExtra: `Liquidación crédito LIBRE #${credito.id}`,
+            conceptoExtra: `Liquidación crédito LIBRE #${credito.id}${conceptoDesc}`,
 
             saldoPrincipalAntes: capital,
             saldoPrincipalDespues: 0,
@@ -1101,7 +1167,11 @@ export const pagarCuotaLibreEnTx = async ({
 
         let reciboPayload = armarDatosRecibo(reciboBase);
 
-        // ✅ SIEMPRE tag en concepto
+        // ✅ Persistencia REAL en columnas de DB (evita que quede 0 como tu recibo #50)
+        reciboPayload.descuento_aplicado = descuentoTotal;
+        reciboPayload.descuento_sobre = descuentoTotal > 0 ? descuentoSobre : null;
+        reciboPayload.descuento_porcentaje = descuentoTotal > 0 ? descuentoPorcentaje : null;
+
         reciboPayload = appendCicloTagEnReciboPayload(reciboPayload, cicloActual);
 
         if (tieneCicloLibre) {
@@ -1119,7 +1189,6 @@ export const pagarCuotaLibreEnTx = async ({
             usuario_id: usuario_id ?? null
         });
 
-        // ✅ Recalcular historial de interés cobrado y persistirlo en Credito.interes_acumulado
         const interesHist = await recalcularInteresAcumuladoHistoricoLibreEnTx({
             creditoId: credito.id,
             cuotaIds,
@@ -1129,16 +1198,22 @@ export const pagarCuotaLibreEnTx = async ({
         creditoPatch = { ...creditoPatch, interes_acumulado: interesHist };
         await credito.update({ interes_acumulado: interesHist }, { transaction: t });
 
-        // Compat: ejecuta side-effects, pero BLINDAMOS nuestros campos luego.
         const { actualizarEstadoCredito } = await import('../credito.service.js');
         await actualizarEstadoCredito(credito.id, t);
 
-        // ✅ Re-lectura de resumen post-movimientos para fijar “mora HOY” en la cuota (y contrato UI)
         let resumen_after = null;
         try {
             resumen_after = await obtenerResumenLibrePorCredito(credito.id, ymdDate(hoyYMD_TZ));
         } catch {
             resumen_after = null;
+        }
+
+        // ✅ También persistimos total_actual en crédito para que la ficha no muestre “viejo”
+        if (resumen_after) {
+            creditoPatch = {
+                ...creditoPatch,
+                total_actual: fix2(toNumber(resumen_after.total_actual ?? resumen_after.total_liquidacion_hoy ?? 0))
+            };
         }
 
         cuotaPatch = {
@@ -1170,16 +1245,14 @@ export const pagarCuotaLibreEnTx = async ({
         return { cuota, recibo, credito: credito_ui, resumen_libre: resumen_after };
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // Ruta NO liquidación
-    // ─────────────────────────────────────────────────────────────
+    // ───────────────────────────────────────────────
+    // Ruta NO liquidación (pago total “parcializado”)
+    // ───────────────────────────────────────────────
 
     let cicloObjetivo = null;
     let detalleCiclo = null;
 
-    // ✅ Regla: no se permite saltar ciclos; siempre se paga el más viejo abierto
     if (ciclo_libre != null && String(ciclo_libre).trim() !== '') {
-        // Si el front insiste con ciclo_libre, lo clampamos al ciclo más viejo abierto (regla)
         const masViejo = await cicloLibreMasViejoAbierto({ credito, hoyYMD: hoyYMD_TZ, t });
         const cicloMasViejo = masViejo?.ciclo ?? cicloActual;
 
@@ -1208,10 +1281,13 @@ export const pagarCuotaLibreEnTx = async ({
     const interesPendienteCiclo = fix2(detalleCiclo?.interes_pendiente ?? 0);
     const moraPendienteCiclo = fix2(detalleCiclo?.mora_pendiente ?? 0);
 
-    const moraBonificada = fix2(moraPendienteCiclo * (pct / 100));
-    const moraNetaCiclo = fix2(Math.max(moraPendienteCiclo - moraBonificada, 0));
+    const moraBonificada = fix2(moraPendienteCiclo * (pctMora / 100));
+    const interesBonificada = fix2(interesPendienteCiclo * (pctInteres / 100));
 
-    const sugeridoCerrarCiclo = fix2(Math.max(moraNetaCiclo + interesPendienteCiclo, 0));
+    const moraNetaCiclo = fix2(Math.max(moraPendienteCiclo - moraBonificada, 0));
+    const interesNetaCiclo = fix2(Math.max(interesPendienteCiclo - interesBonificada, 0));
+
+    const sugeridoCerrarCiclo = fix2(Math.max(moraNetaCiclo + interesNetaCiclo, 0));
     const montoAImputar = montoIngresado != null ? montoIngresado : sugeridoCerrarCiclo;
 
     if (!(montoAImputar > 0)) {
@@ -1223,18 +1299,17 @@ export const pagarCuotaLibreEnTx = async ({
     let restante = fix2(montoAImputar);
     const moraCobrada = fix2(Math.min(restante, moraNetaCiclo));
     restante = fix2(restante - moraCobrada);
-    const interesCicloCobrado = fix2(Math.min(restante, interesPendienteCiclo));
-    restante = fix2(restante - interesCicloCobrado);
+    const interesCicloCobrada = fix2(Math.min(restante, interesNetaCiclo));
+    restante = fix2(restante - interesCicloCobrada);
 
-    // ✅ Regla cliente: sólo puede tocar capital si cubrió mora+interés del ciclo objetivo
     const puedeIrACapital =
-        fix2(moraNetaCiclo - moraCobrada) <= 0 && fix2(interesPendienteCiclo - interesCicloCobrado) <= 0;
+        fix2(moraNetaCiclo - moraCobrada) <= 0 && fix2(interesNetaCiclo - interesCicloCobrada) <= 0;
 
     const principalPagado = puedeIrACapital ? fix2(Math.min(restante, saldoCapitalAntes)) : 0;
 
     restante = fix2(restante - principalPagado);
 
-    const totalAplicado = fix2(moraCobrada + interesCicloCobrado + principalPagado);
+    const totalAplicado = fix2(moraCobrada + interesCicloCobrada + principalPagado);
     if (!(totalAplicado > 0)) {
         const err = new Error('El pago no impacta sobre deuda (mora/interés/capital).');
         err.status = 400;
@@ -1250,7 +1325,9 @@ export const pagarCuotaLibreEnTx = async ({
     }
 
     const moraTotalNetaAntes = fix2(Math.max(moraPendienteTotalAntes - moraBonificada, 0));
-    const totalAntes = fix2(saldoCapitalAntes + interesPendienteTotalAntes + moraTotalNetaAntes);
+    const interesTotalNetaAntes = fix2(Math.max(interesPendienteTotalAntes - interesBonificada, 0));
+
+    const totalAntes = fix2(saldoCapitalAntes + interesTotalNetaAntes + moraTotalNetaAntes);
     const totalDespues = fix2(Math.max(totalAntes - totalAplicado, 0));
 
     const pago = await Pago.create(
@@ -1260,7 +1337,6 @@ export const pagarCuotaLibreEnTx = async ({
 
     const nuevoSaldoCapital = fix2(Math.max(saldoCapitalAntes - principalPagado, 0));
 
-    // idem: el interes_acumulado se recalcula tras crear recibo
     let creditoPatch = {
         saldo_actual: nuevoSaldoCapital
     };
@@ -1272,10 +1348,21 @@ export const pagarCuotaLibreEnTx = async ({
         estado: toNumber(nuevoSaldoCapital) <= 0 && totalDespues <= 0 ? 'pagada' : 'parcial',
         forma_pago_id,
         monto_pagado_acumulado: fix2(principalPrevio + principalPagado)
-        // intereses_vencidos_acumulados se setea luego con resumen_after.mora_pendiente_hoy
     };
 
     await cuota.update(cuotaPatch, { transaction: t });
+
+    const descuentoTotal = fix2(moraBonificada + interesBonificada);
+    const { sobre: descuentoSobre, porcentaje: descuentoPorcentaje } = buildDescuentoMeta({ pctMora, pctInteres });
+
+    const conceptoDesc =
+        descuentoTotal > 0
+            ? ` (Desc: mora ${fix2(moraBonificada)} / interés ${fix2(interesBonificada)})`
+            : '';
+
+    // ✅ settlement para resumen: cobrado “contable” = pagado neto + bonificado
+    const moraCobradaSettle = fix2(moraCobrada + moraBonificada);
+    const interesCicloCobradoSettle = fix2(interesCicloCobrada + interesBonificada);
 
     const reciboBase = {
         credito,
@@ -1285,14 +1372,19 @@ export const pagarCuotaLibreEnTx = async ({
         cobrador,
         medioPagoNombre: medioPago?.nombre ?? 'N/D',
         importeOriginalCuota: fix2(toNumber(cuota.importe_cuota || saldoCapitalAntes)),
-        descuentoAplicado: moraBonificada,
-        moraCobrada,
+
+        // ✅ NUEVO: observaciones -> recibo
+        observaciones: observacion,
+
+        descuentoAplicado: descuentoTotal,
+
+        moraCobrada: moraCobradaSettle,
         principalPagado,
-        interesCicloCobrado,
+        interesCicloCobrado: interesCicloCobradoSettle,
         saldoCuotaAnterior: totalAntes,
         saldoCuotaActual: totalDespues,
         saldoMoraRestante: fix2(Math.max(moraNetaCiclo - moraCobrada, 0)),
-        conceptoExtra: `Pago crédito LIBRE #${credito.id} - ciclo ${cicloObjetivo}`,
+        conceptoExtra: `Pago crédito LIBRE #${credito.id} - ciclo ${cicloObjetivo}${conceptoDesc}`,
         saldoPrincipalAntes: saldoCapitalAntes,
         saldoPrincipalDespues: nuevoSaldoCapital,
         saldoCreditoAntes: saldoCapitalAntes,
@@ -1300,6 +1392,10 @@ export const pagarCuotaLibreEnTx = async ({
     };
 
     let reciboPayload = armarDatosRecibo(reciboBase);
+
+    reciboPayload.descuento_aplicado = descuentoTotal;
+    reciboPayload.descuento_sobre = descuentoTotal > 0 ? descuentoSobre : null;
+    reciboPayload.descuento_porcentaje = descuentoTotal > 0 ? descuentoPorcentaje : null;
 
     reciboPayload = appendCicloTagEnReciboPayload(reciboPayload, cicloObjetivo);
 
@@ -1319,7 +1415,6 @@ export const pagarCuotaLibreEnTx = async ({
         usuario_id: usuario_id ?? null
     });
 
-    // ✅ Recalcular historial de interés cobrado
     const interesHist = await recalcularInteresAcumuladoHistoricoLibreEnTx({
         creditoId: credito.id,
         cuotaIds,
@@ -1329,7 +1424,6 @@ export const pagarCuotaLibreEnTx = async ({
     creditoPatch = { ...creditoPatch, interes_acumulado: interesHist };
     await credito.update({ interes_acumulado: interesHist }, { transaction: t });
 
-    // ✅ Tope 3 ciclos (según REGLA, no por fecha)
     if (cicloActual >= 3) {
         const deudaTotDespues = await deudaLibreTotalHoy({ credito, hoyYMD: hoyYMD_TZ, t });
         const sinInteresMora =
@@ -1348,12 +1442,18 @@ export const pagarCuotaLibreEnTx = async ({
     const { actualizarEstadoCredito } = await import('../credito.service.js');
     await actualizarEstadoCredito(credito.id, t);
 
-    // ✅ Resumen post pago para setear “mora HOY” en cuota
     let resumen_after = null;
     try {
         resumen_after = await obtenerResumenLibrePorCredito(credito.id, ymdDate(hoyYMD_TZ));
     } catch {
         resumen_after = null;
+    }
+
+    if (resumen_after) {
+        creditoPatch = {
+            ...creditoPatch,
+            total_actual: fix2(toNumber(resumen_after.total_actual ?? resumen_after.total_liquidacion_hoy ?? 0))
+        };
     }
 
     cuotaPatch = {
@@ -1398,16 +1498,15 @@ export const registrarPagoParcialLibreEnTx = async ({
     descuento = 0,
     descuento_scope = null,
     descuento_mora = null,
+    descuento_interes = null, // ✅ NUEVO
     usuario_id = null,
     rol_id = null
 }) => {
-    // ✅ Blindajes backend
     assertNoPagoSiRefinanciado({ credito, cuota });
     assertNoPagoSiAnulado({ credito });
 
     const hoyYMD_TZ = todayYMD();
 
-    // ✅ Tope 3 ciclos SEGÚN REGLA (no por fecha)
     const resumen = await obtenerResumenLibrePorCredito(credito.id, ymdDate(hoyYMD_TZ));
     const cicloActual = clamp(toNumber(resumen?.ciclo_actual ?? 1), 1, LIBRE_MAX_CICLOS);
     if (cicloActual >= LIBRE_MAX_CICLOS) {
@@ -1439,24 +1538,22 @@ export const registrarPagoParcialLibreEnTx = async ({
     const interesPendienteCiclo = fix2(detCiclo.interes_pendiente);
     const moraPendienteCiclo = fix2(detCiclo.mora_pendiente);
 
-    const isAdmin = Number(rol_id) === 1;
-    const scope = isAdmin ? 'mora' : (String(descuento_scope || '').toLowerCase() || null);
+    const pctMora = getPctDescuentoMora({ rol_id, descuento, descuento_scope, descuento_mora });
+    const pctInteres = getPctDescuentoInteres({ rol_id, descuento, descuento_scope, descuento_interes });
 
-    const pctRaw = scope === 'mora' ? (descuento_mora != null ? toNumber(descuento_mora) : toNumber(descuento)) : 0;
+    const descuentoMoraCiclo = fix2(moraPendienteCiclo * (pctMora / 100));
+    const descuentoInteresCiclo = fix2(interesPendienteCiclo * (pctInteres / 100));
 
-    const pct = clamp(fix2(pctRaw), 0, 100);
-    const descuentoMoraCiclo = fix2(moraPendienteCiclo * (pct / 100));
     const moraNetaCiclo = fix2(Math.max(moraPendienteCiclo - descuentoMoraCiclo, 0));
+    const interesNetaCiclo = fix2(Math.max(interesPendienteCiclo - descuentoInteresCiclo, 0));
 
-    // ✅ Imputación estricta: Mora → Interés → Capital
     const aMora = fix2(Math.min(pagado, moraNetaCiclo));
     const restoTrasMora = fix2(pagado - aMora);
 
-    const aInteres = fix2(Math.min(restoTrasMora, interesPendienteCiclo));
+    const aInteres = fix2(Math.min(restoTrasMora, interesNetaCiclo));
     const restoTrasInteres = fix2(restoTrasMora - aInteres);
 
-    // ✅ Regla: capital sólo si cubre mora+interés del ciclo
-    const puedeIrACapital = fix2(moraNetaCiclo - aMora) <= 0 && fix2(interesPendienteCiclo - aInteres) <= 0;
+    const puedeIrACapital = fix2(moraNetaCiclo - aMora) <= 0 && fix2(interesNetaCiclo - aInteres) <= 0;
     const aCapital = puedeIrACapital ? fix2(Math.min(restoTrasInteres, saldoAntesCapital)) : 0;
 
     const restanteNoImputable = fix2(restoTrasInteres - aCapital);
@@ -1467,7 +1564,7 @@ export const registrarPagoParcialLibreEnTx = async ({
         err.meta = {
             excedente: restanteNoImputable,
             mora_pendiente_ciclo: moraNetaCiclo,
-            interes_pendiente_ciclo: interesPendienteCiclo,
+            interes_pendiente_ciclo: interesNetaCiclo,
             saldo_capital: saldoAntesCapital
         };
         throw err;
@@ -1475,7 +1572,7 @@ export const registrarPagoParcialLibreEnTx = async ({
 
     const nuevoSaldoCapital = fix2(Math.max(saldoAntesCapital - aCapital, 0));
 
-    const interesTotalDespues = fix2(Math.max(interesTotalAntes - aInteres, 0));
+    const interesTotalDespues = fix2(Math.max(interesTotalAntes - aInteres - descuentoInteresCiclo, 0));
     const moraTotalDespues = fix2(Math.max(moraTotalAntes - aMora - descuentoMoraCiclo, 0));
     const totalDespuesGlobal = fix2(nuevoSaldoCapital + interesTotalDespues + moraTotalDespues);
 
@@ -1494,19 +1591,29 @@ export const registrarPagoParcialLibreEnTx = async ({
     let cuotaPatch = {
         estado: nuevoEstado,
         forma_pago_id,
-        // ✅ mora en cuota = “mora HOY del ciclo actual” (se setea luego con resumen_after)
         monto_pagado_acumulado: capitalPagadoNuevo
     };
 
     await cuota.update(cuotaPatch, { transaction: t });
 
-    // idem: interes_acumulado se recalcula tras crear recibo
     let creditoPatch = {
         saldo_actual: nuevoSaldoCapital,
         estado: liquidado ? 'pagado' : credito.estado
     };
 
     await credito.update(creditoPatch, { transaction: t });
+
+    const descuentoTotal = fix2(descuentoMoraCiclo + descuentoInteresCiclo);
+    const { sobre: descuentoSobre, porcentaje: descuentoPorcentaje } = buildDescuentoMeta({ pctMora, pctInteres });
+
+    const conceptoDesc =
+        descuentoTotal > 0
+            ? ` (Desc: mora ${fix2(descuentoMoraCiclo)} / interés ${fix2(descuentoInteresCiclo)})`
+            : '';
+
+    // ✅ settlement para resumen/ficha
+    const moraCobradaSettle = fix2(aMora + descuentoMoraCiclo);
+    const interesCicloCobradoSettle = fix2(aInteres + descuentoInteresCiclo);
 
     const reciboBase = {
         cliente,
@@ -1516,21 +1623,31 @@ export const registrarPagoParcialLibreEnTx = async ({
         credito,
         medioPagoNombre: medioPago?.nombre ?? 'N/D',
         importeOriginalCuota: cuota.importe_cuota,
-        descuentoAplicado: descuentoMoraCiclo,
-        moraCobrada: aMora,
+
+        // ✅ NUEVO: observaciones -> recibo
+        observaciones: observacion,
+
+        descuentoAplicado: descuentoTotal,
+
+        moraCobrada: moraCobradaSettle,
         principalPagado: aCapital,
         saldoPrincipalAntes: saldoAntesCapital,
         saldoPrincipalDespues: nuevoSaldoCapital,
         saldoCreditoAntes: saldoAntesCapital,
         saldoCreditoDespues: nuevoSaldoCapital,
-        conceptoExtra: `Pago parcial LIBRE #${credito.id} (Ciclo ${cicloObjetivo})`,
-        interesCicloCobrado: aInteres,
+        conceptoExtra: `Pago parcial LIBRE #${credito.id} (Ciclo ${cicloObjetivo})${conceptoDesc}`,
+        interesCicloCobrado: interesCicloCobradoSettle,
         saldoCuotaAnterior: totalAntesGlobal,
         saldoCuotaActual: totalDespuesGlobal,
         saldoMoraRestante: fix2(Math.max(moraNetaCiclo - aMora, 0))
     };
 
     let reciboPayload = armarDatosRecibo(reciboBase);
+
+    // ✅ Persistencia en DB
+    reciboPayload.descuento_aplicado = descuentoTotal;
+    reciboPayload.descuento_sobre = descuentoTotal > 0 ? descuentoSobre : null;
+    reciboPayload.descuento_porcentaje = descuentoTotal > 0 ? descuentoPorcentaje : null;
 
     reciboPayload = appendCicloTagEnReciboPayload(reciboPayload, cicloObjetivo);
 
@@ -1550,7 +1667,6 @@ export const registrarPagoParcialLibreEnTx = async ({
         usuario_id: usuario_id ?? null
     });
 
-    // ✅ Recalcular historial de interés cobrado
     const cuotaIds = await obtenerCuotaIdsPorCredito({ credito_id: credito.id, t });
     const interesHist = await recalcularInteresAcumuladoHistoricoLibreEnTx({
         creditoId: credito.id,
@@ -1564,12 +1680,18 @@ export const registrarPagoParcialLibreEnTx = async ({
     const { actualizarEstadoCredito } = await import('../credito.service.js');
     await actualizarEstadoCredito(credito.id, t);
 
-    // ✅ Resumen post pago: fija mora HOY en cuota para UI/consistencia
     let resumen_after = null;
     try {
         resumen_after = await obtenerResumenLibrePorCredito(credito.id, ymdDate(hoyYMD_TZ));
     } catch {
         resumen_after = null;
+    }
+
+    if (resumen_after) {
+        creditoPatch = {
+            ...creditoPatch,
+            total_actual: fix2(toNumber(resumen_after.total_actual ?? resumen_after.total_liquidacion_hoy ?? 0))
+        };
     }
 
     cuotaPatch = {

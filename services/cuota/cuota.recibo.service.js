@@ -1,5 +1,5 @@
 // financiera-backend/services/cuota/cuota.recibo.service.js
-// Recibos: formateo UI + creación compatible con DB legacy (sin columna ciclo_libre)
+// Recibos: formateo UI + creación compatible con DB legacy (sin columnas nuevas)
 // Importante: NO contiene lógica de negocio de pago; solo armado/compat.
 
 import Recibo from '../../models/Recibo.js';
@@ -58,6 +58,10 @@ export const buildReciboUI = (recibo) => {
         nombre_cobrador,
         modalidad_credito,
 
+        // ✅ observaciones (puede venir en distintas DBs)
+        observaciones,
+        observacion,
+
         // desglose
         importe_cuota_original,
         descuento_aplicado,
@@ -70,6 +74,10 @@ export const buildReciboUI = (recibo) => {
 
         // ✅ ciclo imputado (LIBRE)
         ciclo_libre,
+
+        // ✅ meta descuento cancelación (si existe en DB)
+        descuento_sobre,
+        descuento_porcentaje,
 
         // montos y saldos
         monto_pagado,
@@ -87,6 +95,11 @@ export const buildReciboUI = (recibo) => {
     // Si por cualquier razón monto_pagado viniera con "monto del crédito", no debe ganar.
     const montoDisplay = pago_a_cuenta ?? monto_pagado ?? 0;
 
+    const obsUI =
+        (typeof observaciones === 'string' && observaciones.trim() !== '')
+            ? observaciones.trim()
+            : ((typeof observacion === 'string' && observacion.trim() !== '') ? observacion.trim() : '');
+
     const base = {
         numero_recibo: numero_recibo ?? null,
         fecha: formatYMDToDMY(fecha),
@@ -96,6 +109,9 @@ export const buildReciboUI = (recibo) => {
         medio_pago: medio_pago || '',
         concepto: concepto || '',
         modalidad_credito: modalidad_credito || undefined,
+
+        // ✅ observaciones para UI (si existen)
+        observaciones: obsUI || undefined,
 
         // totales (UI)
         monto_pagado: formatARS(montoDisplay),
@@ -115,7 +131,14 @@ export const buildReciboUI = (recibo) => {
 
         // 🟦 campo “Saldo de mora” (UI)
         saldo_mora:
-            saldo_mora_pendiente !== undefined ? nonAplicaIfZero(saldo_mora_pendiente) : undefined
+            saldo_mora_pendiente !== undefined ? nonAplicaIfZero(saldo_mora_pendiente) : undefined,
+
+        // ✅ meta descuento cancelación (opcional, solo si existe)
+        descuento_sobre: descuento_sobre ?? undefined,
+        descuento_porcentaje:
+            descuento_porcentaje !== undefined && descuento_porcentaje !== null
+                ? String(descuento_porcentaje)
+                : undefined
     };
 
     if (!libre) {
@@ -210,6 +233,13 @@ const dropCicloLibreConTag = (payload) => {
  * - Si falla por cualquier columna faltante, se elimina esa columna y se reintenta en SAVEPOINT.
  * - PLUS (LIBRE): cuando no existe ciclo_libre, se guarda el ciclo en `concepto` como tag:
  *   "[ciclo_libre:N]" para que luego podamos filtrar/sumar por ciclo sin depender de fechas.
+ *
+ * ✅ Importante (meta descuento):
+ * - Si la DB no tiene `descuento_sobre` / `descuento_porcentaje`, este método las removerá por retry
+ *   (misma mecánica que con ciclo_libre y cualquier otra columna faltante).
+ *
+ * ✅ Importante (observaciones):
+ * - Si la DB no tiene `observaciones` / `observacion`, este método las removerá por retry.
  */
 export const createReciboSafe = async (payload, options = {}) => {
     let finalPayload = payload ? { ...payload } : payload;
@@ -295,8 +325,18 @@ export const armarDatosRecibo = ({
     saldoCuotaAnterior = undefined,
     saldoCuotaActual = undefined,
     saldoMoraRestante = undefined,
+
+    // ✅ NUEVO: observaciones del modal (texto libre)
+    observaciones = undefined,
+
     // ✅ ciclo libre imputado
-    cicloLibre = null
+    cicloLibre = null,
+
+    // ✅ NUEVO: meta de descuento en cancelación (si aplica)
+    // - descuentoSobre: 'mora' | 'total' (string)
+    // - descuentoPorcentaje: 0..100 (number)
+    descuentoSobre = undefined,
+    descuentoPorcentaje = undefined
 }) => {
     const nowYMD = todayYMD();
     const horaNow = nowTime(new Date());
@@ -346,12 +386,34 @@ export const armarDatosRecibo = ({
         modalidad_credito: credito?.modalidad_credito || undefined
     };
 
+    // ✅ Persistimos observaciones (si viene texto)
+    // Mandamos ambos nombres por compat: observaciones / observacion.
+    // Si la DB no tiene alguno, createReciboSafe lo elimina automáticamente.
+    if (typeof observaciones === 'string' && observaciones.trim() !== '') {
+        const txt = observaciones.trim().slice(0, 500); // límite defensivo
+        payload.observaciones = txt;
+        payload.observacion = txt;
+    }
+
     // ✅ Persistimos ciclo_libre solo para LIBRE y SOLO si es un número válido
     // (Si la DB no tiene la columna, createReciboSafe lo taggea en concepto y lo elimina.)
     if (String(credito?.modalidad_credito || '').toLowerCase() === 'libre') {
         const cicloNum = Number(cicloLibre);
         if (Number.isFinite(cicloNum)) {
             payload.ciclo_libre = cicloNum;
+        }
+    }
+
+    // ✅ NUEVO: meta de descuento (cancelación).
+    // Solo lo mandamos si viene explícito y es válido.
+    // Si la DB no tiene estas columnas, createReciboSafe las removerá por retry automáticamente.
+    if (typeof descuentoSobre !== 'undefined' && descuentoSobre !== null && descuentoSobre !== '') {
+        payload.descuento_sobre = String(descuentoSobre);
+    }
+    if (typeof descuentoPorcentaje !== 'undefined' && descuentoPorcentaje !== null && descuentoPorcentaje !== '') {
+        const pct = Number(descuentoPorcentaje);
+        if (Number.isFinite(pct)) {
+            payload.descuento_porcentaje = pct;
         }
     }
 

@@ -54,8 +54,7 @@ import {
     pagarCuotaLibreEnTx,
     registrarPagoParcialLibreEnTx,
 
-    // ✅ NUEVO: lo usamos para mantener coherencia con el “resumen exacto”
-    // (mora/interest HOY = ciclo actual)
+    // ✅ lo usamos para mantener coherencia con el “resumen exacto”
     obtenerResumenLibrePorCredito
 } from './cuota.libre.service.js';
 
@@ -91,7 +90,8 @@ import CajaMovimiento from '../../models/CajaMovimiento.js';
  */
 const assertNoPagoSiAnulado = ({ credito }) => {
     const estado = String(credito?.estado ?? '').trim().toLowerCase();
-    if (estado === 'anulado' || estado === 'anulada') {
+    // ⚠️ DB enum no incluye "anulada" (solo "anulado")
+    if (estado === 'anulado') {
         const err = new Error('El crédito está ANULADO. No se permiten pagos ni liquidaciones.');
         err.status = 409;
         err.code = 'CREDITO_ANULADO';
@@ -155,6 +155,22 @@ const recalcularPuntajeClienteSafe = (clienteId) => {
         });
 };
 
+/**
+ * ✅ FIX: si el FRONT no manda rol_id, lo resolvemos por usuario_id dentro de la TX.
+ * Esto es clave porque en LIBRE el descuento depende del rol.
+ */
+const resolveRolIdInTx = async ({ t, rol_id, usuario_id }) => {
+    const rolNum = Number(rol_id);
+    if (Number.isFinite(rolNum)) return rolNum;
+
+    const userNum = Number(usuario_id);
+    if (!Number.isFinite(userNum) || userNum <= 0) return null;
+
+    const u = await Usuario.findByPk(userNum, { transaction: t });
+    const r = Number(u?.rol_id);
+    return Number.isFinite(r) ? r : null;
+};
+
 /* ───────────────── Vencimientos ───────────────── */
 export const actualizarCuotasVencidas = async () => {
     const hoy = todayYMD(); // YMD en TZ negocio
@@ -175,12 +191,20 @@ export const actualizarCuotasVencidas = async () => {
     });
     const refiIds = refinanciados.map(r => r.id);
 
+    // ✅ Excluir ANULADOS (DB enum: solo 'anulado')
+    const anulados = await Credito.findAll({
+        attributes: ['id'],
+        where: { estado: { [Op.in]: ['anulado'] } },
+        raw: true
+    });
+    const anuladoIds = anulados.map(r => r.id);
+
     // ⚠️ Solo vencidas si fv < HOY (mismo día NO se marca vencida)
     const whereUpdate = {
         estado: { [Op.in]: ['pendiente', 'parcial'] },
         fecha_vencimiento: { [Op.lt]: hoy, [Op.ne]: VTO_FICTICIO_LIBRE }
     };
-    const excluir = [...libreIds, ...refiIds];
+    const excluir = [...libreIds, ...refiIds, ...anuladoIds];
     if (excluir.length > 0) {
         whereUpdate['credito_id'] = { [Op.notIn]: excluir };
     }
@@ -258,6 +282,14 @@ export const recalcularMoraCuota = async (cuotaId, t = null) => {
         return 0;
     }
 
+    // ✅ anulado -> mora no relevante para cobro; dejamos 0 para no “ensuciar” UI
+    if (String(credito.estado ?? '').trim().toLowerCase() === 'anulado') {
+        if (toNumber(cuota.intereses_vencidos_acumulados) !== 0) {
+            await cuota.update({ intereses_vencidos_acumulados: 0 }, { transaction: t });
+        }
+        return 0;
+    }
+
     if (cuota.estado === 'pagada') {
         await cuota.update({ intereses_vencidos_acumulados: 0 }, { transaction: t });
         return 0;
@@ -322,6 +354,15 @@ export const recalcularMoraPorCredito = async (creditoId, t = null) => {
     }
 
     if (String(credito.estado) === 'refinanciado') {
+        await Cuota.update(
+            { intereses_vencidos_acumulados: 0 },
+            { where: { credito_id: creditoId }, transaction: t }
+        );
+        return 0;
+    }
+
+    // ✅ anulado -> mora 0
+    if (String(credito.estado ?? '').trim().toLowerCase() === 'anulado') {
         await Cuota.update(
             { intereses_vencidos_acumulados: 0 },
             { where: { credito_id: creditoId }, transaction: t }
@@ -501,6 +542,10 @@ export const obtenerCuotasVencidas = async (query = {}) => {
     for (const c of cuotas) {
         const cr = mapCredito.get(c.credito_id);
         if (!cr) continue;
+
+        // ✅ excluir anulado del listado de vencidas (DB enum: solo 'anulado')
+        if (String(cr.estado ?? '').trim().toLowerCase() === 'anulado') continue;
+
         if (esCreditoLibre(cr) || String(cr.estado) === 'refinanciado') continue;
 
         const cl = mapCliente.get(cr.cliente_id);
@@ -621,7 +666,8 @@ export const obtenerRutaCobroCobrador = async ({
         where: {
             cobrador_id: cobradorIdNum,
             modalidad_credito: { [Op.ne]: 'libre' },
-            estado: { [Op.ne]: 'refinanciado' }
+            // ✅ excluir anulado también (DB enum: solo 'anulado')
+            estado: { [Op.notIn]: ['refinanciado', 'anulado'] }
         },
         attributes: [
             'id',
@@ -715,6 +761,7 @@ export const obtenerRutaCobroCobrador = async ({
             where: {
                 cobrador_id: cobradorIdNum,
                 modalidad_credito: 'libre',
+                // ✅ excluir anulado (DB enum: solo 'anulado')
                 estado: { [Op.notIn]: ['refinanciado', 'pagado', 'anulado'] },
                 saldo_actual: { [Op.gt]: 0 },
                 fecha_compromiso_pago: { [Op.ne]: null },
@@ -963,6 +1010,7 @@ export const pagarCuota = async (...args) => {
             cuota_id: cuotaId,
             forma_pago_id: formaPagoId,
             descuento: 0,
+            descuento_interes: null, // ✅ compat
             observacion,
             usuario_id
         });
@@ -976,6 +1024,7 @@ const pagarCuotaTotal = async ({
     descuento = 0,
     descuento_scope = null,   // 'mora' | 'total' | null
     descuento_mora = null,    // para 'mora' (en LIBRE se interpreta como %; en NO-LIBRE como MONTO)
+    descuento_interes = null, // ✅ NUEVO (LIBRE: % 0..100)
     observacion = null,
     usuario_id = null,
     rol_id = null,
@@ -1002,7 +1051,10 @@ const pagarCuotaTotal = async ({
         assertClienteYCobradorValidos({ credito, cliente, cobrador });
         assertFormaPagoValida({ medioPago, forma_pago_id });
 
-        // —— LIBRE → delega a cuota.libre.service.js (mantiene core liviano) —— 
+        // ✅ FIX: asegurar rol_id real (si el front no lo manda)
+        const rolResolved = await resolveRolIdInTx({ t, rol_id, usuario_id });
+
+        // —— LIBRE → delega a cuota.libre.service.js (mantiene core liviano) ——
         if (esCreditoLibre(credito)) {
             const result = await pagarCuotaLibreEnTx({
                 t,
@@ -1015,9 +1067,10 @@ const pagarCuotaTotal = async ({
                 descuento,
                 descuento_scope,
                 descuento_mora,
+                descuento_interes, // ✅ NUEVO: reenviamos
                 observacion,
                 usuario_id,
-                rol_id,
+                rol_id: rolResolved,
                 monto_pagado,
                 ciclo_libre
             });
@@ -1030,14 +1083,14 @@ const pagarCuotaTotal = async ({
             return result;
         }
 
-        // —— NO libre —— 
+        // —— NO libre ——
         const moraActual = await recalcularMoraCuota(cuota.id, t);
 
         const importeOriginal = fix2(cuota.importe_cuota);
         const descuentoPrevio = fix2(cuota.descuento_cuota);
         const principalPagadoPrevio = fix2(cuota.monto_pagado_acumulado);
 
-        const isAdmin = Number(rol_id) === 1;
+        const isAdmin = Number(rolResolved) === 1;
         const scope = isAdmin ? 'mora' : (String(descuento_scope || '').toLowerCase() || null);
         const descuentoMoraBruto = scope === 'mora'
             ? (descuento_mora != null ? fix2(toNumber(descuento_mora)) : fix2(toNumber(descuento)))
@@ -1129,6 +1182,7 @@ export const registrarPagoParcial = async ({
     descuento = 0,
     descuento_scope = null,   // 'mora' | null
     descuento_mora = null,    // en LIBRE se interpreta como %; en NO-LIBRE como MONTO
+    descuento_interes = null, // ✅ NUEVO (LIBRE: % 0..100)
     usuario_id = null,
     rol_id = null
 }) => {
@@ -1154,7 +1208,10 @@ export const registrarPagoParcial = async ({
         assertClienteYCobradorValidos({ credito, cliente, cobrador });
         assertFormaPagoValida({ medioPago, forma_pago_id });
 
-        // —— LIBRE → delega a cuota.libre.service.js —— 
+        // ✅ FIX: asegurar rol_id real (si el front no lo manda)
+        const rolResolved = await resolveRolIdInTx({ t, rol_id, usuario_id });
+
+        // —— LIBRE → delega a cuota.libre.service.js ——
         if (esCreditoLibre(credito)) {
             const result = await registrarPagoParcialLibreEnTx({
                 t,
@@ -1170,8 +1227,9 @@ export const registrarPagoParcial = async ({
                 descuento,
                 descuento_scope,
                 descuento_mora,
+                descuento_interes, // ✅ NUEVO: reenviamos
                 usuario_id,
-                rol_id
+                rol_id: rolResolved
             });
 
             await t.commit();
@@ -1191,7 +1249,7 @@ export const registrarPagoParcial = async ({
         const saldoPrincipalAntes = Math.max(importeCuota - descuentoPrevio - principalPagadoPrevio, 0);
         const saldoCreditoAntes = fix2(credito.saldo_actual);
 
-        const isAdmin = Number(rol_id) === 1;
+        const isAdmin = Number(rolResolved) === 1;
         const scope = isAdmin ? 'mora' : (String(descuento_scope || '').toLowerCase() || null);
         const descMoraRaw = scope === 'mora'
             ? (descuento_mora != null ? fix2(toNumber(descuento_mora)) : fix2(toNumber(descuento)))

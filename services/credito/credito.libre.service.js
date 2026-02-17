@@ -157,6 +157,67 @@ const obtenerInteresCobradoHistoricoLibre = async (creditoId, t = null) => {
   return fix2(toNumber(sum || 0));
 };
 
+/**
+ * ✅ Descuentos aplicados (histórico y último) para LIBRE.
+ *
+ * Nota:
+ * - El “scope” (mora|total) y el “%” no están persistidos en el schema actual (al menos en este módulo).
+ * - Lo que SÍ tenemos de forma confiable es el monto efectivamente descontado en el recibo: `descuento_aplicado`.
+ * - Por eso exponemos:
+ *   - descuento_aplicado_total_historico (sumatoria)
+ *   - descuento_ultimo (monto del último recibo)
+ *   - descuento_ultimo_numero_recibo / descuento_ultimo_fecha (para UI)
+ */
+const obtenerDescuentosAplicadosLibre = async (creditoId, t = null) => {
+  const cuotas = await Cuota.findAll({
+    where: { credito_id: creditoId },
+    attributes: ['id'],
+    ...(t && { transaction: t })
+  });
+
+  const cuotaIds = cuotas.map((c) => c.id).filter(Boolean);
+  if (!cuotaIds.length) {
+    return {
+      descuento_aplicado_total_historico: 0,
+      descuento_ultimo: 0,
+      descuento_ultimo_numero_recibo: null,
+      descuento_ultimo_fecha: null
+    };
+  }
+
+  // Sumatoria histórica
+  let sum = 0;
+  try {
+    sum = await Recibo.sum('descuento_aplicado', {
+      where: { cuota_id: { [Op.in]: cuotaIds } },
+      ...(t && { transaction: t })
+    });
+  } catch {
+    // si la columna no existiera en algún entorno, no rompemos el resumen
+    sum = 0;
+  }
+
+  // Último recibo (monto real descontado)
+  let last = null;
+  try {
+    last = await Recibo.findOne({
+      where: { cuota_id: { [Op.in]: cuotaIds } },
+      order: [['id', 'DESC']],
+      attributes: ['id', 'numero_recibo', 'fecha', 'descuento_aplicado'],
+      ...(t && { transaction: t })
+    });
+  } catch {
+    last = null;
+  }
+
+  return {
+    descuento_aplicado_total_historico: fix2(toNumber(sum || 0)),
+    descuento_ultimo: fix2(toNumber(last?.descuento_aplicado ?? 0)),
+    descuento_ultimo_numero_recibo: last?.numero_recibo ?? null,
+    descuento_ultimo_fecha: last?.fecha ?? null
+  };
+};
+
 /* ===================== Helpers fallback (solo si falla resumen exacto) ===================== */
 
 export const calcularInteresCicloLibre = (credito) => {
@@ -266,8 +327,11 @@ const obtenerResumenLibreExactoSafe = async (creditoId, hoyYMD) => {
     );
 
     const interes_cobrado_historico = await obtenerInteresCobradoHistoricoLibre(creditoId);
-    const intereses_acumulados = fix2(interes_cobrado_historico);
+    const intereses_acumulados = fix2(toNumber(interes_cobrado_historico));
     const interes_devengado_total = fix2(interes_cobrado_historico + interes_total);
+
+    // ✅ Descuentos aplicados (monto real histórico + último)
+    const descuentos = await obtenerDescuentosAplicadosLibre(creditoId);
 
     const fechas = obtenerFechasCiclosLibre(credito);
 
@@ -295,6 +359,9 @@ const obtenerResumenLibreExactoSafe = async (creditoId, hoyYMD) => {
       interes_cobrado_historico,
       intereses_acumulados,
       interes_devengado_total,
+
+      // ✅ NUEVO: descuentos (monto efectivo)
+      ...descuentos,
 
       ...(fechas || {})
     };
@@ -596,6 +663,9 @@ export const obtenerResumenLibre = async (creditoId, fecha = ymdDate(todayYMD())
   const intereses_acumulados = fix2(interes_cobrado_historico);
   const interes_devengado_total = fix2(interes_cobrado_historico + interes);
 
+  // ✅ Descuentos aplicados (fallback seguro)
+  const descuentos = await obtenerDescuentosAplicadosLibre(creditoId);
+
   return {
     credito_id: creditoId,
     hoy: hoyYMD,
@@ -618,6 +688,9 @@ export const obtenerResumenLibre = async (creditoId, fecha = ymdDate(todayYMD())
     interes_cobrado_historico,
     intereses_acumulados,
     interes_devengado_total,
+
+    // ✅ NUEVO: descuentos (monto efectivo)
+    ...descuentos,
 
     ...(obtenerFechasCiclosLibre(credito) || {})
   };

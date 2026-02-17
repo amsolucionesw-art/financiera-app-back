@@ -87,6 +87,31 @@ const Recibo = sequelize.define('Recibo', {
         }
     },
 
+    // ✅ NUEVO: cómo se aplicó el descuento (para auditoría/UX)
+    // - descuento_sobre: 'mora' | 'total' (NULL para recibos históricos)
+    // - descuento_porcentaje: porcentaje solicitado (0..100) (NULL para recibos históricos)
+    descuento_sobre: {
+        type: DataTypes.STRING(10),
+        allowNull: true,
+        defaultValue: null,
+        validate: {
+            isIn: {
+                args: [['mora', 'total']],
+                msg: 'descuento_sobre inválido (mora|total)'
+            }
+        }
+    },
+    descuento_porcentaje: {
+        // Guardamos porcentaje (no monto), ej: 10.00
+        type: DataTypes.DECIMAL(5, 2),
+        allowNull: true,
+        defaultValue: null,
+        validate: {
+            min: 0,
+            max: 100
+        }
+    },
+
     // ── Campos de desglose ──
     importe_cuota_original: {
         type: DataTypes.DECIMAL(10, 2),

@@ -1,4 +1,4 @@
-// src/services/pago.service.js
+// services/pago.service.js
 // Controller fino de pagos. SIN lógica de negocio.
 // La lógica completa (incluido LIBRE, transacciones, caja y recibos)
 // vive en cuota.service.js.
@@ -21,10 +21,22 @@ const toIntOrNull = (v) => {
     return Number.isInteger(n) ? n : null;
 };
 
+const clampPct = (v) => {
+    const n = sanitizeNumber(v);
+    if (!Number.isFinite(n)) return null;
+    return Math.max(0, Math.min(100, n));
+};
+
+const normScope = (s) => String(s ?? '').trim().toLowerCase();
+const isCreditoLibre = (credito) => String(credito?.modalidad_credito ?? '').trim().toLowerCase() === 'libre';
+
 /**
  * Resuelve el descuento que se envía a cuota.service.js
  * - Admin (rol 1): SOLO mora
  * - Otros: compat legacy
+ *
+ * Nota: este "descuento" (legacy) se mantiene igual para no romper
+ * el circuito existente (especialmente pago total).
  */
 const resolveDescuentoParaCuotaService = ({ rolId, descuentoLegacy, descuentoMora }) => {
     const dl = sanitizeNumber(descuentoLegacy);
@@ -65,8 +77,14 @@ export const registrarPago = async (req, res) => {
             monto_pagado,
             forma_pago_id,
             observacion,
+
+            // legacy / existente
             descuento = 0,
-            descuento_mora = null
+            descuento_mora = null,
+
+            // ✅ NUEVO (solo SUPERADMIN + LIBRE): descuento sobre interés / scope
+            descuento_interes = null,
+            descuento_scope = null
         } = req.body ?? {};
 
         const usuarioId =
@@ -106,18 +124,44 @@ export const registrarPago = async (req, res) => {
         // ✅ Bloqueo por estado del crédito
         assertCreditoNoAnulado(cuota.credito);
 
+        // Mantener comportamiento anterior del descuento legacy (no romper pago parcial NO-LIBRE)
         const descuentoFinal = resolveDescuentoParaCuotaService({
             rolId,
             descuentoLegacy: descuento,
             descuentoMora: descuento_mora
         });
 
+        // ✅ Passthrough controlado: solo SUPERADMIN + crédito LIBRE
+        const libre = isCreditoLibre(cuota.credito);
+        const isSuper = Number(rolId) === 0;
+
+        const scopeNorm = normScope(descuento_scope);
+        const interesPct = descuento_interes != null && String(descuento_interes).trim() !== '' ? clampPct(descuento_interes) : null;
+
+        // Si no es super o no es LIBRE, no permitimos interés/scope (se ignoran)
+        const descuento_scope_final = (libre && isSuper && scopeNorm) ? scopeNorm : null;
+        const descuento_interes_final = (libre && isSuper && interesPct != null) ? interesPct : null;
+
+        // Si scope viene vacío pero mandan descuento_interes, asumimos "interes"
+        const descuento_scope_autofix =
+            (libre && isSuper && descuento_interes_final != null && !descuento_scope_final)
+                ? 'interes'
+                : descuento_scope_final;
+
         const result = await registrarPagoParcial({
             cuota_id: cuotaIdInt,
             monto_pagado: monto,
             forma_pago_id: formaPagoIdInt,
             observacion,
+
+            // legacy
             descuento: descuentoFinal,
+            descuento_mora: descuento_mora,
+
+            // ✅ NUEVO (LIBRE): viaja a cuota.service.js y de ahí a cuota.libre.service.js
+            descuento_scope: descuento_scope_autofix,
+            descuento_interes: descuento_interes_final,
+
             usuario_id: usuarioId ?? undefined,
             rol_id: rolId ?? undefined
         });
@@ -144,8 +188,13 @@ export const registrarPagoTotal = async (req, res) => {
             cuota_id,
             forma_pago_id,
             observacion,
+
+            // Se mantiene igual
             descuento = 0,
             descuento_mora = null
+
+            // ❌ NO agregamos descuento_interes acá a propósito:
+            // el requerimiento fue SOLO para pagos parciales en LIBRE.
         } = req.body ?? {};
 
         const usuarioId =
@@ -174,7 +223,6 @@ export const registrarPagoTotal = async (req, res) => {
             });
         }
 
-        // ✅ Traemos cuota+crédito para validar ANULADO también en pago total
         const cuota = await Cuota.findByPk(cuotaIdInt, {
             include: [{ model: Credito, as: 'credito' }]
         });
@@ -182,7 +230,6 @@ export const registrarPagoTotal = async (req, res) => {
             return res.status(404).json({ success: false, error: 'Cuota o crédito no encontrados.' });
         }
 
-        // ✅ Bloqueo por estado del crédito
         assertCreditoNoAnulado(cuota.credito);
 
         const descuentoFinal = resolveDescuentoParaCuotaService({
