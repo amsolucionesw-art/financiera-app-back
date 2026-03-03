@@ -74,6 +74,18 @@ const createCajaMovimientoSafe = async (payload, options = {}) => {
                 continue;
             }
 
+            /**
+             * Fallback seguro:
+             * en DBs legacy, el caso más común es que NO exista CajaMovimiento.observacion.
+             * Si no pudimos detectar el nombre exacto, probamos eliminando SOLO 'observacion'.
+             */
+            if (!missingCol && finalPayload && Object.prototype.hasOwnProperty.call(finalPayload, 'observacion')) {
+                const clone = { ...finalPayload };
+                delete clone.observacion;
+                finalPayload = clone;
+                continue;
+            }
+
             // Si no podemos detectar cuál, no arriesgamos borrar a ciegas
             break;
         }
@@ -111,21 +123,28 @@ export const registrarIngresoDesdeReciboEnTx = async ({
 
     const numeroRef = r?.numero_recibo ?? r?.id ?? null;
 
-    // ✅ Tomamos observación desde el parámetro, o desde el recibo si existiera.
+    // ✅ Tomamos observación desde el parámetro, o desde el recibo si existiera (incluye observaciones/observacion legacy)
     const obs =
         (observacion != null && String(observacion).trim() !== '')
             ? String(observacion).trim()
-            : (r?.observacion != null && String(r.observacion).trim() !== '')
-                ? String(r.observacion).trim()
-                : (r?.pago_observacion != null && String(r.pago_observacion).trim() !== '')
-                    ? String(r.pago_observacion).trim()
-                    : null;
+            : (r?.observaciones != null && String(r.observaciones).trim() !== '')
+                ? String(r.observaciones).trim()
+                : (r?.observacion != null && String(r.observacion).trim() !== '')
+                    ? String(r.observacion).trim()
+                    : (r?.pago_observacion != null && String(r.pago_observacion).trim() !== '')
+                        ? String(r.pago_observacion).trim()
+                        : null;
+
+    // ✅ Para caja es más seguro priorizar pago_a_cuenta si existe
+    const montoCaja = fix2(
+        (r?.pago_a_cuenta != null ? r.pago_a_cuenta : (r?.monto_pagado != null ? r.monto_pagado : 0)) || 0
+    );
 
     const payload = {
         fecha: r?.fecha || nowYMD,
         hora: r?.hora || horaNow,
         tipo: 'ingreso',
-        monto: fix2(r?.monto_pagado || 0),
+        monto: montoCaja,
         forma_pago_id: forma_pago_id ?? null,
         concepto: (
             (numeroRef != null && numeroRef !== '')
@@ -136,7 +155,7 @@ export const registrarIngresoDesdeReciboEnTx = async ({
         referencia_id: numeroRef,
         usuario_id: usuario_id ?? null,
 
-        // ✅ NUEVO: observación visible en movimientos de caja (si la DB tiene la columna).
+        // ✅ observación visible en movimientos de caja (si la DB tiene la columna).
         observacion: obs
     };
 

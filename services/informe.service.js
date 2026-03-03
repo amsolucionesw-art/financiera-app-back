@@ -330,8 +330,23 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
         case 'creditos': {
             const onlyPend = asBool(query.conCreditosPendientes);
 
+            // Soporte filtro por ID (front puede enviar: creditoId | id | credito_id)
+            const creditoIdRaw =
+                query.creditoId ??
+                query.id ??
+                query.credito_id;
+
+            const creditoIdNum = creditoIdRaw !== undefined && creditoIdRaw !== null && String(creditoIdRaw).trim() !== ''
+                ? Number(creditoIdRaw)
+                : null;
+
             const queryForFilters = { ...query };
             delete queryForFilters.rangoFechaCredito;
+
+            // Capturamos modalidad para poder traducir "refinanciado"
+            const modalidadRaw = queryForFilters.modalidad;
+            // Evitamos que buildFilters intente filtrar modalidad_credito cuando venga "refinanciado"
+            delete queryForFilters.modalidad;
 
             const whereCreditoBase = {
                 ...buildFilters(queryForFilters, {
@@ -339,12 +354,54 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
                     clienteId: { field: 'cliente_id', type: 'eq' },
                     zonaId: { field: '$cliente.zona$', type: 'eq' },
                     estadoCredito: { field: 'estado', type: 'in' },
-                    modalidad: { field: 'modalidad_credito', type: 'in' },
                     tipoCredito: { field: 'tipo_credito', type: 'in' }
                 })
             };
 
+            // ✅ Filtro por ID exacto (si viene)
+            if (Number.isFinite(creditoIdNum) && creditoIdNum > 0) {
+                whereCreditoBase.id = creditoIdNum;
+            }
+
+            // ✅ Modalidad con compat: si el front manda "refinanciado" como modalidad,
+            // en realidad se corresponde con estado='refinanciado' (según tu backend).
+            // Si viene mezcla (ej: "comun,refinanciado"), armamos OR:
+            //   (modalidad_credito IN ['comun', ...]) OR (estado='refinanciado')
+            let whereModalidadExtra = null;
+            if (modalidadRaw !== undefined && modalidadRaw !== null && String(modalidadRaw).trim() !== '') {
+                const norm = (v) => String(v).trim().toLowerCase();
+
+                let items = [];
+                if (Array.isArray(modalidadRaw)) {
+                    items = modalidadRaw.flatMap((x) => String(x).split(','));
+                } else {
+                    items = String(modalidadRaw).split(',');
+                }
+
+                const cleaned = items.map(norm).filter(Boolean);
+
+                const wantsRefinanciado = cleaned.includes('refinanciado');
+
+                const modalidades = cleaned.filter((m) => m !== 'refinanciado');
+
+                const parts = [];
+                if (modalidades.length > 0) {
+                    parts.push({ modalidad_credito: { [Op.in]: modalidades } });
+                }
+                if (wantsRefinanciado) {
+                    parts.push({ estado: 'refinanciado' });
+                }
+
+                if (parts.length === 1) {
+                    // Un solo criterio (o modalidad_credito o estado refinanciado)
+                    whereModalidadExtra = parts[0];
+                } else if (parts.length > 1) {
+                    whereModalidadExtra = { [Op.or]: parts };
+                }
+            }
+
             if (onlyPend === true) {
+                // Mantiene el comportamiento actual: pendientes excluye refinanciado.
                 whereCreditoBase.estado = { [Op.notIn]: ['pagado', 'anulado', 'refinanciado'] };
             }
 
@@ -353,9 +410,13 @@ export const generarInforme = async (tipo = 'clientes', query = {}) => {
 
             const whereRango = dateRangeWhereOr(camposRango, query);
 
-            const whereCredito = whereRango
-                ? { [Op.and]: [whereCreditoBase, whereRango] }
-                : whereCreditoBase;
+            // Construcción final del where para créditos
+            const andParts = [];
+            andParts.push(whereCreditoBase);
+            if (whereModalidadExtra) andParts.push(whereModalidadExtra);
+            if (whereRango) andParts.push(whereRango);
+
+            let whereCredito = andParts.length > 1 ? { [Op.and]: andParts } : andParts[0];
 
             const whereSearch = addGenericSearchForCliente(query.q, 'cliente');
 

@@ -49,36 +49,50 @@ const safeTieneCicloLibreCol = async (t = null) => {
         }
     };
 
-    // Preferimos detectar contra DB (y si hay TX, usarla)
-    const r1 = await tryCall(async () => reciboTieneCicloLibreCol({ transaction: t }));
+    // ✅ Nunca pasar { transaction: null }
+    // Preferimos detectar contra DB (y si hay TX real, usarla)
+    const r1 = await tryCall(async () => {
+        if (!t) return null;
+        return reciboTieneCicloLibreCol({ transaction: t });
+    });
     if (r1 !== null) {
         _cacheTieneCicloLibreCol = r1;
         return _cacheTieneCicloLibreCol;
     }
 
-    const r2 = await tryCall(async () => reciboTieneCicloLibreCol(t));
+    // Algunas implementaciones aceptan directamente el objeto options o tx.
+    // Si t es null, no lo pasamos.
+    const r2 = await tryCall(async () => {
+        if (!t) return null;
+        return reciboTieneCicloLibreCol(t);
+    });
     if (r2 !== null) {
         _cacheTieneCicloLibreCol = r2;
         return _cacheTieneCicloLibreCol;
     }
 
+    // Fallback sin TX (detector “global”)
     const r3 = await tryCall(async () => reciboTieneCicloLibreCol());
     if (r3 !== null) {
         _cacheTieneCicloLibreCol = r3;
         return _cacheTieneCicloLibreCol;
     }
 
-    // Último fallback: si no podemos consultar, asumimos que NO está
+    // Último fallback: no pudimos detectar => asumimos false (conservador)
     _cacheTieneCicloLibreCol = false;
     return _cacheTieneCicloLibreCol;
 };
 
 const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
 
+const getErrMsg = (e) =>
+    String(e?.original?.message || e?.parent?.message || e?.message || '');
+
 const detectMissingColumnByMessage = (e, colName) => {
-    const msg = String(e?.message || '');
-    // Cobertura típica Postgres/Sequelize: "column \"xxx\" does not exist" / "Unknown column" / etc.
-    const re = new RegExp(`\\b${String(colName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+    const msg = getErrMsg(e);
+    // Cobertura típica Postgres/Sequelize: 'column "xxx" does not exist'
+    const safe = String(colName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`\\b${safe}\\b`, 'i');
     return re.test(msg);
 };
 
@@ -99,8 +113,7 @@ const stripCompatColumnsIfNeeded = async ({ attrs, t }) => {
 
     // 2) descuento_sobre / descuento_porcentaje:
     // No hacemos “check de columna” por DB para no agregar dependencias nuevas;
-    // son NULLables: si la DB no las tiene, el create fallará y lo manejamos con retry.
-    // (Acá no se elimina nada preventivamente.)
+    // si la DB no las tiene, el create fallará y lo manejamos con retry.
 
     return attrs;
 };
@@ -124,7 +137,7 @@ export const crearReciboEnTxCompat = async ({
     try {
         return await createReciboSafe(attrs, { transaction: t });
     } catch (e) {
-        const msg = String(e?.message || '');
+        const msg = getErrMsg(e);
 
         // Retry específico: columna faltante Recibo.ciclo_libre
         const esMissingCiclo = (isMissingColumnError?.(e) || /ciclo_libre/i.test(msg));
@@ -136,11 +149,11 @@ export const crearReciboEnTxCompat = async ({
 
         // Retry específico: columnas nuevas de descuento no existen en DB
         const missingDescSobre =
-            isMissingColumnError?.(e) && detectMissingColumnByMessage(e, 'descuento_sobre');
+            (isMissingColumnError?.(e) && detectMissingColumnByMessage(e, 'descuento_sobre'));
         const missingDescPct =
-            isMissingColumnError?.(e) && detectMissingColumnByMessage(e, 'descuento_porcentaje');
+            (isMissingColumnError?.(e) && detectMissingColumnByMessage(e, 'descuento_porcentaje'));
 
-        // Si isMissingColumnError no es confiable en tu entorno, igual cubrimos por string-match
+        // Si isMissingColumnError no es confiable en tu entorno, cubrimos por string-match
         const missingDescSobreLoose = detectMissingColumnByMessage(e, 'descuento_sobre');
         const missingDescPctLoose = detectMissingColumnByMessage(e, 'descuento_porcentaje');
 

@@ -743,6 +743,13 @@ export const crearCredito = async (data, options = {}) => {
     es_credito_anterior = false
   } = data;
 
+  /**
+   * ✅ Cambio solicitado: cobrador NO obligatorio al crear crédito.
+   * Normalizamos para evitar que el front mande "" y reviente la FK / el tipo.
+   */
+  const cobradorIdFinal =
+    cobrador_id === undefined || cobrador_id === null || cobrador_id === '' ? null : cobrador_id;
+
   // Normalización + validación de fechas (incluye soporte de "créditos anteriores")
   const {
     fecha_solicitud: fechaSolicitudFinal,
@@ -763,7 +770,7 @@ export const crearCredito = async (data, options = {}) => {
     const nuevo = await Credito.create(
       {
         cliente_id,
-        cobrador_id,
+        cobrador_id: cobradorIdFinal,
         monto_acreditar,
         fecha_solicitud: fechaSolicitudFinal,
         fecha_acreditacion: fechaAcreditacionFinal, // ✅ caja (desembolso) — ahora soporta histórico
@@ -834,7 +841,7 @@ export const crearCredito = async (data, options = {}) => {
   const nuevo = await Credito.create(
     {
       cliente_id,
-      cobrador_id,
+      cobrador_id: cobradorIdFinal,
       monto_acreditar: calc.capital,
       fecha_solicitud: fechaSolicitudFinal,
       fecha_acreditacion: fechaAcreditacionFinal, // ✅ caja (desembolso) — ahora soporta histórico
@@ -895,6 +902,9 @@ export const actualizarCredito = async (id, data) => {
   if (!existente) throw new Error('Crédito no encontrado');
 
   const {
+    // ✅ NUEVO: permitir asignar/editar/quitar cobrador en update
+    cobrador_id,
+
     monto_acreditar,
     fecha_acreditacion,
     fecha_compromiso_pago,
@@ -912,13 +922,24 @@ export const actualizarCredito = async (id, data) => {
     fecha_corte = null
   } = data;
 
+  /**
+   * ✅ Normalización de cobrador:
+   * - undefined => no tocar
+   * - '' | null => setear NULL
+   * - número/string num => setear valor
+   */
+  const cobradorIdPatch =
+    cobrador_id === undefined ? undefined : (cobrador_id === null || cobrador_id === '' ? null : cobrador_id);
+
   // —— LIBRE ——
   if (modalidad_credito === 'libre') {
     const tasaPorCicloPct = normalizePercent(
       typeof interesInput !== 'undefined' ? interesInput : existente.interes,
       0
     );
-    const capital = toNumber(typeof monto_acreditar !== 'undefined' ? monto_acreditar : existente.monto_acreditar);
+    const capital = toNumber(
+      typeof monto_acreditar !== 'undefined' ? monto_acreditar : existente.monto_acreditar
+    );
 
     // Normalización defensiva (sin flag aquí; en update exigimos coherencia si el usuario cambia fechas)
     const fechaAcreditacionFinal = fecha_acreditacion || existente.fecha_acreditacion || todayYMD();
@@ -934,23 +955,23 @@ export const actualizarCredito = async (id, data) => {
       throw err;
     }
 
-    await Credito.update(
-      {
-        monto_acreditar: capital,
-        fecha_solicitud: fechaSolicitudFinal,
-        fecha_acreditacion: fechaAcreditacionFinal, // ✅ caja
-        fecha_compromiso_pago: fechaCompromisoFinal, // ✅ ancla
-        interes: tasaPorCicloPct,
-        tipo_credito: 'mensual',
-        cantidad_cuotas: 1,
-        modalidad_credito,
-        descuento: 0,
-        monto_total_devolver: fix2(capital),
-        origen_venta_manual_financiada,
-        detalle_producto
-      },
-      { where: { id } }
-    );
+    const patch = {
+      ...(cobradorIdPatch !== undefined ? { cobrador_id: cobradorIdPatch } : {}),
+      monto_acreditar: capital,
+      fecha_solicitud: fechaSolicitudFinal,
+      fecha_acreditacion: fechaAcreditacionFinal, // ✅ caja
+      fecha_compromiso_pago: fechaCompromisoFinal, // ✅ ancla
+      interes: tasaPorCicloPct,
+      tipo_credito: 'mensual',
+      cantidad_cuotas: 1,
+      modalidad_credito,
+      descuento: 0,
+      monto_total_devolver: fix2(capital),
+      origen_venta_manual_financiada,
+      detalle_producto
+    };
+
+    await Credito.update(patch, { where: { id } });
 
     await refrescarCuotaLibre(id);
     return;
@@ -990,25 +1011,25 @@ export const actualizarCredito = async (id, data) => {
     throw err;
   }
 
-  await Credito.update(
-    {
-      monto_acreditar: calc.capital,
-      fecha_solicitud: fechaSolicitudFinal,
-      fecha_acreditacion: fechaAcreditacionFinal, // ✅ caja
-      fecha_compromiso_pago: fechaCompromisoFinal, // ✅ ancla vencimientos
-      interes: calc.interestPct,
-      tipo_credito: nuevoTipo,
-      cantidad_cuotas: nuevasCuotas,
-      modalidad_credito,
-      descuento: calc.descuentoPct,
-      monto_total_devolver: calc.total,
-      saldo_actual: calc.total,
-      interes_acumulado: 0.0,
-      origen_venta_manual_financiada,
-      detalle_producto
-    },
-    { where: { id } }
-  );
+  const patch = {
+    ...(cobradorIdPatch !== undefined ? { cobrador_id: cobradorIdPatch } : {}),
+    monto_acreditar: calc.capital,
+    fecha_solicitud: fechaSolicitudFinal,
+    fecha_acreditacion: fechaAcreditacionFinal, // ✅ caja
+    fecha_compromiso_pago: fechaCompromisoFinal, // ✅ ancla vencimientos
+    interes: calc.interestPct,
+    tipo_credito: nuevoTipo,
+    cantidad_cuotas: nuevasCuotas,
+    modalidad_credito,
+    descuento: calc.descuentoPct,
+    monto_total_devolver: calc.total,
+    saldo_actual: calc.total,
+    interes_acumulado: 0.0,
+    origen_venta_manual_financiada,
+    detalle_producto
+  };
+
+  await Credito.update(patch, { where: { id } });
 
   await Cuota.destroy({ where: { credito_id: id } });
   const actualizado = await Credito.findByPk(id);

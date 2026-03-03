@@ -106,7 +106,6 @@ export const actualizarUsuario = async (id, data) => {
             }
         } else {
             // Si deja de ser cobrador, limpiamos zonas para evitar basura histórica
-            // (no rompe nada aunque no tuviera)
             await usuarioActual.setZonas([], { transaction: t });
         }
 
@@ -132,7 +131,6 @@ export const eliminarUsuario = async (id) => {
 
     // Si es cobrador (rol_id === 2), verificamos si tiene clientes asignados
     if (asInt(usuario.rol_id) === 2) {
-        // Se usa la columna 'cobrador' según tu modelo Cliente
         const clientesAsignados = await Cliente.count({ where: { cobrador: id } });
         if (clientesAsignados > 0) {
             throw new Error('No se puede eliminar un cobrador con clientes asignados');
@@ -151,7 +149,6 @@ export const loginUsuario = async (nombre_usuario, password) => {
 
     const usuario = await Usuario.findOne({
         where: { nombre_usuario: userName },
-        // Traemos password solo para comparar; no lo devolvemos
         attributes: ['id', 'rol_id', 'nombre_completo', 'nombre_usuario', 'password']
     });
 
@@ -160,7 +157,6 @@ export const loginUsuario = async (nombre_usuario, password) => {
     const valid = await bcrypt.compare(pass, usuario.password);
     if (!valid) return null;
 
-    // devolvemos solo lo necesario (sin password)
     return {
         id: usuario.id,
         rol_id: usuario.rol_id,
@@ -169,7 +165,7 @@ export const loginUsuario = async (nombre_usuario, password) => {
 };
 
 /* ──────────────────────────────────────────────────────────
-   COBRADORES (para selects dependientes en CrearCredito.jsx)
+   COBRADORES (para selects dependientes)
    ────────────────────────────────────────────────────────── */
 
 // Básico: ideal para <select> (sin datos sensibles)
@@ -182,28 +178,39 @@ export const obtenerCobradoresBasico = async () => {
     return cobradores;
 };
 
-// Con zonas: para cuando necesites mapear cobertura/filtrado por zona
+// Con zonas: respuesta estable (plain) para evitar inconsistencias de serialización
 export const obtenerCobradoresConZonas = async () => {
     try {
         const cobradores = await Usuario.findAll({
-            where: { rol_id: 2 }, // 2 = cobrador
-            attributes: { exclude: ['password'] },
+            where: { rol_id: 2 },
+            attributes: ['id', 'nombre_completo', 'rol_id'],
             include: [
-                {
-                    model: Role,
-                    as: 'rol',
-                    attributes: ['id', 'nombre_rol']
-                },
                 {
                     model: Zona,
                     as: 'zonas',
                     through: { attributes: [] },
-                    attributes: ['id', 'nombre']
+                    attributes: ['id', 'nombre'],
+                    required: false
                 }
             ],
-            order: [['nombre_completo', 'ASC']]
+            order: [['nombre_completo', 'ASC']],
+            raw: false
         });
-        return cobradores;
+
+        // ✅ Normalizamos a plain + shape fijo
+        return (cobradores || []).map((u) => {
+            const dto = u?.toJSON ? u.toJSON() : u;
+            const zonas = Array.isArray(dto?.zonas) ? dto.zonas : [];
+            return {
+                id: dto.id,
+                nombre_completo: dto.nombre_completo,
+                rol_id: dto.rol_id,
+                zonas: zonas.map((z) => ({
+                    id: z.id,
+                    nombre: z.nombre
+                }))
+            };
+        });
     } catch (error) {
         console.error('Error al obtener cobradores con zonas:', error);
         throw error;

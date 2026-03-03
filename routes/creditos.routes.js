@@ -63,7 +63,9 @@ const calcularInteresProporcionalMin60 = (tipo_credito, cantidad_cuotas) => {
  *  - modalidad = 'progresivo' → cuotas crecientes (suma i/sum)
  *  - modalidad = 'comun'     → cuotas fijas
  * Si se envía fecha_compromiso_pago (YYYY-MM-DD), calcula fecha_vencimiento
- * igual que el servicio real (7/15/30 días por cuota según tipo_credito).
+ * igual que el servicio real:
+ *  - mensual -> +meses (i-1)
+ *  - semanal/quincenal -> +días (7/15/30) * (i-1)
  */
 const construirCuotasPreview = ({
     modalidad_credito,
@@ -110,20 +112,30 @@ const construirCuotasPreview = ({
             .split('-')
             .map((x) => parseInt(x, 10));
 
-        // Para evitar importar date-fns aquí, usamos Date nativo + sumatoria de días
-        const baseDate = new Date(year, month - 1, day);
+        const baseDate = new Date(year, month - 1, day, 12, 0, 0); // mediodía (evita corridas)
 
+        const tipo = String(tipo_credito || '').toLowerCase();
         const diasPorPeriodo =
-            String(tipo_credito).toLowerCase() === 'semanal'
-                ? 7
-                : String(tipo_credito).toLowerCase() === 'quincenal'
-                    ? 15
-                    : 30;
+            tipo === 'semanal' ? 7 : tipo === 'quincenal' ? 15 : 30;
+
+        const addMonthsNative = (date, months) => {
+            const d = new Date(date);
+            const targetMonth = d.getMonth() + Number(months || 0);
+            d.setMonth(targetMonth);
+            return d;
+        };
 
         cuotasArr.forEach((c) => {
-            const offsetDias = diasPorPeriodo * c.numero_cuota;
-            const d = new Date(baseDate);
-            d.setDate(d.getDate() + offsetDias);
+            const idx = Math.max(Number(c.numero_cuota) - 1, 0);
+
+            let d;
+            if (tipo === 'mensual') {
+                d = addMonthsNative(baseDate, idx);
+            } else {
+                d = new Date(baseDate);
+                d.setDate(d.getDate() + diasPorPeriodo * idx);
+            }
+
             const yyyy = d.getFullYear();
             const mm = String(d.getMonth() + 1).padStart(2, '0');
             const dd = String(d.getDate()).padStart(2, '0');
@@ -161,6 +173,12 @@ const parseYMDToLocalDate = (ymdStr) => {
  * - es_credito_anterior: boolean (opcional)
  * - si es_credito_anterior=true => requiere fecha_compromiso_pago (YYYY-MM-DD)
  * - si vienen ambas fechas => fecha_compromiso_pago no puede ser anterior a fecha_acreditacion
+ *
+ * ✅ Soporta "cobrador opcional":
+ * - cobrador_id puede ser null/''/undefined (no se exige)
+ *
+ * ✅ Soporta "interés opcional en LIBRE":
+ * - en LIBRE puede venir undefined (el service aplica default 60)
  */
 function validarPayloadCredito(body = {}, isUpdate = false) {
     const errors = [];
@@ -180,6 +198,9 @@ function validarPayloadCredito(body = {}, isUpdate = false) {
         es_credito_anterior
     } = body ?? {};
 
+    const mod = String(modalidad_credito || '').toLowerCase();
+    const esLibre = mod === 'libre';
+
     // cliente_id
     if (!isUpdate || cliente_id !== undefined) {
         if (!isNum(cliente_id) || Number(cliente_id) <= 0) {
@@ -189,7 +210,6 @@ function validarPayloadCredito(body = {}, isUpdate = false) {
 
     // modalidad_credito
     if (!isUpdate || modalidad_credito !== undefined) {
-        const mod = String(modalidad_credito || '').toLowerCase();
         if (!MODS_VALIDAS.has(mod)) {
             errors.push('modalidad_credito inválida (comun|progresivo|libre)');
         }
@@ -203,10 +223,30 @@ function validarPayloadCredito(body = {}, isUpdate = false) {
         }
     }
 
-    // interes (acepta 0 o mayor)
-    if (!isUpdate || interes !== undefined) {
-        if (!isNum(interes) || Number(interes) < 0) {
-            errors.push('interes debe ser numérico y ≥ 0');
+    // interes
+    // - En creación NO-LIBRE: requerido (porque afecta total)
+    // - En creación LIBRE: opcional (service default 60)
+    // - En update: si viene, se valida
+    if (!isUpdate) {
+        if (!esLibre) {
+            if (!isNum(interes) || Number(interes) < 0) {
+                errors.push('interes es requerido en comun/progresivo y debe ser numérico y ≥ 0');
+            }
+        } else {
+            // libre: si viene, validar; si no viene, OK
+            if (interes !== undefined && interes !== null && interes !== '') {
+                if (!isNum(interes) || Number(interes) < 0) {
+                    errors.push('interes debe ser numérico y ≥ 0 (si se envía)');
+                }
+            }
+        }
+    } else {
+        if (interes !== undefined) {
+            if (interes !== null && interes !== '') {
+                if (!isNum(interes) || Number(interes) < 0) {
+                    errors.push('interes debe ser numérico y ≥ 0');
+                }
+            }
         }
     }
 
@@ -283,6 +323,7 @@ function validarPayloadCredito(body = {}, isUpdate = false) {
     }
 
     // cobrador_id (si viene)
+    // ✅ permitido null/''/undefined (cobrador opcional)
     if (cobrador_id !== undefined && cobrador_id !== null && cobrador_id !== '') {
         if (!isNum(cobrador_id) || Number(cobrador_id) <= 0) {
             errors.push('cobrador_id debe ser numérico positivo si se envía');

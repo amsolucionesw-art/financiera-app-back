@@ -100,13 +100,16 @@ const assertNoPagoSiAnulado = ({ credito }) => {
 };
 
 /**
+ * ✅ Opción C (requerimiento): permitir cobrar SIN cobrador asignado.
+ *
  * Defensa: no permitir pagos si el crédito/cliente no están correctamente asociados.
  * Esto evita que se registren movimientos (pago/recibo/caja) y luego falle el armado de recibo/UI
- * por datos nulos (caso típico: créditos importados sin cobrador/zona).
+ * por datos nulos.
  *
- * Nota: Zona puede ser null (se tolera), pero COBRADOR no: se usa en recibos/reportes.
+ * Nota: Zona puede ser null (se tolera). COBRADOR ahora también se tolera:
+ * - Si no hay cobrador, el recibo debe salir con "Sin cobrador asignado".
  */
-const assertClienteYCobradorValidos = ({ credito, cliente, cobrador }) => {
+const assertClienteYCobradorValidos = ({ credito, cliente /*, cobrador*/ }) => {
     if (!cliente) {
         const err = new Error('El crédito no tiene CLIENTE asociado. No se puede registrar el pago.');
         err.status = 409;
@@ -114,15 +117,22 @@ const assertClienteYCobradorValidos = ({ credito, cliente, cobrador }) => {
         throw err;
     }
 
-    const cobradorId = credito?.cobrador_id ?? null;
-    if (!cobradorId || !cobrador) {
-        const err = new Error(
-            'El crédito no tiene COBRADOR asignado. Asigná un cobrador (y zona si corresponde) antes de cobrar.'
-        );
-        err.status = 409;
-        err.code = 'CREDITO_SIN_COBRADOR';
-        throw err;
-    }
+    // ✅ Antes se bloqueaba si faltaba cobrador.
+    // Opción C: NO bloqueamos. El recibo se emite con "Sin cobrador asignado".
+    // const cobradorId = credito?.cobrador_id ?? null;
+    // if (!cobradorId || !cobrador) { ... throw ... }
+};
+
+/**
+ * Normaliza cobrador para recibos/reportes cuando es null.
+ * Devuelve un objeto "compatible" con el uso habitual (nombre_completo / id).
+ */
+const getCobradorSafe = (cobrador) => {
+    if (cobrador) return cobrador;
+    return {
+        id: null,
+        nombre_completo: 'Sin cobrador asignado'
+    };
 };
 
 const assertFormaPagoValida = ({ medioPago, forma_pago_id }) => {
@@ -1045,6 +1055,7 @@ const pagarCuotaTotal = async ({
 
         const cliente = await Cliente.findByPk(credito.cliente_id, { transaction: t });
         const cobrador = await Usuario.findByPk(credito.cobrador_id, { transaction: t });
+        const cobradorSafe = getCobradorSafe(cobrador);
         const medioPago = await FormaPago.findByPk(forma_pago_id, { transaction: t });
 
         // ✅ Validaciones fuertes ANTES de registrar movimientos
@@ -1061,7 +1072,7 @@ const pagarCuotaTotal = async ({
                 cuota,
                 credito,
                 cliente,
-                cobrador,
+                cobrador: cobradorSafe,
                 medioPago,
                 forma_pago_id,
                 descuento,
@@ -1127,7 +1138,7 @@ const pagarCuotaTotal = async ({
 
         const datosRecibo = armarDatosRecibo({
             cliente,
-            cobrador,
+            cobrador: cobradorSafe,
             pago,
             cuota,
             credito,
@@ -1202,6 +1213,7 @@ export const registrarPagoParcial = async ({
 
         const cliente = await Cliente.findByPk(credito.cliente_id, { transaction: t });
         const cobrador = await Usuario.findByPk(credito.cobrador_id, { transaction: t });
+        const cobradorSafe = getCobradorSafe(cobrador);
         const medioPago = await FormaPago.findByPk(forma_pago_id, { transaction: t });
 
         // ✅ Validaciones fuertes ANTES de registrar movimientos
@@ -1218,7 +1230,7 @@ export const registrarPagoParcial = async ({
                 cuota,
                 credito,
                 cliente,
-                cobrador,
+                cobrador: cobradorSafe,
                 medioPago,
                 cuota_id,
                 monto_pagado,
@@ -1310,7 +1322,7 @@ export const registrarPagoParcial = async ({
 
         const datosRecibo = armarDatosRecibo({
             cliente,
-            cobrador,
+            cobrador: cobradorSafe,
             pago,
             cuota,
             credito,

@@ -364,6 +364,7 @@ export const armarDatosRecibo = ({
             typeof saldoCuotaActual === 'number' ? saldoCuotaActual : toNumber(saldoPrincipalDespues)
         ),
 
+        // ✅ Ya soporta cobrador null
         nombre_cobrador: cobrador?.nombre_completo || 'Sin cobrador asignado',
         medio_pago: medioPagoFinal,
 

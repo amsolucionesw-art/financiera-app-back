@@ -124,6 +124,19 @@ const safeTieneCicloLibreCol = async (t = null) => {
 };
 
 /* =============================================================================
+   ✅ Opción C: permitir pagos sin cobrador.
+   - Normalizamos cobrador para que armarDatosRecibo / recibos no exploten
+   - Se imprime "Sin cobrador asignado"
+   ============================================================================= */
+const getCobradorSafe = (cobrador) => {
+    if (cobrador) return cobrador;
+    return {
+        id: null,
+        nombre_completo: 'Sin cobrador asignado'
+    };
+};
+
+/* =============================================================================
    ✅ Tag de ciclo (ALINEADO con cuota.utils.js)
    - Siempre se escribe en `concepto` como: [ciclo_libre:N]
    - cuota.utils.js traduce where.ciclo_libre -> concepto ILIKE '%[ciclo_libre:N]%' si falta columna
@@ -146,22 +159,6 @@ const appendCicloTagEnReciboPayload = (payload, ciclo) => {
 
 /* =============================================================================
    ✅ Descuentos: persistencia + efecto contable en resumen LIBRE
-
-   PROBLEMA REAL (tu caso):
-   - El FRONT manda descuento_mora / descuento_interes.
-   - El recibo se creaba con descuento_aplicado=0 y sin “pagar” el descuento a nivel
-     de campos usados por el resumen (mora_cobrada / interes_ciclo_cobrado).
-   - Entonces el resumen y la ficha quedaban como si no existiera el descuento.
-
-   SOLUCIÓN:
-   1) Persistimos SIEMPRE en recibo:
-      - descuento_aplicado (en $)
-      - descuento_sobre (mora/interes/total)
-      - descuento_porcentaje (cuando aplica 1 solo %, si son 2 => NULL para no mentir)
-   2) Para que la deuda pendiente baje (resumen/ficha), el descuento debe “contar” como
-      cancelación de mora/interés. Para eso:
-      - sumamos el descuento a mora_cobrada / interes_ciclo_cobrado (según corresponda)
-      - monto_pagado NO cambia (caja sigue correcta).
    ============================================================================= */
 
 const buildDescuentoMeta = ({ pctMora, pctInteres }) => {
@@ -1006,6 +1003,9 @@ export const pagarCuotaLibreEnTx = async ({
     assertNoPagoSiRefinanciado({ credito, cuota });
     assertNoPagoSiAnulado({ credito });
 
+    // ✅ Opción C: cobrador puede ser null
+    const cobradorSafe = getCobradorSafe(cobrador);
+
     const hoyYMD_TZ = todayYMD();
 
     const saldoCapitalAntes = fix2(credito.saldo_actual);
@@ -1028,7 +1028,7 @@ export const pagarCuotaLibreEnTx = async ({
     let moraTotal = 0;
 
     let moraBonificadaTotal = 0;
-    let interesBonificadoTotal = 0;
+    let interesBonificadaTotal = 0;
 
     for (let c = 1; c <= cicloActual; c++) {
         const det = await deudaLibrePorCiclo({
@@ -1140,7 +1140,7 @@ export const pagarCuotaLibreEnTx = async ({
             cuota,
             pago,
             cliente,
-            cobrador,
+            cobrador: cobradorSafe,
             medioPagoNombre: medioPago?.nombre ?? 'N/D',
             importeOriginalCuota: fix2(toNumber(cuota.importe_cuota || saldoCapitalAntes)),
 
@@ -1369,7 +1369,7 @@ export const pagarCuotaLibreEnTx = async ({
         cuota,
         pago,
         cliente,
-        cobrador,
+        cobrador: cobradorSafe,
         medioPagoNombre: medioPago?.nombre ?? 'N/D',
         importeOriginalCuota: fix2(toNumber(cuota.importe_cuota || saldoCapitalAntes)),
 
@@ -1505,6 +1505,9 @@ export const registrarPagoParcialLibreEnTx = async ({
     assertNoPagoSiRefinanciado({ credito, cuota });
     assertNoPagoSiAnulado({ credito });
 
+    // ✅ Opción C: cobrador puede ser null
+    const cobradorSafe = getCobradorSafe(cobrador);
+
     const hoyYMD_TZ = todayYMD();
 
     const resumen = await obtenerResumenLibrePorCredito(credito.id, ymdDate(hoyYMD_TZ));
@@ -1617,7 +1620,7 @@ export const registrarPagoParcialLibreEnTx = async ({
 
     const reciboBase = {
         cliente,
-        cobrador,
+        cobrador: cobradorSafe,
         pago,
         cuota,
         credito,

@@ -53,10 +53,10 @@ const normalizePct = (v) => {
 const getModalidadFromCuota = (cuota) => {
     // Intentamos cubrir distintas formas de retorno del service
     const m =
-        cuota?.Credito?.modalidad ??
         cuota?.Credito?.modalidad_credito ??
-        cuota?.credito?.modalidad ??
+        cuota?.Credito?.modalidad ??
         cuota?.credito?.modalidad_credito ??
+        cuota?.credito?.modalidad ??
         cuota?.credito?.tipo ??
         null;
 
@@ -67,8 +67,10 @@ const resolveModalidadByCreditoId = async (creditoId) => {
     if (!creditoId) return null;
     try {
         const { default: Credito } = await import('../models/Credito.js');
-        const c = await Credito.findByPk(creditoId, { attributes: ['id', 'modalidad'] });
-        const m = c?.modalidad ? String(c.modalidad).toLowerCase() : null;
+
+        // ✅ FIX: el modelo usa `modalidad_credito` (no `modalidad`)
+        const c = await Credito.findByPk(creditoId, { attributes: ['id', 'modalidad_credito'] });
+        const m = c?.modalidad_credito ? String(c.modalidad_credito).toLowerCase() : null;
         return m;
     } catch {
         // si el modelo no está en esa ruta o falla, devolvemos null

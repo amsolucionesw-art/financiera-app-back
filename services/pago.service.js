@@ -10,9 +10,53 @@ import FormaPago from '../models/FormaPago.js';
 
 /* ───────────────── Helpers básicos ───────────────── */
 
+/**
+ * Sanitiza números aceptando:
+ * - number
+ * - "1234.56"
+ * - "1234,56"
+ * - "1.234,56" / "1,234.56" (best-effort)
+ */
 const sanitizeNumber = (value) => {
     if (value === null || value === undefined) return 0;
-    const n = Number(String(value).replace(',', '.'));
+
+    if (typeof value === 'number') {
+        return Number.isFinite(value) ? value : 0;
+    }
+
+    if (typeof value === 'string') {
+        const trimmed = value.trim();
+        if (trimmed === '') return 0;
+
+        // Si tiene coma y punto, asumimos que el separador decimal es el ÚLTIMO que aparezca.
+        const lastComma = trimmed.lastIndexOf(',');
+        const lastDot = trimmed.lastIndexOf('.');
+
+        let normalized = trimmed;
+
+        if (lastComma !== -1 && lastDot !== -1) {
+            // Ej "1.234,56" => decimal ","; Ej "1,234.56" => decimal "."
+            if (lastComma > lastDot) {
+                // decimal coma: quitamos miles "." y cambiamos coma por punto
+                normalized = trimmed.replace(/\./g, '').replace(',', '.');
+            } else {
+                // decimal punto: quitamos miles "," (o espacios)
+                normalized = trimmed.replace(/,/g, '');
+            }
+        } else {
+            // Solo coma: decimal coma
+            if (lastComma !== -1) normalized = trimmed.replace(',', '.');
+            // Solo punto: decimal punto (ok)
+        }
+
+        // Limpieza final de espacios
+        normalized = normalized.replace(/\s+/g, '');
+
+        const n = Number(normalized);
+        return Number.isFinite(n) ? n : 0;
+    }
+
+    const n = Number(value);
     return Number.isFinite(n) ? n : 0;
 };
 
@@ -136,7 +180,10 @@ export const registrarPago = async (req, res) => {
         const isSuper = Number(rolId) === 0;
 
         const scopeNorm = normScope(descuento_scope);
-        const interesPct = descuento_interes != null && String(descuento_interes).trim() !== '' ? clampPct(descuento_interes) : null;
+        const interesPct =
+            descuento_interes != null && String(descuento_interes).trim() !== ''
+                ? clampPct(descuento_interes)
+                : null;
 
         // Si no es super o no es LIBRE, no permitimos interés/scope (se ignoran)
         const descuento_scope_final = (libre && isSuper && scopeNorm) ? scopeNorm : null;
@@ -156,7 +203,8 @@ export const registrarPago = async (req, res) => {
 
             // legacy
             descuento: descuentoFinal,
-            descuento_mora: descuento_mora,
+            // ✅ mandamos numérico para evitar que viaje string
+            descuento_mora: descuento_mora != null ? sanitizeNumber(descuento_mora) : null,
 
             // ✅ NUEVO (LIBRE): viaja a cuota.service.js y de ahí a cuota.libre.service.js
             descuento_scope: descuento_scope_autofix,
@@ -191,8 +239,10 @@ export const registrarPagoTotal = async (req, res) => {
 
             // Se mantiene igual
             descuento = 0,
-            descuento_mora = null
+            descuento_mora = null,
 
+            // ✅ si viene del middleware/admin, lo dejamos viajar (no rompe nada)
+            descuento_scope = null
             // ❌ NO agregamos descuento_interes acá a propósito:
             // el requerimiento fue SOLO para pagos parciales en LIBRE.
         } = req.body ?? {};
@@ -242,6 +292,10 @@ export const registrarPagoTotal = async (req, res) => {
             cuota_id: cuotaIdInt,
             forma_pago_id: formaPagoIdInt,
             descuento: descuentoFinal,
+            // ✅ coherencia: si viene, lo pasamos
+            descuento_scope: descuento_scope ? normScope(descuento_scope) : null,
+            // ✅ mandamos numérico para evitar que viaje string
+            descuento_mora: descuento_mora != null ? sanitizeNumber(descuento_mora) : null,
             observacion,
             usuario_id: usuarioId ?? undefined,
             rol_id: rolId ?? undefined

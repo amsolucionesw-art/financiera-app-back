@@ -77,6 +77,44 @@ const assertDniDisponible = async (dni, { excludeId = null } = {}) => {
     LISTADOS (full y básico para selects)
    ────────────────────────────────────────────────────────── */
 
+const absolutizeDniFoto = (plain) => {
+    if (!plain) return plain;
+
+    if (plain.dni_foto && typeof plain.dni_foto === 'string') {
+        const s = plain.dni_foto.trim();
+        // si ya viene absoluta, no tocamos
+        if (/^https?:\/\//i.test(s)) return plain;
+
+        // si viene como filename o path relativo, lo absolutizamos
+        const filename = s.includes('/') ? s.split('/').filter(Boolean).pop() : s;
+        plain.dni_foto = `${BASE_URL}/uploads/dni/${filename}`;
+    }
+
+    return plain;
+};
+
+/**
+ * ✅ Normaliza output para el front:
+ * - agrega zonaId y cobradorId (fuentes únicas y estables)
+ * - respeta feature flag dni_foto
+ */
+const normalizeClienteForFront = (plain) => {
+    if (!plain) return plain;
+
+    // Fuente única para selects en front
+    plain.zonaId = plain.zona ?? plain?.clienteZona?.id ?? null;
+    plain.cobradorId = plain.cobrador ?? plain?.cobradorUsuario?.id ?? null;
+
+    // Sanitizamos salida para no exponer dni_foto si feature flag está apagado
+    if (!DNI_FOTO_ENABLED && Object.prototype.hasOwnProperty.call(plain, 'dni_foto')) {
+        delete plain.dni_foto;
+    } else {
+        absolutizeDniFoto(plain);
+    }
+
+    return plain;
+};
+
 // 🟢 Obtener todos los clientes con filtros opcionales (listado completo)
 export const obtenerClientes = async (query) => {
     const where = buildFilters(query, ['dni', 'zona', 'cobrador', 'apellido', 'localidad']);
@@ -89,15 +127,9 @@ export const obtenerClientes = async (query) => {
         ],
     });
 
-    // ✅ Sanitizamos salida para no exponer dni_foto si feature flag está apagado
     return (clientes || []).map((c) => {
         const plain = c?.toJSON ? c.toJSON() : c;
-        if (!DNI_FOTO_ENABLED && plain && Object.prototype.hasOwnProperty.call(plain, 'dni_foto')) {
-            delete plain.dni_foto;
-        } else {
-            absolutizeDniFoto(plain);
-        }
-        return plain;
+        return normalizeClienteForFront(plain);
     });
 };
 
@@ -119,22 +151,6 @@ export const obtenerClientesBasico = async (query = {}) => {
 /* ──────────────────────────────────────────────────────────
    CRUD / CONSULTAS
    ────────────────────────────────────────────────────────── */
-
-const absolutizeDniFoto = (plain) => {
-    if (!plain) return plain;
-
-    if (plain.dni_foto && typeof plain.dni_foto === 'string') {
-        const s = plain.dni_foto.trim();
-        // si ya viene absoluta, no tocamos
-        if (/^https?:\/\//i.test(s)) return plain;
-
-        // si viene como filename o path relativo, lo absolutizamos
-        const filename = s.includes('/') ? s.split('/').filter(Boolean).pop() : s;
-        plain.dni_foto = `${BASE_URL}/uploads/dni/${filename}`;
-    }
-
-    return plain;
-};
 
 /**
  * Para cartera del cobrador: estado “operativo” inferido por cuotas.
@@ -182,15 +198,7 @@ export const obtenerClientePorId = async (id) => {
     if (!cliente) return null;
 
     const plain = cliente.toJSON();
-
-    // ✅ Si DNI_FOTO_ENABLED está apagado, NO exponemos dni_foto
-    if (!DNI_FOTO_ENABLED && Object.prototype.hasOwnProperty.call(plain, 'dni_foto')) {
-        delete plain.dni_foto;
-    } else {
-        absolutizeDniFoto(plain);
-    }
-
-    return plain;
+    return normalizeClienteForFront(plain);
 };
 
 // 🟢 Obtener clientes por cobrador con créditos y cuotas
@@ -213,15 +221,10 @@ export const obtenerClientesPorCobrador = async (cobradorId) => {
         ],
     });
 
-    // ✅ devolvemos plain JSON + estado coherente con cuotas (para evitar fichas “viejas”)
     return (clientes || []).map((c) => {
         const plain = c?.toJSON ? c.toJSON() : c;
 
-        if (!DNI_FOTO_ENABLED && plain && Object.prototype.hasOwnProperty.call(plain, 'dni_foto')) {
-            delete plain.dni_foto;
-        } else {
-            absolutizeDniFoto(plain);
-        }
+        normalizeClienteForFront(plain);
 
         if (Array.isArray(plain.creditos)) {
             plain.creditos = plain.creditos.map((cred) => {
