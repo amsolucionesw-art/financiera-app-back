@@ -74,6 +74,68 @@ const assertDniDisponible = async (dni, { excludeId = null } = {}) => {
 };
 
 /* ──────────────────────────────────────────────────────────
+    Buscador (nombre/apellido/dni/cobrador)
+   ────────────────────────────────────────────────────────── */
+
+/**
+ * Soporta varios nombres de query param sin “adivinar” uno solo:
+ * - search / q / term / query / texto / filtro / busqueda
+ */
+const getSearchTerm = (query = {}) => {
+    const candidates = [
+        query.search,
+        query.q,
+        query.term,
+        query.query,
+        query.texto,
+        query.filtro,
+        query.busqueda,
+    ];
+    const found = candidates.find((v) => str(v));
+    return str(found);
+};
+
+/**
+ * Inyecta búsqueda libre en el WHERE existente.
+ * Incluye:
+ * - nombre
+ * - apellido  ✅ (fix)
+ * - dni
+ * - cobradorUsuario.nombre_completo (si está el include)
+ * - "nombre apellido" y "apellido nombre" (concat)
+ */
+const withSearchWhere = (baseWhere, query = {}) => {
+    const term = getSearchTerm(query);
+    if (!term) return baseWhere || {};
+
+    const like = `%${term}%`;
+    const sequelize = Cliente.sequelize;
+
+    const or = [
+        { nombre: { [Op.iLike]: like } },
+        { apellido: { [Op.iLike]: like } }, // ✅ clave
+        { dni: { [Op.iLike]: like } },
+        // requiere include de cobradorUsuario (lo agregamos en los findAll)
+        { '$cobradorUsuario.nombre_completo$': { [Op.iLike]: like } },
+
+        // búsqueda por nombre completo (y al revés)
+        sequelize.where(
+            sequelize.fn('concat', sequelize.col('nombre'), ' ', sequelize.col('apellido')),
+            { [Op.iLike]: like }
+        ),
+        sequelize.where(
+            sequelize.fn('concat', sequelize.col('apellido'), ' ', sequelize.col('nombre')),
+            { [Op.iLike]: like }
+        ),
+    ];
+
+    const base = baseWhere && Object.keys(baseWhere).length ? baseWhere : null;
+    if (!base) return { [Op.or]: or };
+
+    return { [Op.and]: [base, { [Op.or]: or }] };
+};
+
+/* ──────────────────────────────────────────────────────────
     LISTADOS (full y básico para selects)
    ────────────────────────────────────────────────────────── */
 
@@ -117,13 +179,17 @@ const normalizeClienteForFront = (plain) => {
 
 // 🟢 Obtener todos los clientes con filtros opcionales (listado completo)
 export const obtenerClientes = async (query) => {
-    const where = buildFilters(query, ['dni', 'zona', 'cobrador', 'apellido', 'localidad']);
+    // base filters (zona/cobrador/apellido/localidad/etc.)
+    const baseWhere = buildFilters(query, ['dni', 'zona', 'cobrador', 'apellido', 'localidad']);
+
+    // ✅ agregamos búsqueda libre que incluya apellido
+    const where = withSearchWhere(baseWhere, query);
 
     const clientes = await Cliente.findAll({
         where,
         include: [
-            { model: Usuario, as: 'cobradorUsuario', attributes: ['id', 'nombre_completo'] },
-            { model: Zona, as: 'clienteZona', attributes: ['id', 'nombre'] },
+            { model: Usuario, as: 'cobradorUsuario', attributes: ['id', 'nombre_completo'], required: false },
+            { model: Zona, as: 'clienteZona', attributes: ['id', 'nombre'], required: false },
         ],
     });
 
@@ -135,12 +201,17 @@ export const obtenerClientes = async (query) => {
 
 // 🟢 Obtener clientes en formato básico (ideal para <select>), con filtros opcionales
 export const obtenerClientesBasico = async (query = {}) => {
-    const where = buildFilters(query, ['dni', 'zona', 'cobrador', 'apellido', 'localidad']);
+    const baseWhere = buildFilters(query, ['dni', 'zona', 'cobrador', 'apellido', 'localidad']);
+    const where = withSearchWhere(baseWhere, query);
 
     return Cliente.findAll({
         where,
         // ✅ Incluimos DNI para poder mostrarlo en el selector
         attributes: ['id', 'nombre', 'apellido', 'dni', 'cobrador', 'zona'],
+        // ✅ include “silencioso” para poder filtrar por nombre del cobrador cuando haya búsqueda libre
+        include: [
+            { model: Usuario, as: 'cobradorUsuario', attributes: [], required: false },
+        ],
         order: [
             ['apellido', 'ASC'],
             ['nombre', 'ASC'],

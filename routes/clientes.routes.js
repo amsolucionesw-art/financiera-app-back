@@ -27,7 +27,7 @@ import Credito from '../models/Credito.js';
 const router = Router();
 
 /* ──────────────────────────────────────────────────────────
-   Feature flags
+    Feature flags
    ────────────────────────────────────────────────────────── */
 const parseBool = (v, def = false) => {
   if (v == null) return def;
@@ -41,7 +41,7 @@ const parseBool = (v, def = false) => {
 const DNI_FOTO_ENABLED = parseBool(process.env.DNI_FOTO_ENABLED, false);
 
 /* ──────────────────────────────────────────────────────────
-   Helpers
+    Helpers
    ────────────────────────────────────────────────────────── */
 const getRoleIdFromReq = (req) => {
   // Intentamos varios formatos posibles sin asumir cómo está implementado verifyToken/checkRole
