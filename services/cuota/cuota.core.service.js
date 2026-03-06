@@ -181,6 +181,91 @@ const resolveRolIdInTx = async ({ t, rol_id, usuario_id }) => {
     return Number.isFinite(r) ? r : null;
 };
 
+/**
+ * ✅ NUEVO:
+ * Enriquece pagos con el descuento de mora aplicado en recibos, para que
+ * la simulación de mora NO-LIBRE pueda reconstruir correctamente la deuda.
+ *
+ * Devuelve un Map:
+ *   cuota_id -> pagos enriquecidos [{ id, cuota_id, monto_pagado, fecha_pago, recibo: { descuento_aplicado } }]
+ *
+ * Nota:
+ * - No dependemos de aliases de asociaciones Recibo<->Pago.
+ * - Leemos recibos por pago_id, que es el vínculo estable real.
+ */
+const mapearPagosConRecibosParaMoraPorCuota = async (cuotas = [], t = null) => {
+    const cuotasArr = Array.isArray(cuotas) ? cuotas : [];
+    const pagosPlanos = [];
+
+    for (const cuota of cuotasArr) {
+        const cuotaId = Number(cuota?.id);
+        const pagos = Array.isArray(cuota?.pagos) ? cuota.pagos : [];
+
+        for (const pago of pagos) {
+            const plain = typeof pago?.get === 'function'
+                ? pago.get({ plain: true })
+                : { ...(pago ?? {}) };
+
+            pagosPlanos.push({
+                ...plain,
+                cuota_id: Number(plain?.cuota_id ?? cuotaId ?? 0)
+            });
+        }
+    }
+
+    const pagoIds = [
+        ...new Set(
+            pagosPlanos
+                .map(p => Number(p?.id))
+                .filter(id => Number.isFinite(id) && id > 0)
+        )
+    ];
+
+    const descuentoPorPagoId = new Map();
+
+    if (pagoIds.length > 0) {
+        const recibos = await findAllReciboSafe({
+            where: { pago_id: { [Op.in]: pagoIds } },
+            attributes: ['pago_id', 'descuento_aplicado'],
+            transaction: t
+        });
+
+        for (const r of recibos) {
+            const pagoId = Number(r?.pago_id);
+            if (!Number.isFinite(pagoId) || pagoId <= 0) continue;
+
+            const acumPrevio = fix2(descuentoPorPagoId.get(pagoId) ?? 0);
+            const descuento = fix2(toNumber(r?.descuento_aplicado));
+            descuentoPorPagoId.set(pagoId, fix2(acumPrevio + descuento));
+        }
+    }
+
+    const pagosPorCuota = new Map();
+
+    for (const p of pagosPlanos) {
+        const cuotaId = Number(p?.cuota_id);
+        if (!Number.isFinite(cuotaId) || cuotaId <= 0) continue;
+
+        const pagoId = Number(p?.id);
+        const descuentoAplicado =
+            Number.isFinite(pagoId) && pagoId > 0
+                ? fix2(descuentoPorPagoId.get(pagoId) ?? 0)
+                : 0;
+
+        const enriched = {
+            ...p,
+            recibo: {
+                descuento_aplicado: descuentoAplicado
+            }
+        };
+
+        if (!pagosPorCuota.has(cuotaId)) pagosPorCuota.set(cuotaId, []);
+        pagosPorCuota.get(cuotaId).push(enriched);
+    }
+
+    return pagosPorCuota;
+};
+
 /* ───────────────── Vencimientos ───────────────── */
 export const actualizarCuotasVencidas = async () => {
     const hoy = todayYMD(); // YMD en TZ negocio
@@ -248,7 +333,7 @@ export const recalcularMoraCuota = async (cuotaId, t = null) => {
             {
                 model: Pago,
                 as: 'pagos',
-                attributes: ['id', 'monto_pagado', 'fecha_pago']
+                attributes: ['id', 'cuota_id', 'monto_pagado', 'fecha_pago']
             }
         ],
         transaction: t
@@ -318,7 +403,10 @@ export const recalcularMoraCuota = async (cuotaId, t = null) => {
         }
     }
 
-    const { moraPendiente } = simularMoraCuotaHasta(cuota, cuota.pagos, hoyTZ);
+    const pagosPorCuota = await mapearPagosConRecibosParaMoraPorCuota([cuota], t);
+    const pagosEnriquecidos = pagosPorCuota.get(Number(cuota.id)) ?? [];
+
+    const { moraPendiente } = simularMoraCuotaHasta(cuota, pagosEnriquecidos, hoyTZ);
 
     const updates = { intereses_vencidos_acumulados: moraPendiente };
     if (nuevoEstado && nuevoEstado !== cuota.estado) {
@@ -382,9 +470,11 @@ export const recalcularMoraPorCredito = async (creditoId, t = null) => {
 
     const cuotas = await Cuota.findAll({
         where: { credito_id: creditoId },
-        include: [{ model: Pago, as: 'pagos', attributes: ['id', 'monto_pagado', 'fecha_pago'] }],
+        include: [{ model: Pago, as: 'pagos', attributes: ['id', 'cuota_id', 'monto_pagado', 'fecha_pago'] }],
         transaction: t
     });
+
+    const pagosPorCuota = await mapearPagosConRecibosParaMoraPorCuota(cuotas, t);
 
     let total = 0;
     for (const c of cuotas) {
@@ -399,7 +489,8 @@ export const recalcularMoraPorCredito = async (creditoId, t = null) => {
             continue;
         }
 
-        const { moraPendiente } = simularMoraCuotaHasta(c, c.pagos, hoyTZ);
+        const pagosEnriquecidos = pagosPorCuota.get(Number(c.id)) ?? [];
+        const { moraPendiente } = simularMoraCuotaHasta(c, pagosEnriquecidos, hoyTZ);
 
         // 💡 NO-LIBRE: sincronizamos también el estado vencida/pendiente/parcial
         let nuevoEstado = c.estado;
@@ -465,7 +556,7 @@ export const obtenerCuotasPorCredito = async (creditoId) => {
             {
                 model: Pago,
                 as: 'pagos',
-                attributes: ['id', 'monto_pagado', 'fecha_pago'],
+                attributes: ['id', 'cuota_id', 'monto_pagado', 'fecha_pago'],
                 include: [{ model: FormaPago, as: 'formaPago', attributes: ['nombre'] }]
             }
         ],
@@ -511,12 +602,14 @@ export const obtenerCuotasVencidas = async (query = {}) => {
         include: [{
             model: Pago,
             as: 'pagos',
-            attributes: ['monto_pagado', 'fecha_pago']
+            attributes: ['id', 'cuota_id', 'monto_pagado', 'fecha_pago']
         }],
         order: [['fecha_vencimiento', 'ASC']]
     });
 
     if (cuotas.length === 0) return [];
+
+    const pagosPorCuota = await mapearPagosConRecibosParaMoraPorCuota(cuotas);
 
     const creditoIds = [...new Set(cuotas.map(c => c.credito_id))];
     const creditos = await Credito.findAll({
@@ -568,7 +661,8 @@ export const obtenerCuotasVencidas = async (query = {}) => {
         const diasVencida = differenceInCalendarDays(ymdDate(hoy), ymdDate(c.fecha_vencimiento));
         if (minDiasVencida && diasVencida < minDiasVencida) continue;
 
-        const sim = simularMoraCuotaHasta(c, c.pagos, hoy);
+        const pagosEnriquecidos = pagosPorCuota.get(Number(c.id)) ?? [];
+        const sim = simularMoraCuotaHasta(c, pagosEnriquecidos, hoy);
 
         const mora_pendiente = fix2(sim.moraPendiente);
         const saldo_principal_pendiente = fix2(sim.saldoPrincipalPendiente);
@@ -730,11 +824,13 @@ export const obtenerRutaCobroCobrador = async ({
             include: [{
                 model: Pago,
                 as: 'pagos',
-                attributes: ['monto_pagado', 'fecha_pago']
+                attributes: ['id', 'cuota_id', 'monto_pagado', 'fecha_pago']
             }],
             order: [['fecha_vencimiento', 'ASC'], ['numero_cuota', 'ASC']]
         });
     }
+
+    const pagosPorCuota = await mapearPagosConRecibosParaMoraPorCuota(cuotas);
 
     /* ─────────────── Clientes (NO-LIBRE) ─────────────── */
     const clienteIdsNoLibre = [...new Set(creditosNoLibre.map(cr => cr.cliente_id))];
@@ -856,7 +952,8 @@ export const obtenerRutaCobroCobrador = async ({
                 ? Math.max(differenceInCalendarDays(hoyDate, ymdDate(fv)), 0)
                 : 0;
 
-        const sim = simularMoraCuotaHasta(c, c.pagos, hoyDate);
+        const pagosEnriquecidos = pagosPorCuota.get(Number(c.id)) ?? [];
+        const sim = simularMoraCuotaHasta(c, pagosEnriquecidos, hoyDate);
         const mora_pendiente = fix2(sim.moraPendiente);
         const saldo_principal_pendiente = fix2(sim.saldoPrincipalPendiente);
         const total_a_pagar_hoy = fix2(mora_pendiente + saldo_principal_pendiente);

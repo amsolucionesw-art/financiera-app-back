@@ -1,12 +1,17 @@
 // financiera-backend/services/credito/credito.pdf.service.js
 // Generación de PDF para ficha del crédito (aislado para no inflar el service principal).
 //
-// ✅ Mejoras incluidas (camino A):
+// ✅ Mejoras incluidas:
 // - Logo desde financiera-backend/assets/logo.png (en runtime: process.cwd()/assets/logo.png)
 // - Header prolijo (logo + título + fecha)
 // - Secciones con cajas/sombreado suave
 // - Tabla con encabezado sombreado + repetición de encabezado al saltar de página
 // - Corte de página automático para no “romper” filas
+// - Ajuste de tabla de cuotas para importes largos:
+//   * columnas rebalanceadas
+//   * tamaño de fuente levemente menor
+//   * altura de fila dinámica
+//   * montos compactados para evitar cortes visuales
 
 import { obtenerCreditoPorId } from './credito.core.service.js';
 
@@ -26,13 +31,94 @@ import { obtenerFechasCiclosLibre } from './credito.libre.service.js';
 import fs from 'fs';
 import path from 'path';
 
+/* ===================== Helpers descuento / mora ===================== */
+
+const getPagoDescuento = (pago) => {
+  return fix2(
+    toNumber(
+      pago?.descuento_aplicado ??
+      pago?.descuento ??
+      pago?.recibo?.descuento_aplicado ??
+      pago?.recibo?.descuento ??
+      pago?.recibo_ui?.descuento_aplicado ??
+      0
+    )
+  );
+};
+
+const getCuotaDescuentoMora = (cuota) => {
+  const consolidado = fix2(
+    toNumber(
+      cuota?.descuento_aplicado ??
+      cuota?.descuento_aplicado_total ??
+      0
+    )
+  );
+  if (consolidado > 0) return consolidado;
+
+  const pagos = Array.isArray(cuota?.pagos) ? cuota.pagos : [];
+  const descuentoDesdePagos = fix2(
+    pagos.reduce((acc, p) => acc + getPagoDescuento(p), 0)
+  );
+
+  if (descuentoDesdePagos > 0) return descuentoDesdePagos;
+  return fix2(toNumber(cuota?.descuento_cuota ?? 0));
+};
+
+const getCuotaMoraBruta = (cuota) =>
+  fix2(toNumber(cuota?.intereses_vencidos_acumulados ?? 0));
+
+const getCuotaSaldoMora = (cuota) => {
+  const saldoMora = cuota?.saldo_mora;
+  if (saldoMora !== undefined && saldoMora !== null) {
+    return fix2(toNumber(saldoMora));
+  }
+  return null;
+};
+
+const getCuotaMoraNeta = (cuota) => {
+  const moraNetaConsolidada = cuota?.mora_neta;
+  if (moraNetaConsolidada !== undefined && moraNetaConsolidada !== null) {
+    return fix2(toNumber(moraNetaConsolidada));
+  }
+
+  const saldoMora = getCuotaSaldoMora(cuota);
+  if (saldoMora !== null) return saldoMora;
+
+  const moraBruta = getCuotaMoraBruta(cuota);
+  const descuentoMora = getCuotaDescuentoMora(cuota);
+  return fix2(Math.max(moraBruta - descuentoMora, 0));
+};
+
+const getCuotaPrincipalPendiente = (cuota) => {
+  return fix2(
+    Math.max(
+      toNumber(cuota?.importe_cuota) -
+      toNumber(cuota?.descuento_cuota) -
+      toNumber(cuota?.monto_pagado_acumulado),
+      0
+    )
+  );
+};
+
+const getCuotaSaldoTotal = (cuota) => {
+  return fix2(getCuotaPrincipalPendiente(cuota) + getCuotaMoraNeta(cuota));
+};
+
 /* ===================== TOTAL ACTUAL (helper local para PDF) ===================== */
 const calcularTotalActualCreditoPlainPDF = (creditoPlain) => {
   if (!creditoPlain) return 0;
 
   if (esLibre(creditoPlain)) {
     const cuota = Array.isArray(creditoPlain.cuotas) ? creditoPlain.cuotas[0] : null;
-    const mora = fix2(toNumber(cuota?.intereses_vencidos_acumulados));
+    const mora = fix2(
+      toNumber(
+        cuota?.saldo_mora ??
+        cuota?.mora_neta ??
+        cuota?.intereses_vencidos_acumulados ??
+        0
+      )
+    );
 
     const capital = fix2(toNumber(creditoPlain.saldo_capital ?? creditoPlain.saldo_actual));
     const interes = fix2(
@@ -52,12 +138,7 @@ const calcularTotalActualCreditoPlainPDF = (creditoPlain) => {
     const estado = String(c.estado || '').toLowerCase();
     if (!['pendiente', 'parcial', 'vencida'].includes(estado)) continue;
 
-    const principalPend = Math.max(
-      fix2(toNumber(c.importe_cuota) - toNumber(c.descuento_cuota) - toNumber(c.monto_pagado_acumulado)),
-      0
-    );
-    const mora = fix2(toNumber(c.intereses_vencidos_acumulados));
-    total = fix2(total + principalPend + mora);
+    total = fix2(total + getCuotaSaldoTotal(c));
   }
   return total;
 };
@@ -125,6 +206,63 @@ const resolveLogoPath = () => {
   return p;
 };
 
+/* ===================== Helpers tabla cuotas ===================== */
+
+const fmtARSTable = (value) => {
+  // Compacta un poco para que entre mejor en columnas del PDF
+  return String(fmtARS(value ?? 0)).replace(/\$\s+/g, '$');
+};
+
+const getCellAlign = (index) => {
+  if (index === 0) return 'center';
+  if (index === 1) return 'left';
+  if (index === 7) return 'center';
+  return 'right';
+};
+
+const getCellFont = (index) => {
+  if (index === 7) return 'Helvetica-Bold';
+  return 'Helvetica';
+};
+
+const getRowHeight = (doc, cells, colWidths, opts = {}) => {
+  const fontSize = opts.fontSize ?? 8;
+  const paddingX = opts.paddingX ?? 4;
+  const paddingY = opts.paddingY ?? 4;
+  const minRowH = opts.minRowH ?? 18;
+
+  let maxH = 0;
+  cells.forEach((cell, i) => {
+    const width = Math.max((colWidths[i] || 0) - (paddingX * 2), 8);
+    const font = getCellFont(i);
+    doc.font(font).fontSize(fontSize);
+
+    const h = doc.heightOfString(String(cell ?? ''), {
+      width,
+      align: getCellAlign(i)
+    });
+
+    if (h > maxH) maxH = h;
+  });
+
+  return Math.max(minRowH, Math.ceil(maxH + (paddingY * 2)));
+};
+
+const drawTableGrid = (doc, x, y, colWidths, rowH) => {
+  const totalW = colWidths.reduce((a, b) => a + b, 0);
+
+  safeStrokeColor(doc, COLORS.line);
+  doc.rect(x, y, totalW, rowH).stroke();
+
+  let cx = x;
+  for (let i = 0; i < colWidths.length - 1; i += 1) {
+    cx += colWidths[i];
+    doc.moveTo(cx, y).lineTo(cx, y + rowH).stroke();
+  }
+
+  safeStrokeColor(doc, COLORS.text);
+};
+
 /* ===================== PDF: Ficha del Crédito ===================== */
 export const imprimirFichaCredito = async (req, res) => {
   try {
@@ -148,11 +286,13 @@ export const imprimirFichaCredito = async (req, res) => {
     const cli = c.cliente || {};
     const cuotas = Array.isArray(c.cuotas) ? c.cuotas : [];
 
-    const total_actual = fix2(toNumber(
-      typeof c.total_actual !== 'undefined' && c.total_actual !== null
-        ? c.total_actual
-        : calcularTotalActualCreditoPlainPDF(c)
-    ));
+    const total_actual = fix2(
+      toNumber(
+        typeof c.total_actual !== 'undefined' && c.total_actual !== null
+          ? c.total_actual
+          : calcularTotalActualCreditoPlainPDF(c)
+      )
+    );
 
     const fechaEmision = todayYMD();
     const ciclosLibre = esLibre(c) ? obtenerFechasCiclosLibre(c) : null;
@@ -200,18 +340,16 @@ export const imprimirFichaCredito = async (req, res) => {
     const right = doc.page.width - doc.page.margins.right;
     const top = doc.page.margins.top;
 
-    // Banda superior
     const headerH = 64;
     safeStrokeColor(doc, COLORS.line);
     doc.rect(left, top - 10, right - left, headerH).stroke();
     safeStrokeColor(doc, COLORS.text);
 
-    // Logo
     const logoPath = resolveLogoPath();
     let logoDrawn = false;
     if (fs.existsSync(logoPath)) {
       try {
-        doc.image(logoPath, left + 10, top - 2, { height: 44 }); // mantiene proporción
+        doc.image(logoPath, left + 10, top - 2, { height: 44 });
         logoDrawn = true;
       } catch (e) {
         console.error('[PDFKit][logo] No se pudo cargar logo:', e?.message || e);
@@ -220,7 +358,6 @@ export const imprimirFichaCredito = async (req, res) => {
       console.warn('[PDFKit][logo] No existe:', logoPath);
     }
 
-    // Título + fecha (a la derecha del logo)
     const titleX = logoDrawn ? left + 10 + 160 : left + 10;
     const titleW = right - titleX - 10;
 
@@ -230,14 +367,12 @@ export const imprimirFichaCredito = async (req, res) => {
     safeSetColor(doc, COLORS.muted);
     doc.font('Helvetica').fontSize(9).text(`Emitido: ${fechaEmision}`, titleX, top + 28, { width: titleW, align: 'right' });
 
-    // Subtítulo pequeño
     safeSetColor(doc, COLORS.muted);
     doc.fontSize(9).text(`Crédito #${c.id} · ${String(c.estado || '').toUpperCase()} · ${labelModalidad(c.modalidad_credito)}`, titleX, top + 42, {
       width: titleW,
       align: 'right'
     });
 
-    // Cursor debajo del header
     doc.y = top + headerH + 8;
     safeSetColor(doc, COLORS.text);
 
@@ -276,7 +411,6 @@ export const imprimirFichaCredito = async (req, res) => {
 
     y1 = drawKV(doc, left, y1, 'Cobrador asignado', c.cobradorCredito?.nombre_completo || '-');
 
-    // Caja “totales”
     const totalsBoxH = 54;
     ensureSpace(doc, totalsBoxH + 18);
 
@@ -302,58 +436,87 @@ export const imprimirFichaCredito = async (req, res) => {
     drawSectionTitle(doc, 'Detalle de cuotas');
 
     const headers = ['#', 'Vencimiento', 'Importe', 'Pagado', 'Desc.', 'Mora', 'Saldo', 'Estado'];
-    const colWidths = [26, 78, 70, 70, 55, 55, 70, 72];
+
+    // Rebalanceadas para evitar corte de montos grandes
+    const colWidths = [22, 78, 64, 64, 50, 72, 86, 64];
 
     const tableX = left;
     const tableW = colWidths.reduce((a, b) => a + b, 0);
-    const rowH = 18;
+
+    const tableFontSize = 7.6;
+    const headerFontSize = 8;
+    const cellPadX = 4;
+    const cellPadY = 4;
+    const minRowH = 18;
 
     const drawTableHeader = () => {
-      ensureSpace(doc, rowH + 6);
+      const headerCells = headers;
+      const headerH = getRowHeight(doc, headerCells, colWidths, {
+        fontSize: headerFontSize,
+        paddingX: cellPadX,
+        paddingY: cellPadY,
+        minRowH
+      });
+
+      ensureSpace(doc, headerH + 6);
 
       const y = doc.y;
 
-      // fondo header
-      safeStrokeColor(doc, COLORS.line);
-      doc.rect(tableX, y, tableW, rowH).stroke();
       doc.save();
-      doc.fillColor(COLORS.tableHeaderFill);
-      doc.rect(tableX, y, tableW, rowH).fill();
+      safeSetColor(doc, COLORS.tableHeaderFill);
+      doc.rect(tableX, y, tableW, headerH).fill();
       doc.restore();
 
-      // textos
-      let cx = tableX;
-      doc.font('Helvetica-Bold').fontSize(9);
-      safeSetColor(doc, COLORS.text);
+      drawTableGrid(doc, tableX, y, colWidths, headerH);
 
+      let cx = tableX;
       headers.forEach((h, i) => {
-        const align = i <= 1 ? 'left' : 'right';
-        doc.text(h, cx + 6, y + 5, { width: colWidths[i] - 10, align });
-        cx += colWidths[i];
+        const width = colWidths[i];
+        const align = getCellAlign(i);
+        doc.font('Helvetica-Bold').fontSize(headerFontSize);
+        safeSetColor(doc, COLORS.text);
+        doc.text(h, cx + cellPadX, y + cellPadY, {
+          width: width - (cellPadX * 2),
+          align
+        });
+        cx += width;
       });
 
       doc.font('Helvetica');
-      doc.y = y + rowH;
-      return y + rowH;
+      doc.y = y + headerH;
+      return y + headerH;
     };
 
     const drawRow = (cells) => {
+      const rowH = getRowHeight(doc, cells, colWidths, {
+        fontSize: tableFontSize,
+        paddingX: cellPadX,
+        paddingY: cellPadY,
+        minRowH
+      });
+
       ensureSpace(doc, rowH + 2, () => {
-        // al nueva página, repetimos header
         drawTableHeader();
       });
 
       const y = doc.y;
-      safeStrokeColor(doc, COLORS.line);
-      doc.rect(tableX, y, tableW, rowH).stroke();
-      safeStrokeColor(doc, COLORS.text);
+
+      drawTableGrid(doc, tableX, y, colWidths, rowH);
 
       let cx = tableX;
-      doc.fontSize(9);
       cells.forEach((cell, i) => {
-        const align = i <= 1 ? 'left' : 'right';
-        doc.text(String(cell ?? ''), cx + 6, y + 5, { width: colWidths[i] - 10, align });
-        cx += colWidths[i];
+        const width = colWidths[i];
+        const align = getCellAlign(i);
+
+        doc.font(getCellFont(i)).fontSize(tableFontSize);
+        safeSetColor(doc, COLORS.text);
+
+        doc.text(String(cell ?? ''), cx + cellPadX, y + cellPadY, {
+          width: width - (cellPadX * 2),
+          align
+        });
+
+        cx += width;
       });
 
       doc.y = y + rowH;
@@ -363,16 +526,16 @@ export const imprimirFichaCredito = async (req, res) => {
 
     let totalPrincipalPend = 0;
     let totalMora = 0;
+    let totalDescuento = 0;
 
     for (const ct of cuotas) {
-      const principalPend = Math.max(
-        fix2(toNumber(ct.importe_cuota) - toNumber(ct.descuento_cuota) - toNumber(ct.monto_pagado_acumulado)),
-        0
-      );
-      const mora = fix2(toNumber(ct.intereses_vencidos_acumulados));
+      const descuentoMora = getCuotaDescuentoMora(ct);
+      const mora = getCuotaMoraNeta(ct);
+      const principalPend = getCuotaPrincipalPendiente(ct);
 
       totalPrincipalPend = fix2(totalPrincipalPend + principalPend);
       totalMora = fix2(totalMora + mora);
+      totalDescuento = fix2(totalDescuento + descuentoMora);
 
       const vto = ct.fecha_vencimiento === LIBRE_VTO_FICTICIO
         ? '—'
@@ -383,35 +546,32 @@ export const imprimirFichaCredito = async (req, res) => {
       drawRow([
         ct.numero_cuota,
         vto,
-        fmtARS(ct.importe_cuota),
-        fmtARS(ct.monto_pagado_acumulado),
-        fmtARS(ct.descuento_cuota),
-        fmtARS(mora),
-        fmtARS(saldoCuota),
+        fmtARSTable(ct.importe_cuota),
+        fmtARSTable(ct.monto_pagado_acumulado),
+        fmtARSTable(descuentoMora),
+        fmtARSTable(mora),
+        fmtARSTable(saldoCuota),
         String(ct.estado || '').toUpperCase()
       ]);
     }
 
-    // Totales debajo de tabla
     doc.moveDown(0.6);
-    ensureSpace(doc, 64);
+    ensureSpace(doc, 76);
 
     const totalsY = doc.y;
-    const boxH = 54;
+    const boxH = 66;
 
     safeStrokeColor(doc, COLORS.line);
     doc.rect(left, totalsY, right - left, boxH).stroke();
     safeStrokeColor(doc, COLORS.text);
 
-    // Título
     doc.font('Helvetica-Bold').fontSize(10);
     safeSetColor(doc, COLORS.text);
     doc.text('Totales', left + 10, totalsY + 10);
 
-    // Columna derecha (etiquetas + valores)
     doc.font('Helvetica').fontSize(10);
 
-    const labelW = 70;
+    const labelW = 90;
     const valueW = 160;
     const rightPad = 12;
 
@@ -419,30 +579,33 @@ export const imprimirFichaCredito = async (req, res) => {
     const valueX = right - rightPad - valueW;
 
     safeSetColor(doc, COLORS.muted);
-    doc.text('Mora:', labelX, totalsY + 10, { width: labelW, align: 'right' });
+    doc.text('Descuento:', labelX, totalsY + 10, { width: labelW, align: 'right' });
     safeSetColor(doc, COLORS.text);
-    doc.text(fmtARS(totalMora), valueX, totalsY + 10, { width: valueW, align: 'right' });
+    doc.text(fmtARS(totalDescuento), valueX, totalsY + 10, { width: valueW, align: 'right' });
 
     safeSetColor(doc, COLORS.muted);
-    doc.text('Principal pendiente:', labelX, totalsY + 26, { width: labelW, align: 'right' });
+    doc.text('Mora:', labelX, totalsY + 26, { width: labelW, align: 'right' });
     safeSetColor(doc, COLORS.text);
-    doc.text(fmtARS(totalPrincipalPend), valueX, totalsY + 26, { width: valueW, align: 'right' });
+    doc.text(fmtARS(totalMora), valueX, totalsY + 26, { width: valueW, align: 'right' });
 
-    // Nota (a la izquierda, con ancho acotado para no invadir la columna derecha)
+    safeSetColor(doc, COLORS.muted);
+    doc.text('Principal pendiente:', labelX, totalsY + 42, { width: labelW, align: 'right' });
+    safeSetColor(doc, COLORS.text);
+    doc.text(fmtARS(totalPrincipalPend), valueX, totalsY + 42, { width: valueW, align: 'right' });
+
     const noteX = left + 10;
-    const noteW = (labelX - 12) - noteX; // deja un gap antes de la columna derecha
+    const noteW = (labelX - 12) - noteX;
 
     safeSetColor(doc, COLORS.muted);
     doc.font('Helvetica').fontSize(8);
     doc.text(
-      'Nota: Esta ficha es informativa. Los importes pueden variar según pagos registrados y recálculos de mora.',
+      'Nota: Esta ficha es informativa. Los importes pueden variar según pagos registrados, descuentos aplicados y recálculos de mora.',
       noteX,
-      totalsY + 30,
+      totalsY + 38,
       { width: Math.max(noteW, 120), align: 'left' }
     );
 
     doc.y = totalsY + boxH + 10;
-
 
     doc.end();
   } catch (error) {

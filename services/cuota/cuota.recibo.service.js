@@ -69,7 +69,8 @@ export const buildReciboUI = (recibo) => {
         principal_pagado,
         interes_ciclo_cobrado,
 
-        // ✅ DB: saldo_mora_pendiente
+        // ✅ FIX: usar atributo del modelo (saldo_mora) y fallback a nombre de columna legacy
+        saldo_mora,
         saldo_mora_pendiente,
 
         // ✅ ciclo imputado (LIBRE)
@@ -89,6 +90,11 @@ export const buildReciboUI = (recibo) => {
         saldo_credito_anterior,
         saldo_credito_actual
     } = recibo;
+
+    const saldoMoraValue =
+        saldo_mora !== undefined && saldo_mora !== null
+            ? saldo_mora
+            : saldo_mora_pendiente;
 
     // ✅ CLAVE:
     // "Cantidad de" (y lo que el usuario percibe como pago) debe priorizar pago_a_cuenta.
@@ -131,7 +137,7 @@ export const buildReciboUI = (recibo) => {
 
         // 🟦 campo “Saldo de mora” (UI)
         saldo_mora:
-            saldo_mora_pendiente !== undefined ? nonAplicaIfZero(saldo_mora_pendiente) : undefined,
+            saldoMoraValue !== undefined ? nonAplicaIfZero(saldoMoraValue) : undefined,
 
         // ✅ meta descuento cancelación (opcional, solo si existe)
         descuento_sobre: descuento_sobre ?? undefined,
@@ -374,8 +380,8 @@ export const armarDatosRecibo = ({
         mora_cobrada: fix2(toNumber(moraCobrada)),
         principal_pagado: fix2(toNumber(principalPagado)),
 
-        // ✅ DB: saldo_mora_pendiente (NOT NULL default 0)
-        saldo_mora_pendiente: fix2(
+        // ✅ FIX: usar atributo del modelo, no nombre de columna
+        saldo_mora: fix2(
             saldoMoraRestante !== undefined ? toNumber(saldoMoraRestante) : 0
         ),
 

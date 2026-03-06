@@ -78,6 +78,166 @@ const esEstadoAnulado = (estado) => {
   return e === 'anulado' || e === 'anulada' || e.startsWith('anul');
 };
 
+const setTransientValue = (target, key, value) => {
+  if (!target || typeof target !== 'object') return;
+  if (typeof target.setDataValue === 'function') {
+    target.setDataValue(key, value);
+  } else {
+    target[key] = value;
+  }
+};
+
+/* =============================================================================
+   ✅ Enriquecer pagos de cuotas con datos de recibo (descuento_aplicado, numero_recibo)
+   ✅ NUEVO: consolidar también a nivel CUOTA para que el front no “parpadee”
+   ============================================================================= */
+const anexarRecibosAPagosEnCreditos = async (creditos = []) => {
+  const lista = Array.isArray(creditos) ? creditos : [];
+
+  const pagos = [];
+  const cuotas = [];
+
+  for (const cr of lista) {
+    const cuotasCredito = Array.isArray(cr?.cuotas) ? cr.cuotas : [];
+    for (const ct of cuotasCredito) {
+      cuotas.push(ct);
+      const pagosCuota = Array.isArray(ct?.pagos) ? ct.pagos : [];
+      for (const p of pagosCuota) pagos.push(p);
+    }
+  }
+
+  const pagoIds = [...new Set(
+    pagos.map((p) => Number(p?.id)).filter((id) => Number.isInteger(id) && id > 0)
+  )];
+
+  const cuotaIds = [...new Set(
+    cuotas.map((c) => Number(c?.id)).filter((id) => Number.isInteger(id) && id > 0)
+  )];
+
+  if (pagoIds.length === 0 && cuotaIds.length === 0) return;
+
+  const whereOr = [];
+  if (pagoIds.length > 0) whereOr.push({ pago_id: { [Op.in]: pagoIds } });
+  if (cuotaIds.length > 0) whereOr.push({ cuota_id: { [Op.in]: cuotaIds } });
+
+  const recibos = await Recibo.findAll({
+    where: whereOr.length === 1 ? whereOr[0] : { [Op.or]: whereOr },
+    attributes: [
+      'numero_recibo',
+      'pago_id',
+      'cuota_id',
+      'descuento_aplicado',
+      'mora_cobrada',
+      'principal_pagado',
+      'saldo_mora'
+    ],
+    order: [['numero_recibo', 'ASC']],
+    raw: true
+  });
+
+  const reciboPorPagoId = new Map();
+  const resumenPorCuotaId = new Map();
+
+  for (const r of recibos) {
+    const pagoId = Number(r?.pago_id);
+    const cuotaId = Number(r?.cuota_id);
+
+    if (Number.isInteger(pagoId) && pagoId > 0) {
+      const prevPago = reciboPorPagoId.get(pagoId);
+      if (!prevPago || Number(r?.numero_recibo) > Number(prevPago?.numero_recibo)) {
+        reciboPorPagoId.set(pagoId, r);
+      }
+    }
+
+    if (Number.isInteger(cuotaId) && cuotaId > 0) {
+      const prev = resumenPorCuotaId.get(cuotaId) || {
+        descuento_aplicado_total: 0,
+        mora_cobrada_total: 0,
+        principal_pagado_total: 0,
+        ultimo_recibo: null
+      };
+
+      prev.descuento_aplicado_total = fix2(
+        toNumber(prev.descuento_aplicado_total) + toNumber(r?.descuento_aplicado)
+      );
+      prev.mora_cobrada_total = fix2(
+        toNumber(prev.mora_cobrada_total) + toNumber(r?.mora_cobrada)
+      );
+      prev.principal_pagado_total = fix2(
+        toNumber(prev.principal_pagado_total) + toNumber(r?.principal_pagado)
+      );
+
+      if (!prev.ultimo_recibo || Number(r?.numero_recibo) > Number(prev.ultimo_recibo?.numero_recibo)) {
+        prev.ultimo_recibo = r;
+      }
+
+      resumenPorCuotaId.set(cuotaId, prev);
+    }
+  }
+
+  // ─────────────────────────────
+  // Enriquecer PAGOS
+  // ─────────────────────────────
+  for (const p of pagos) {
+    const r = reciboPorPagoId.get(Number(p?.id));
+    const descuentoAplicado = fix2(toNumber(r?.descuento_aplicado ?? 0));
+    const moraCobrada = fix2(toNumber(r?.mora_cobrada ?? 0));
+    const principalPagado = fix2(toNumber(r?.principal_pagado ?? 0));
+    const saldoMora = fix2(toNumber(r?.saldo_mora ?? 0));
+
+    setTransientValue(p, 'numero_recibo', r?.numero_recibo ?? null);
+    setTransientValue(p, 'descuento_aplicado', descuentoAplicado);
+    setTransientValue(p, 'mora_cobrada', moraCobrada);
+    setTransientValue(p, 'principal_pagado', principalPagado);
+    setTransientValue(p, 'saldo_mora', saldoMora);
+    setTransientValue(
+      p,
+      'recibo',
+      r
+        ? {
+            numero_recibo: r.numero_recibo,
+            descuento_aplicado: descuentoAplicado,
+            mora_cobrada: moraCobrada,
+            principal_pagado: principalPagado,
+            saldo_mora: saldoMora
+          }
+        : null
+    );
+  }
+
+  // ─────────────────────────────
+  // Enriquecer CUOTAS
+  // ─────────────────────────────
+  for (const ct of cuotas) {
+    const cuotaId = Number(ct?.id);
+    const resumen = resumenPorCuotaId.get(cuotaId);
+
+    const descuentoAplicadoTotal = fix2(toNumber(resumen?.descuento_aplicado_total ?? 0));
+    const moraCobradaTotal = fix2(toNumber(resumen?.mora_cobrada_total ?? 0));
+    const principalPagadoTotal = fix2(toNumber(resumen?.principal_pagado_total ?? 0));
+
+    const saldoMora = resumen?.ultimo_recibo
+      ? fix2(toNumber(resumen.ultimo_recibo?.saldo_mora ?? 0))
+      : fix2(toNumber(ct?.intereses_vencidos_acumulados ?? 0));
+
+    const moraNeta = fix2(
+      saldoMora > 0
+        ? saldoMora
+        : Math.max(toNumber(ct?.intereses_vencidos_acumulados ?? 0) - descuentoAplicadoTotal, 0)
+    );
+
+    setTransientValue(ct, 'numero_recibo_ultimo', resumen?.ultimo_recibo?.numero_recibo ?? null);
+
+    // ✅ Campos “UI/consulta”, NO persistidos
+    setTransientValue(ct, 'descuento_aplicado', descuentoAplicadoTotal);
+    setTransientValue(ct, 'descuento_aplicado_total', descuentoAplicadoTotal);
+    setTransientValue(ct, 'mora_cobrada_total', moraCobradaTotal);
+    setTransientValue(ct, 'principal_pagado_total', principalPagadoTotal);
+    setTransientValue(ct, 'saldo_mora', saldoMora);
+    setTransientValue(ct, 'mora_neta', moraNeta);
+  }
+};
+
 /* =============================================================================
    ✅ Caja: helpers de limpieza (desembolso) al ANULAR/ELIMINAR
    ============================================================================= */
@@ -543,14 +703,33 @@ export const obtenerCreditos = async (query, { rol_id = null } = {}) => {
   }
 
   const where = buildFilters(query, ['cliente_id', 'estado', 'interes', 'monto']);
-  return Credito.findAll({
+
+  const creditos = await Credito.findAll({
     where,
     include: [
       { model: Cliente, as: 'cliente', attributes: ['id', 'nombre', 'apellido'] },
-      { model: Cuota, as: 'cuotas', separate: true, order: [['numero_cuota', 'ASC']] }
+      {
+        model: Cuota,
+        as: 'cuotas',
+        separate: true,
+        order: [['numero_cuota', 'ASC']],
+        include: [
+          {
+            model: Pago,
+            as: 'pagos',
+            attributes: ['id', 'cuota_id', 'monto_pagado', 'fecha_pago'],
+            include: [{ model: FormaPago, as: 'formaPago', attributes: ['id', 'nombre'] }]
+          }
+        ]
+      },
+      { model: Usuario, as: 'cobradorCredito', attributes: ['id', 'nombre_completo'] }
     ],
     order: [['id', 'DESC']]
   });
+
+  await anexarRecibosAPagosEnCreditos(creditos);
+
+  return creditos;
 };
 
 export const obtenerCreditoPorId = async (id, { rol_id = null } = {}) => {
@@ -565,13 +744,28 @@ export const obtenerCreditoPorId = async (id, { rol_id = null } = {}) => {
 
   const includeOpts = [
     { model: Cliente, as: 'cliente' },
-    { model: Cuota, as: 'cuotas', separate: true, order: [['numero_cuota', 'ASC']] },
+    {
+      model: Cuota,
+      as: 'cuotas',
+      separate: true,
+      order: [['numero_cuota', 'ASC']],
+      include: [
+        {
+          model: Pago,
+          as: 'pagos',
+          attributes: ['id', 'cuota_id', 'monto_pagado', 'fecha_pago'],
+          include: [{ model: FormaPago, as: 'formaPago', attributes: ['id', 'nombre'] }]
+        }
+      ]
+    },
     { model: Usuario, as: 'cobradorCredito', attributes: ['id', 'nombre_completo'] }
   ];
 
   // 1) Leemos el crédito con todas las relaciones
   let cred = await Credito.findByPk(pk, { include: includeOpts });
   if (!cred) return null;
+
+  await anexarRecibosAPagosEnCreditos([cred]);
 
   // 2) Recalcular en función de modalidad (protegido con try/catch)
   try {
@@ -596,6 +790,7 @@ export const obtenerCreditoPorId = async (id, { rol_id = null } = {}) => {
     const refetched = await Credito.findByPk(pk, { include: includeOpts });
     if (refetched) {
       cred = refetched;
+      await anexarRecibosAPagosEnCreditos([cred]);
     }
   } catch (e) {
     console.error('[obtenerCreditoPorId] Error al recalcular crédito:', e?.message || e);
@@ -1479,8 +1674,8 @@ export const obtenerCreditosPorCliente = async (clienteId, query = {}, { rol_id 
                 {
                   model: Pago,
                   as: 'pagos',
-                  attributes: ['id', 'monto_pagado', 'fecha_pago'],
-                  include: [{ model: FormaPago, as: 'formaPago', attributes: ['nombre'] }]
+                  attributes: ['id', 'cuota_id', 'monto_pagado', 'fecha_pago'],
+                  include: [{ model: FormaPago, as: 'formaPago', attributes: ['id', 'nombre'] }]
                 }
               ]
             },
@@ -1521,8 +1716,8 @@ export const obtenerCreditosPorCliente = async (clienteId, query = {}, { rol_id 
                 {
                   model: Pago,
                   as: 'pagos',
-                  attributes: ['id', 'monto_pagado', 'fecha_pago'],
-                  include: [{ model: FormaPago, as: 'formaPago', attributes: ['nombre'] }]
+                  attributes: ['id', 'cuota_id', 'monto_pagado', 'fecha_pago'],
+                  include: [{ model: FormaPago, as: 'formaPago', attributes: ['id', 'nombre'] }]
                 }
               ]
             },
@@ -1533,6 +1728,8 @@ export const obtenerCreditosPorCliente = async (clienteId, query = {}, { rol_id 
         { model: Zona, as: 'clienteZona', attributes: ['id', 'nombre'] }
       ]
     });
+
+    await anexarRecibosAPagosEnCreditos(cliente?.creditos || []);
 
     const plain = cliente.get({ plain: true });
 

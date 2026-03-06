@@ -202,8 +202,8 @@ const obtenerDescuentosAplicadosLibre = async (creditoId, t = null) => {
   try {
     last = await Recibo.findOne({
       where: { cuota_id: { [Op.in]: cuotaIds } },
-      order: [['id', 'DESC']],
-      attributes: ['id', 'numero_recibo', 'fecha', 'descuento_aplicado'],
+      order: [['numero_recibo', 'DESC']],
+      attributes: ['numero_recibo', 'fecha', 'descuento_aplicado'],
       ...(t && { transaction: t })
     });
   } catch {
