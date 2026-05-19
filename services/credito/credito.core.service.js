@@ -1224,11 +1224,19 @@ export const actualizarCredito = async (id, data) => {
     detalle_producto
   };
 
-  await Credito.update(patch, { where: { id } });
+  const tx = await Credito.sequelize.transaction();
+  try {
+    await Credito.update(patch, { where: { id }, transaction: tx });
+    await Cuota.destroy({ where: { credito_id: id }, transaction: tx });
+    const creditoEnTx = await Credito.findByPk(id, { transaction: tx });
+    await generarCuotasServicio(creditoEnTx, tx);
+    await tx.commit();
+  } catch (err) {
+    await tx.rollback();
+    throw err;
+  }
 
-  await Cuota.destroy({ where: { credito_id: id } });
   const actualizado = await Credito.findByPk(id);
-  await generarCuotasServicio(actualizado);
 
   if (recalcular_hasta_hoy !== false) {
     await marcarVencidasYCalcularMora(actualizado.id, {
